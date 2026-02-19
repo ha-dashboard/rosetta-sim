@@ -426,10 +426,19 @@ static void addMissingMethods(void) {
     // _addHeartBeatClientView: was removed from NSView/NSWindow in modern AppKit
     // IB tries to swizzle it and crashes when it's not found
     struct { const char *cls; const char *sel; const char *types; } stubs[] = {
+        // HeartBeat methods removed from modern AppKit
         {"NSView", "_addHeartBeatClientView:", "v@:@"},
         {"NSView", "_removeHeartBeatClientView:", "v@:@"},
+        {"NSView", "_installHeartBeat:", "v@:@"},
+        {"NSView", "_removeHeartBeat:", "v@:@"},
+        {"NSView", "_heartBeatClientViews", "@@:"},
         {"NSWindow", "_addHeartBeatClientView:", "v@:@"},
         {"NSWindow", "_removeHeartBeatClientView:", "v@:@"},
+        {"NSWindow", "_installHeartBeat:", "v@:@"},
+        {"NSWindow", "_removeHeartBeat:", "v@:@"},
+        // Other common removed private methods
+        {"NSApplication", "_installHeartBeat:", "v@:@"},
+        {"NSApplication", "_removeHeartBeat:", "v@:@"},
         {NULL, NULL, NULL}
     };
 
@@ -443,18 +452,37 @@ static void addMissingMethods(void) {
     }
 }
 
-// Also install a global uncaught exception handler that logs instead of crashing
-static void uncaughtExceptionHandler(NSException *exception) {
-    static int exCount = 0;
-    exCount++;
-    if (exCount <= 10) {
-        fprintf(stderr, "[dvt] UNCAUGHT EXCEPTION #%d: %s: %s\n",
-                exCount,
-                [[exception name] UTF8String],
-                [[exception reason] UTF8String]);
+// Hook _DVTAssertionFailureHandler to make assertions non-fatal
+// This is a C function, not an ObjC method, so we need to use interposition
+// Instead, we'll hook the DVTAssertionHandler at the ObjC level by replacing
+// the handler object's methods with safe versions.
+// But the real fix is to make IBReplaceMethodPrimitive safe.
+
+// We'll hook NSException's raise method to catch IB assertion exceptions
+static IMP orig_raise = NULL;
+static void hooked_raise(id self, SEL _cmd) {
+    NSString *name = [self name];
+    NSString *reason = [self reason];
+
+    // Check if this is an IB/DVT assertion
+    if ([reason containsString:@"IBFoundation"] ||
+        [reason containsString:@"Type encoding"] ||
+        [reason containsString:@"heartBeat"] ||
+        [reason containsString:@"HeartBeat"] ||
+        [reason containsString:@"IBReplaceMethod"] ||
+        [reason containsString:@"DVTAssert"]) {
+        static int suppressCount = 0;
+        suppressCount++;
+        if (suppressCount <= 10) {
+            fprintf(stderr, "[dvt] SUPPRESSED EXCEPTION #%d: %s\n",
+                    suppressCount, [reason UTF8String]);
+        }
+        // Don't raise - just return (this effectively swallows the exception)
+        return;
     }
-    // Don't abort - just continue (this only works if the exception is caught
-    // somewhere up the call stack)
+
+    // For other exceptions, call original raise
+    ((void(*)(id, SEL))orig_raise)(self, _cmd);
 }
 
 // Hook: +[DVTExtendedPlatformInfo extendedPlatformInfoForPlatformIdentifier:error:]
@@ -590,11 +618,75 @@ static void dvt_plugin_hook_init(void) {
         fprintf(stderr, "[dvt] DVTExtendedPlatformInfo class not found\n");
     }
 
-    // Add missing private method stubs to prevent assertion failures
+    // Add missing private method stubs
     addMissingMethods();
 
-    // Install global uncaught exception handler
-    NSSetUncaughtExceptionHandler(uncaughtExceptionHandler);
+    // Hook IBCocoaPlugin initialization to catch exceptions
+    Class ibCocoaCls = NSClassFromString(@"IBCocoaPlugin");
+    if (ibCocoaCls) {
+        SEL initSel = NSSelectorFromString(@"ide_initializeWithOptions:error:");
+        Method m_ibinit = class_getClassMethod(ibCocoaCls, initSel);
+        if (m_ibinit) {
+            static IMP orig_ibinit = NULL;
+            typedef BOOL(*IBInitFn)(id, SEL, unsigned long long, NSError **);
+            orig_ibinit = method_getImplementation(m_ibinit);
+            // Create a block-based IMP that wraps in try/catch
+            IMP new_imp = imp_implementationWithBlock(^BOOL(id _self, unsigned long long opts, NSError **err) {
+                @try {
+                    fprintf(stderr, "[dvt] IBCocoaPlugin init (with try/catch)...\n");
+                    return ((IBInitFn)orig_ibinit)(_self, initSel, opts, err);
+                } @catch (NSException *e) {
+                    fprintf(stderr, "[dvt] IBCocoaPlugin init EXCEPTION caught: %s\n",
+                            [[e reason] UTF8String]);
+                    return YES; // Pretend it succeeded
+                }
+            });
+            method_setImplementation(m_ibinit, new_imp);
+            fprintf(stderr, "[dvt] Hooked +[IBCocoaPlugin ide_initializeWithOptions:error:] (try/catch)\n");
+        }
+    }
+
+    // Also wrap DVTPlugIn load: method in try/catch to catch any plugin load failures
+    if (plugInCls) {
+        SEL loadSel = NSSelectorFromString(@"load:");
+        Method m_load = class_getInstanceMethod(plugInCls, loadSel);
+        if (m_load) {
+            static IMP orig_load = NULL;
+            orig_load = method_getImplementation(m_load);
+            typedef BOOL(*LoadFn)(id, SEL, NSError **);
+            IMP new_load_imp = imp_implementationWithBlock(^BOOL(id _self, NSError **err) {
+                @try {
+                    return ((LoadFn)orig_load)(_self, loadSel, err);
+                } @catch (NSException *e) {
+                    static int loadExCount = 0;
+                    loadExCount++;
+                    if (loadExCount <= 5) {
+                        id ident = [_self performSelector:NSSelectorFromString(@"identifier")];
+                        fprintf(stderr, "[dvt] Plugin load exception for %s: %s\n",
+                                ident ? [ident UTF8String] : "?",
+                                [[e reason] UTF8String]);
+                    }
+                    return NO;
+                }
+            });
+            method_setImplementation(m_load, new_load_imp);
+            fprintf(stderr, "[dvt] Hooked -[DVTPlugIn load:] (try/catch)\n");
+        }
+    }
+
+    // Hook both instance and class raise methods
+    Method m_raise = class_getInstanceMethod([NSException class], @selector(raise));
+    if (m_raise) {
+        orig_raise = method_getImplementation(m_raise);
+        method_setImplementation(m_raise, (IMP)hooked_raise);
+        fprintf(stderr, "[dvt] Hooked -[NSException raise]\n");
+    }
+    // Also hook the objc_exception_throw function indirectly by setting
+    // NSExceptionHandler behavior to not abort on uncaught exceptions
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"NSExceptionHandlingMask"];
+
+    // Set OBJC_DEBUG_MISSING_POOLS=NO to prevent debug crashes
+    setenv("OBJC_DEBUG_MISSING_POOLS", "NO", 1);
 
     fprintf(stderr, "[dvt] All hooks installed\n");
 }
