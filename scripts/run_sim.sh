@@ -46,6 +46,32 @@ if [[ ! "$TARGET_BIN" = /* ]]; then
 fi
 
 # ================================================================
+# .app bundle support
+# ================================================================
+# If the target is a .app directory, extract the executable from
+# Info.plist and set bundle-related environment variables.
+
+APP_BUNDLE=""
+if [[ -d "$TARGET_BIN" && "$TARGET_BIN" == *.app ]]; then
+    APP_BUNDLE="$TARGET_BIN"
+    # Extract executable name from Info.plist
+    EXEC_NAME="$(plutil -p "$APP_BUNDLE/Info.plist" 2>/dev/null | grep CFBundleExecutable | head -1 | sed 's/.*=> "\(.*\)"/\1/')"
+    if [[ -z "$EXEC_NAME" ]]; then
+        # Fallback: use the .app basename without extension
+        EXEC_NAME="$(basename "$APP_BUNDLE" .app)"
+    fi
+    TARGET_BIN="$APP_BUNDLE/$EXEC_NAME"
+    echo "App bundle: $APP_BUNDLE"
+    echo "Executable: $EXEC_NAME"
+elif [[ -f "$TARGET_BIN" ]]; then
+    # Check if the binary is inside a .app bundle
+    PARENT_DIR="$(dirname "$TARGET_BIN")"
+    if [[ "$PARENT_DIR" == *.app ]]; then
+        APP_BUNDLE="$PARENT_DIR"
+    fi
+fi
+
+# ================================================================
 # Preflight checks
 # ================================================================
 
@@ -140,6 +166,16 @@ export SIMULATOR_RUNTIME_BUILD_VERSION="14E8301"
 export SIMULATOR_MAINSCREEN_WIDTH="750"
 export SIMULATOR_MAINSCREEN_HEIGHT="1334"
 export SIMULATOR_MAINSCREEN_SCALE="2.0"
+
+# --- App bundle variables ---
+# If launching a .app bundle, set variables that NSBundle and UIKit need.
+if [[ -n "$APP_BUNDLE" ]]; then
+    export CFBundleExecutable="$(basename "$TARGET_BIN")"
+    export NSBundlePath="$APP_BUNDLE"
+    export CFProcessPath="$TARGET_BIN"
+    # Set the working directory inside the bundle for resource loading
+    export SIMULATOR_LEGACY_ASSET_SUFFIX=""
+fi
 
 # ================================================================
 # Launch

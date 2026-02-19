@@ -468,9 +468,46 @@ Three independent agent analyses all converged on this recommendation.
   - Runtime binary patching (write `ret`) doesn't work under Rosetta 2 (translation cache)
   - UIApplication singleton survives the abort but `sharedApplication` returns nil
 
+**Phase 4b Results (2026-02-19):**
+- UIView + UILabel + fonts + CoreText all render correctly via `[CALayer renderInContext:]`
+- Full Retina 750x1334 pixel output verified
+- One-shot rendering confirmed in test harnesses
+
 **Deliverable:** A macOS window showing content rendered by the simulated UIKit.
 
-### Phase 5: Input and Interaction
+### Phase 5: Continuous Rendering + Live Display — COMPLETE (2026-02-20)
+**Goal:** Timer-driven frame capture with live display in native host app.
+
+**Architecture:**
+```
+Bridge (x86_64):                      Host App (ARM64):
+  CFRunLoopTimer @ 30fps                Timer @ 60fps poll
+       │                                     │
+  [CALayer renderInContext:]            mmap(framebuffer)
+       │                                     │
+  CGBitmapContext → mmap'd file         CGDataProvider → CGImage
+       │                                     │
+  frame_counter++                       NSImage → SwiftUI
+```
+
+**Shared Framebuffer (IPC):**
+- File: `/tmp/rosettasim_framebuffer` (~4MB mmap'd file)
+- Header: 64 bytes (magic, dimensions, frame counter, flags)
+- Pixel data: 750×1334 BGRA @ 32bpp
+- Bridge writes, host reads; frame_counter used for change detection
+- Defined in `src/shared/rosettasim_framebuffer.h`
+
+**Key discoveries:**
+1. **UIWindow.hidden defaults to YES** — Phase 4b tests used UIView (hidden=NO), Phase 5 uses UIWindow which defaults hidden=YES. `renderInContext:` respects the hidden flag and produces zero pixels. Fix: explicit `setHidden:NO`.
+2. **CATransaction flush required** — Without CARenderServer, the normal CoreAnimation commit cycle never runs. Pending property changes (background colors, text) don't reach layer backing stores. Fix: `[CATransaction flush]` before rendering.
+3. **displayIfNeeded on layer tree** — Layer contents (backing stores) are never populated without the display server pipeline. Fix: recursive `setNeedsDisplay` + `displayIfNeeded` on the root layer and all sublayers before `renderInContext:`.
+4. **makeKeyAndVisible crashes** — UIWindow.makeKeyAndVisible requires UIApplication.sharedApplication (nil after longjmp). Process exits immediately. Work around by setting hidden=NO manually.
+
+**Performance:** ~29 FPS sustained (30 FPS target), frame counter reaches 580+ in 20s.
+
+**Live content verified:** Uptime counter and clock label update every second, confirming the run loop, NSTimer, and re-rendering pipeline all function correctly.
+
+### Phase 6: Input and Interaction — PLANNED
 **Goal:** Touch, keyboard, and device interaction.
 
 **Implementation:**

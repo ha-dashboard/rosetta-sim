@@ -12,9 +12,13 @@ tests/phase4b_text
 tests/phase4b_retina
 tests/phase4a_bootstrap_test
 tests/phase4a_bootstrap_fix
+tests/phase5_continuous
 
 # Host app build output
 src/host/RosettaSimApp/build/
+
+# Generated .app bundles (test artifacts)
+tests/*.app/
 
 # Simulated home directory
 .sim_home/

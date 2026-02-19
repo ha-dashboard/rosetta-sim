@@ -33,6 +33,18 @@
 #import <pthread.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
+#import <fcntl.h>
+#import <mach/mach_time.h>
+#import <CoreFoundation/CoreFoundation.h>
+
+#include "../shared/rosettasim_framebuffer.h"
+
+/* Forward declarations for frame capture system */
+static id _bridge_delegate = nil;
+static void find_root_window(id delegate);
+static void start_frame_capture(void);
 
 /* ================================================================
  * Logging
@@ -389,10 +401,55 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
             bridge_log("  UIApplication.sharedApplication: %p", (void *)app);
         }
 
-        if (_saved_delegate_class_name) {
+        /* Resolve delegate class name — from UIApplicationMain args, or Info.plist */
+        id effectiveDelegateClassName = _saved_delegate_class_name;
+        if (!effectiveDelegateClassName) {
+            /* Try NSBundle.mainBundle.infoDictionary for delegate/principal class */
+            Class bundleClass = objc_getClass("NSBundle");
+            if (bundleClass) {
+                id mainBundle = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)bundleClass, sel_registerName("mainBundle"));
+                if (mainBundle) {
+                    id infoDict = ((id(*)(id, SEL))objc_msgSend)(
+                        mainBundle, sel_registerName("infoDictionary"));
+                    if (infoDict) {
+                        /* Try NSPrincipalClass first (common in system apps) */
+                        id key = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                            (id)objc_getClass("NSString"),
+                            sel_registerName("stringWithUTF8String:"),
+                            "NSPrincipalClass");
+                        id val = ((id(*)(id, SEL, id))objc_msgSend)(
+                            infoDict, sel_registerName("objectForKey:"), key);
+                        if (val) {
+                            effectiveDelegateClassName = val;
+                            bridge_log("  Delegate from Info.plist NSPrincipalClass");
+                        }
+                    }
+                }
+            }
+        }
+
+        if (effectiveDelegateClassName) {
             SEL utf8Sel = sel_registerName("UTF8String");
-            const char *delName = ((const char *(*)(id, SEL))objc_msgSend)(_saved_delegate_class_name, utf8Sel);
+            const char *delName = ((const char *(*)(id, SEL))objc_msgSend)(effectiveDelegateClassName, utf8Sel);
             Class delClass = objc_getClass(delName);
+
+            /* If the class IS UIApplication or a subclass of it, it's the
+               principal class, not the delegate. Skip alloc/init to avoid
+               "only one UIApplication" crash. */
+            if (delClass) {
+                Class uiAppClass = objc_getClass("UIApplication");
+                Class check = delClass;
+                int isAppClass = 0;
+                while (check) {
+                    if (check == uiAppClass) { isAppClass = 1; break; }
+                    check = class_getSuperclass(check);
+                }
+                if (isAppClass) {
+                    bridge_log("  %s is UIApplication or subclass — skipping alloc/init", delName);
+                    delClass = NULL;
+                }
+            }
 
             if (delClass) {
                 SEL allocSel = sel_registerName("alloc");
@@ -403,6 +460,9 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                     ((id(*)(id, SEL))objc_msgSend)((id)delClass, allocSel), initSel);
 
                 if (delegate) {
+                    _bridge_delegate = delegate;
+                    ((id(*)(id, SEL))objc_msgSend)(delegate, sel_registerName("retain"));
+
                     if (app) {
                         ((void(*)(id, SEL, id))objc_msgSend)(app, setDelSel, delegate);
                         bridge_log("  Delegate set on app: %s @ %p", delName, (void *)delegate);
@@ -420,6 +480,11 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
             }
         }
     }
+
+    /* Set up continuous frame capture before starting the run loop */
+    bridge_log("  Setting up frame capture...");
+    find_root_window(_bridge_delegate);
+    start_frame_capture();
 
     /* Start the run loop */
     bridge_log("  Starting CFRunLoop...");
@@ -483,6 +548,259 @@ static void replacement_BKSHIDEventRegisterEventCallbackOnRunLoop(
 {
     bridge_log("BKSHIDEventRegisterEventCallbackOnRunLoop() intercepted → no-op");
     bridge_log("  (HID events will be injected by the bridge later)");
+}
+
+/* ================================================================
+ * Frame Capture System
+ *
+ * Renders the simulated app's root window into a shared memory-mapped
+ * framebuffer at ~30fps. The ARM64 host app mmaps the same file to
+ * display frames in real-time.
+ *
+ * Architecture:
+ *   Bridge (x86_64):  renderInContext → mmap'd file → increment counter
+ *   Host (ARM64):     poll counter → read pixels → CGImage → display
+ * ================================================================ */
+
+typedef struct { double x, y, w, h; } _RSBridgeCGRect;
+
+/* Framebuffer state */
+static void *_fb_mmap = NULL;    /* Will be set to MAP_FAILED sentinel or valid ptr */
+static size_t _fb_size = 0;
+static id _bridge_root_window = nil;
+
+/* CoreGraphics function pointers (resolved via dlsym) */
+static void *(*_cg_CreateColorSpace)(void);
+static void *(*_cg_CreateBitmap)(void *, size_t, size_t, size_t, size_t, void *, uint32_t);
+static void  (*_cg_ScaleCTM)(void *, double, double);
+static void  (*_cg_Release)(void *);
+static void  (*_cg_ReleaseCS)(void *);
+
+static void resolve_cg_functions(void) {
+    _cg_CreateColorSpace = dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+    _cg_CreateBitmap     = dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+    _cg_ScaleCTM         = dlsym(RTLD_DEFAULT, "CGContextScaleCTM");
+    _cg_Release          = dlsym(RTLD_DEFAULT, "CGContextRelease");
+    _cg_ReleaseCS        = dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
+}
+
+static int setup_shared_framebuffer(void) {
+    int px_w = (int)(kScreenWidth * kScreenScaleX);
+    int px_h = (int)(kScreenHeight * kScreenScaleY);
+    _fb_size = ROSETTASIM_FB_TOTAL_SIZE(px_w, px_h);
+
+    const char *path = getenv("ROSETTASIM_FB_PATH");
+    if (!path) path = ROSETTASIM_FB_PATH;
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        bridge_log("ERROR: Could not create framebuffer file: %s", path);
+        return -1;
+    }
+
+    if (ftruncate(fd, _fb_size) < 0) {
+        bridge_log("ERROR: Could not size framebuffer to %zu bytes", _fb_size);
+        close(fd);
+        return -1;
+    }
+
+    _fb_mmap = mmap(NULL, _fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (_fb_mmap == MAP_FAILED) {
+        bridge_log("ERROR: mmap failed for framebuffer");
+        _fb_mmap = NULL;
+        return -1;
+    }
+
+    /* Initialize header */
+    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
+    memset(hdr, 0, ROSETTASIM_FB_HEADER_SIZE);
+    hdr->magic         = ROSETTASIM_FB_MAGIC;
+    hdr->version       = ROSETTASIM_FB_VERSION;
+    hdr->width         = px_w;
+    hdr->height        = px_h;
+    hdr->stride        = px_w * 4;
+    hdr->format        = ROSETTASIM_FB_FORMAT_BGRA;
+    hdr->frame_counter = 0;
+    hdr->fps_target    = 30;
+    hdr->flags         = ROSETTASIM_FB_FLAG_APP_RUNNING;
+
+    bridge_log("Shared framebuffer: %dx%d (%zu bytes) at %s", px_w, px_h, _fb_size, path);
+    return 0;
+}
+
+/* Recursively force all layers in the tree to display their content */
+static void _force_display_recursive(id layer, int depth) {
+    if (!layer || depth > 20) return; /* guard against infinite recursion */
+
+    ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+    ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
+
+    id sublayers = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("sublayers"));
+    if (sublayers) {
+        long count = ((long(*)(id, SEL))objc_msgSend)(sublayers, sel_registerName("count"));
+        for (long i = 0; i < count; i++) {
+            id sl = ((id(*)(id, SEL, long))objc_msgSend)(
+                sublayers, sel_registerName("objectAtIndex:"), i);
+            _force_display_recursive(sl, depth + 1);
+        }
+    }
+}
+
+static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
+    if (!_bridge_root_window || !_fb_mmap) return;
+    if (!_cg_CreateColorSpace || !_cg_CreateBitmap) return;
+
+    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
+    void *pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE;
+
+    int px_w = hdr->width;
+    int px_h = hdr->height;
+
+    /* Get root window's layer */
+    id layer = ((id(*)(id, SEL))objc_msgSend)(
+        _bridge_root_window, sel_registerName("layer"));
+    if (!layer) return;
+
+    /* Flush pending CATransaction changes (no CARenderServer to do this) */
+    Class caTransaction = objc_getClass("CATransaction");
+    if (caTransaction) {
+        ((void(*)(id, SEL))objc_msgSend)((id)caTransaction, sel_registerName("flush"));
+    }
+
+    /* Force layout */
+    ((void(*)(id, SEL))objc_msgSend)(
+        _bridge_root_window, sel_registerName("setNeedsLayout"));
+    ((void(*)(id, SEL))objc_msgSend)(
+        _bridge_root_window, sel_registerName("layoutIfNeeded"));
+
+    /* Recursively force entire layer tree to populate backing stores.
+       Without CARenderServer, the normal display cycle never runs. */
+    _force_display_recursive(layer, 0);
+
+    /* Create bitmap context over framebuffer pixel region */
+    void *cs = _cg_CreateColorSpace();
+    /* kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002 */
+    void *ctx = _cg_CreateBitmap(pixels, px_w, px_h, 8, px_w * 4, cs, 0x2002);
+
+    if (ctx) {
+        /* Scale for Retina (2x device → 750x1334 pixels from 375x667 points) */
+        _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
+
+        /* Render the layer tree into the bitmap */
+        ((void(*)(id, SEL, void *))objc_msgSend)(
+            layer, sel_registerName("renderInContext:"), ctx);
+
+        /* Memory barrier then update header */
+        __sync_synchronize();
+        hdr->frame_counter++;
+        hdr->timestamp_ns = mach_absolute_time();
+        hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+
+        _cg_Release(ctx);
+    }
+    _cg_ReleaseCS(cs);
+}
+
+/*
+ * Find the root window to render.
+ *
+ * Priority:
+ *   1. delegate.window property
+ *   2. UIApplication.sharedApplication.keyWindow
+ *   3. Create a default window (fallback)
+ */
+static void find_root_window(id delegate) {
+    /* 1. Try delegate.window */
+    if (delegate) {
+        Class delClass = object_getClass(delegate);
+        SEL windowSel = sel_registerName("window");
+        if (class_respondsToSelector(delClass, windowSel)) {
+            id window = ((id(*)(id, SEL))objc_msgSend)(delegate, windowSel);
+            if (window) {
+                /* Retain to prevent deallocation (bridge is MRR) */
+                ((id(*)(id, SEL))objc_msgSend)(window, sel_registerName("retain"));
+                /* UIWindow defaults hidden=YES; ensure visible for rendering */
+                ((void(*)(id, SEL, bool))objc_msgSend)(
+                    window, sel_registerName("setHidden:"), false);
+                _bridge_root_window = window;
+                bridge_log("  Root window from delegate.window: %p", (void *)window);
+                return;
+            }
+        }
+    }
+
+    /* 2. Try UIApplication.sharedApplication.keyWindow */
+    Class appClass = objc_getClass("UIApplication");
+    if (appClass) {
+        id app = ((id(*)(id, SEL))objc_msgSend)(
+            (id)appClass, sel_registerName("sharedApplication"));
+        if (app) {
+            id kw = ((id(*)(id, SEL))objc_msgSend)(
+                app, sel_registerName("keyWindow"));
+            if (kw) {
+                ((id(*)(id, SEL))objc_msgSend)(kw, sel_registerName("retain"));
+                _bridge_root_window = kw;
+                bridge_log("  Root window from keyWindow: %p", (void *)kw);
+                return;
+            }
+        }
+    }
+
+    /* 3. Create a default window as fallback */
+    Class windowClass = objc_getClass("UIWindow");
+    if (windowClass) {
+        _RSBridgeCGRect frame = {0, 0, kScreenWidth, kScreenHeight};
+        typedef id (*initFrame_fn)(id, SEL, _RSBridgeCGRect);
+
+        id window = ((initFrame_fn)objc_msgSend)(
+            ((id(*)(id, SEL))objc_msgSend)((id)windowClass, sel_registerName("alloc")),
+            sel_registerName("initWithFrame:"), frame);
+
+        if (window) {
+            id white = ((id(*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("UIColor"), sel_registerName("whiteColor"));
+            ((void(*)(id, SEL, id))objc_msgSend)(
+                window, sel_registerName("setBackgroundColor:"), white);
+            /* UIWindow defaults hidden=YES; must unhide for rendering */
+            ((void(*)(id, SEL, bool))objc_msgSend)(
+                window, sel_registerName("setHidden:"), false);
+            /* No need to retain - we own it from alloc */
+            _bridge_root_window = window;
+            bridge_log("  Created default root window: %p", (void *)window);
+            return;
+        }
+    }
+
+    bridge_log("  WARNING: No root window found — frame capture will be disabled");
+}
+
+static void start_frame_capture(void) {
+    resolve_cg_functions();
+
+    if (!_cg_CreateColorSpace || !_cg_CreateBitmap) {
+        bridge_log("Frame capture disabled (CoreGraphics functions not found)");
+        return;
+    }
+
+    if (setup_shared_framebuffer() < 0) {
+        bridge_log("Frame capture disabled (framebuffer setup failed)");
+        return;
+    }
+
+    /* Create a repeating timer on the current run loop at ~30fps */
+    double interval = 1.0 / 30.0;
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
+        NULL,                             /* allocator */
+        CFAbsoluteTimeGetCurrent() + 0.1, /* first fire (100ms delay) */
+        interval,                         /* repeat interval */
+        0, 0,                             /* flags, order */
+        frame_capture_tick,               /* callback */
+        NULL);                            /* context */
+
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
+    bridge_log("Frame capture started (%.0f FPS target)", 1.0 / interval);
 }
 
 /* ================================================================
@@ -618,4 +936,16 @@ static void rosettasim_bridge_init(void) {
                gsScale ? *gsScale : 0);
 
     bridge_log("========================================");
+}
+
+__attribute__((destructor))
+static void rosettasim_bridge_cleanup(void) {
+    if (_fb_mmap && _fb_mmap != MAP_FAILED) {
+        RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
+        hdr->flags &= ~ROSETTASIM_FB_FLAG_APP_RUNNING;
+        __sync_synchronize();
+        munmap(_fb_mmap, _fb_size);
+        _fb_mmap = NULL;
+    }
+    bridge_log("Bridge cleanup complete");
 }
