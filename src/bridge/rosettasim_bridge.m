@@ -45,6 +45,7 @@
 static id _bridge_delegate = nil;
 static void find_root_window(id delegate);
 static void start_frame_capture(void);
+static void _mark_display_dirty(void);
 
 /* ================================================================
  * Logging
@@ -904,6 +905,9 @@ static void check_and_inject_touch(void) {
                class_getName(object_getClass(targetView)),
                (void *)targetView);
 
+    /* Schedule force-display after touch to capture UI changes */
+    _mark_display_dirty();
+
     /* ---- Approach 1: Try UIEvent-based delivery via [UIApplication sendEvent:] ---- */
     Class appClass = objc_getClass("UIApplication");
     id app = appClass ? ((id(*)(id, SEL))objc_msgSend)(
@@ -1089,6 +1093,17 @@ static void _dump_view_hierarchy(id view, int depth) {
     }
 }
 
+/* Track whether we need to force-display the layer tree.
+ * Set to a positive count on startup and after touch events.
+ * Decremented each frame; when 0, skip force-display (use cached backing stores).
+ * This prevents the flashing caused by recreating backing stores every frame. */
+static int _force_display_countdown = 10;  /* Force first 10 frames */
+
+/* Called after a touch event mutates the UI — schedule a few force-display frames */
+static void _mark_display_dirty(void) {
+    if (_force_display_countdown < 5) _force_display_countdown = 5;
+}
+
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     if (!_bridge_root_window || !_fb_mmap) return;
     if (!_cg_CreateColorSpace || !_cg_CreateBitmap) return;
@@ -1131,9 +1146,20 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     ((void(*)(id, SEL))objc_msgSend)(
         _bridge_root_window, sel_registerName("layoutIfNeeded"));
 
-    /* Recursively force entire layer tree to populate backing stores.
-       Without CARenderServer, the normal display cycle never runs. */
-    _force_display_recursive(layer, 0);
+    /* Force-display the layer tree only when needed:
+       - First N frames after startup (to populate backing stores)
+       - After touch events (UI may have changed)
+       - Periodically every 30 frames (~1s) to catch timer-driven UI updates
+       After that, renderInContext: uses cached backing stores — no flashing. */
+    static int _frame_tick = 0;
+    _frame_tick++;
+    if (_force_display_countdown > 0) {
+        _force_display_recursive(layer, 0);
+        _force_display_countdown--;
+    } else if ((_frame_tick % 30) == 0) {
+        /* Periodic refresh to catch NSTimer/performSelector UI updates */
+        _force_display_recursive(layer, 0);
+    }
 
     /* Create bitmap context over framebuffer pixel region */
     void *cs = _cg_CreateColorSpace();
