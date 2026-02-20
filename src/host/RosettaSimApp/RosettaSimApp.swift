@@ -8,6 +8,7 @@ private let kFBInputSize         = 64
 private let kFBMetaSize          = 128  // header + input region
 private let kFBFlagFrameReady: UInt32 = 0x01
 private let kFBFlagAppRunning: UInt32 = 0x02
+private let kFBFlagRendering: UInt32   = 0x04  // Bridge is writing pixels — skip read
 private let kFBDefaultPath       = "/tmp/rosettasim_framebuffer"
 
 // Touch phase constants (must match rosettasim_framebuffer.h)
@@ -216,6 +217,11 @@ class FrameLoader: ObservableObject {
         guard counter != lastFrameCounter else { return }
         lastFrameCounter = counter
 
+        // Note: We don't skip when RENDERING flag is set because for complex apps
+        // the bridge spends most of its time in renderInContext:, making the flag
+        // almost always set. The memcpy below provides sufficient protection against
+        // torn frames — a slightly stale copy is better than no frame at all.
+
         // Read dimensions
         let width  = Int(ptr.load(fromByteOffset: 8, as: UInt32.self))
         let height = Int(ptr.load(fromByteOffset: 12, as: UInt32.self))
@@ -351,6 +357,7 @@ class FrameLoader: ObservableObject {
 /// This replaces the SwiftUI Image + overlay approach which blocked mouse events.
 class SimulatorDisplayView: NSView {
     var onTouch: ((UInt32, Float, Float) -> Void)?
+    var displayFrameCounter: UInt64 = 0
     var displayImage: CGImage? {
         didSet { needsDisplay = true }
     }
@@ -420,7 +427,14 @@ struct SimulatorDisplayRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: SimulatorDisplayView, context: Context) {
-        nsView.displayImage = frameLoader.currentCGImage
+        // Only update the image when the frame counter has changed.
+        // SwiftUI calls updateNSView on every state change (fps, frameCount, etc.)
+        // but we should only trigger needsDisplay when there's actually a new frame.
+        let counter = frameLoader.frameCount
+        if counter != nsView.displayFrameCounter {
+            nsView.displayFrameCounter = counter
+            nsView.displayImage = frameLoader.currentCGImage
+        }
     }
 }
 

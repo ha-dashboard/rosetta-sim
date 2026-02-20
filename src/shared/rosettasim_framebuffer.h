@@ -30,6 +30,7 @@
 /* Flags */
 #define ROSETTASIM_FB_FLAG_FRAME_READY  0x01
 #define ROSETTASIM_FB_FLAG_APP_RUNNING  0x02
+#define ROSETTASIM_FB_FLAG_RENDERING    0x04  /* Bridge is writing pixels — host should skip read */
 
 /* Touch phase (matches UITouchPhase) */
 #define ROSETTASIM_TOUCH_NONE      0

@@ -548,6 +548,56 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
         }
     }
 
+    /* Complete app lifecycle: post notifications and call delegate methods that
+       the normal UIApplicationMain would have fired. Many apps rely on these for
+       theme setup, timers, network initialization, etc. */
+    {
+        id sharedApp = appClass ? ((id(*)(id, SEL))objc_msgSend)(
+            (id)appClass, sel_registerName("sharedApplication")) : nil;
+
+        Class nsCenterClass = objc_getClass("NSNotificationCenter");
+        id center = nsCenterClass ? ((id(*)(id, SEL))objc_msgSend)(
+            (id)nsCenterClass, sel_registerName("defaultCenter")) : nil;
+
+        /* Post UIApplicationDidFinishLaunchingNotification */
+        if (center) {
+            id notifName = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                (id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"),
+                "UIApplicationDidFinishLaunchingNotification");
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+                center, sel_registerName("postNotificationName:object:userInfo:"),
+                notifName, sharedApp, nil);
+            bridge_log("  Posted UIApplicationDidFinishLaunchingNotification");
+        }
+
+        /* Call applicationDidBecomeActive: — triggers theme setup, timers, etc. */
+        if (_bridge_delegate && sharedApp) {
+            SEL didBecomeActiveSel = sel_registerName("applicationDidBecomeActive:");
+            if (class_respondsToSelector(object_getClass(_bridge_delegate), didBecomeActiveSel)) {
+                bridge_log("  Calling applicationDidBecomeActive:");
+                @try {
+                    ((void(*)(id, SEL, id))objc_msgSend)(
+                        _bridge_delegate, didBecomeActiveSel, sharedApp);
+                } @catch (id e) {
+                    bridge_log("  applicationDidBecomeActive: threw exception (continuing)");
+                }
+            }
+        }
+
+        /* Post UIApplicationDidBecomeActiveNotification */
+        if (center) {
+            id notifName = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                (id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"),
+                "UIApplicationDidBecomeActiveNotification");
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+                center, sel_registerName("postNotificationName:object:userInfo:"),
+                notifName, sharedApp, nil);
+            bridge_log("  Posted UIApplicationDidBecomeActiveNotification");
+        }
+    }
+
     /* Set up continuous frame capture before starting the run loop */
     bridge_log("  Setting up frame capture...");
     find_root_window(_bridge_delegate);
@@ -1112,8 +1162,11 @@ static void _dump_view_hierarchy(id view, int depth) {
 /* Track whether we need to force-display the layer tree.
  * Set to a positive count on startup and after touch events.
  * Decremented each frame; when 0, skip force-display (use cached backing stores).
- * This prevents the flashing caused by recreating backing stores every frame. */
-static int _force_display_countdown = 10;  /* Force first 10 frames */
+ *
+ * Higher initial count for complex apps (hass-dashboard loads UI during
+ * makeKeyAndVisible, consuming early frames before views are laid out).
+ * Periodic refresh catches timer-driven updates (animations, network responses). */
+static int _force_display_countdown = 60;  /* Force first 60 frames (~2s) */
 
 /* Called after a touch event mutates the UI — schedule a few force-display frames */
 static void _mark_display_dirty(void) {
@@ -1150,30 +1203,28 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
        triggering UIKit's BKSEventFocusManager which needs backboardd) */
     ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
 
-    /* Flush pending CATransaction changes (no CARenderServer to do this) */
-    Class caTransaction = objc_getClass("CATransaction");
-    if (caTransaction) {
-        ((void(*)(id, SEL))objc_msgSend)((id)caTransaction, sel_registerName("flush"));
-    }
+    /* Flush pending CATransaction changes and force layout + display every frame.
+     *
+     * Without CARenderServer, there's no display cycle — we must populate backing
+     * stores ourselves. Animated views (HAConstellationView) and timer-driven updates
+     * continuously call setNeedsDisplay, invalidating cached backing stores.
+     * Force-display every frame keeps the output stable.
+     *
+     * The original session 2 "flashing" was caused by:
+     *   1. Duplicate processes writing to the same framebuffer (fixed)
+     *   2. Host displayImage didSet firing on every SwiftUI update (fixed)
+     * With those root causes fixed, per-frame force-display is stable. */
+    {
+        Class caTransaction = objc_getClass("CATransaction");
+        if (caTransaction) {
+            ((void(*)(id, SEL))objc_msgSend)((id)caTransaction, sel_registerName("flush"));
+        }
 
-    /* Force layout */
-    ((void(*)(id, SEL))objc_msgSend)(
-        _bridge_root_window, sel_registerName("setNeedsLayout"));
-    ((void(*)(id, SEL))objc_msgSend)(
-        _bridge_root_window, sel_registerName("layoutIfNeeded"));
+        ((void(*)(id, SEL))objc_msgSend)(
+            _bridge_root_window, sel_registerName("setNeedsLayout"));
+        ((void(*)(id, SEL))objc_msgSend)(
+            _bridge_root_window, sel_registerName("layoutIfNeeded"));
 
-    /* Force-display the layer tree only when needed:
-       - First N frames after startup (to populate backing stores)
-       - After touch events (UI may have changed)
-       - Periodically every 30 frames (~1s) to catch timer-driven UI updates
-       After that, renderInContext: uses cached backing stores — no flashing. */
-    static int _frame_tick = 0;
-    _frame_tick++;
-    if (_force_display_countdown > 0) {
-        _force_display_recursive(layer, 0);
-        _force_display_countdown--;
-    } else if ((_frame_tick % 30) == 0) {
-        /* Periodic refresh to catch NSTimer/performSelector UI updates */
         _force_display_recursive(layer, 0);
     }
 
@@ -1183,6 +1234,10 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     void *ctx = _cg_CreateBitmap(pixels, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
+        /* Signal host to skip reads while we write pixels */
+        hdr->flags |= ROSETTASIM_FB_FLAG_RENDERING;
+        __sync_synchronize();
+
         /* Scale for Retina. CG origin is bottom-left; the host app handles
            the vertical flip when displaying. Do NOT flip here — negative Y
            scale mirrors text glyphs rendered by CoreText. */
@@ -1192,7 +1247,8 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
 
-        /* Memory barrier then update header */
+        /* Clear rendering flag, barrier, then update counter */
+        hdr->flags &= ~ROSETTASIM_FB_FLAG_RENDERING;
         __sync_synchronize();
         hdr->frame_counter++;
         hdr->timestamp_ns = mach_absolute_time();
@@ -1448,10 +1504,17 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                                class_getName(object_getClass(rootView)));
                 }
 
-                /* Notify view controller */
+                /* Notify view controller of appearance lifecycle.
+                   Both viewWillAppear: and viewDidAppear: are needed:
+                   - viewWillAppear: triggers UIAppearance proxy application
+                   - viewDidAppear: triggers post-layout theme code in many apps */
                 @try {
                     ((void(*)(id, SEL, bool))objc_msgSend)(rootVC,
                         sel_registerName("viewWillAppear:"), false);
+                } @catch (id e) { /* ignore */ }
+                @try {
+                    ((void(*)(id, SEL, bool))objc_msgSend)(rootVC,
+                        sel_registerName("viewDidAppear:"), false);
                 } @catch (id e) { /* ignore */ }
             }
         }
