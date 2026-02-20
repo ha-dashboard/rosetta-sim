@@ -264,14 +264,75 @@ static void replacement_GSRegisterPurpleNamedPort(const char *name) {
 }
 
 /* ================================================================
+ * bootstrap_register2 interposition
+ *
+ * _GSRegisterPurpleNamedPortInPrivateNamespace (internal to
+ * GraphicsServices) calls bootstrap_register2() which fails because
+ * the bootstrap server doesn't have these services registered.
+ * We interpose bootstrap_register2 to actually register the port,
+ * using our fixed bootstrap_port. This lets _GSEventInitializeApp
+ * complete normally instead of aborting, which in turn lets
+ * UIApplicationMain proceed through full UIKit initialization
+ * (UIEventDispatcher, UIGestureEnvironment, etc.).
+ * ================================================================ */
+
+/* bootstrap functions — declared manually because simulator SDK
+ * doesn't include servers/bootstrap.h */
+extern kern_return_t bootstrap_register(mach_port_t bp, const char *service_name,
+                                         mach_port_t sp);
+extern kern_return_t bootstrap_register2(mach_port_t bp, const char *service_name,
+                                          mach_port_t sp, int flags);
+
+static kern_return_t replacement_bootstrap_register2(mach_port_t bp,
+                                                      const char *service_name,
+                                                      mach_port_t sp,
+                                                      int flags) {
+    /* Allocate a receive right if the provided port is null */
+    mach_port_t actual_port = sp;
+    if (actual_port == MACH_PORT_NULL) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &actual_port);
+        mach_port_insert_right(mach_task_self(), actual_port,
+                               actual_port, MACH_MSG_TYPE_MAKE_SEND);
+    }
+
+    /* Try the real bootstrap_register2 with our fixed bootstrap port */
+    mach_port_t real_bp = bp;
+    if (real_bp == MACH_PORT_NULL) {
+        task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &real_bp);
+    }
+
+    kern_return_t kr = KERN_SUCCESS;
+    if (real_bp != MACH_PORT_NULL) {
+        /* Try real registration first */
+        kr = bootstrap_register(real_bp, (char *)service_name, actual_port);
+        if (kr == KERN_SUCCESS) {
+            bridge_log("bootstrap_register2(\"%s\") → SUCCESS (port 0x%x)",
+                       service_name ? service_name : "(null)", actual_port);
+            return KERN_SUCCESS;
+        }
+    }
+
+    /* Registration failed (already registered, or bootstrap doesn't support it).
+     * Return success anyway — the caller (GraphicsServices) just needs to
+     * not abort(). The port won't actually be reachable via bootstrap_look_up,
+     * but that's OK for our use case. */
+    bridge_log("bootstrap_register2(\"%s\") → FAKED SUCCESS (real kr=%d, port 0x%x)",
+               service_name ? service_name : "(null)", kr, actual_port);
+    return KERN_SUCCESS;
+}
+
+/* ================================================================
  * abort() guard for surviving bootstrap_register failures
  *
  * GSRegisterPurpleNamedPerPIDPort calls abort() when
  * bootstrap_register fails. We interpose abort() and use
- * setjmp/longjmp to recover.
+ * setjmp/longjmp to recover. This is a safety net — with
+ * bootstrap_register2 interposed, aborts should be rare.
  * ================================================================ */
 
 extern void abort(void);
+extern void exit(int status);
+extern void _exit(int status);
 
 static __thread jmp_buf _abort_recovery;
 static __thread int _abort_guard_active = 0;
@@ -294,6 +355,26 @@ static void replacement_abort(void) {
     }
     bridge_log("abort() called (#%d) outside guard → terminating", _abort_count);
     _exit(134);
+}
+
+/*
+ * Replace exit() - catch workspace server disconnect exit during init.
+ * The FBSWorkspace connection failure calls exit() on an XPC callback thread.
+ * During startup (_init_phase = 1), we block ALL exits. After the app enters
+ * the run loop, we allow exits normally.
+ */
+static volatile int _init_phase = 1;  /* 1 = during startup, 0 = app running */
+
+static void replacement_exit(int status) {
+    if (_init_phase) {
+        bridge_log("exit(%d) BLOCKED during init phase (workspace disconnect expected)", status);
+        /* Don't exit — the workspace connection failing is expected in RosettaSim.
+         * Just return and let the caller continue. exit() returning is UB but
+         * works in practice — the caller typically returns after calling exit(). */
+        return;
+    }
+    bridge_log("exit(%d) called in running phase → terminating", status);
+    _exit(status);
 }
 
 /* ================================================================
@@ -603,6 +684,9 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
     bridge_log("  Setting up frame capture...");
     find_root_window(_bridge_delegate);
     start_frame_capture();
+
+    /* Mark init complete — exit() calls are now allowed */
+    _init_phase = 0;
 
     /* Start the run loop */
     bridge_log("  Starting CFRunLoop...");
@@ -2021,9 +2105,17 @@ __attribute__((section("__DATA,__interpose"))) = {
     { (const void *)replacement_UIApplicationMain,
       (const void *)UIApplicationMain },
 
+    /* bootstrap_register2 - make Purple port registration succeed */
+    { (const void *)replacement_bootstrap_register2,
+      (const void *)bootstrap_register2 },
+
     /* abort() - intercept to survive bootstrap_register failures */
     { (const void *)replacement_abort,
       (const void *)abort },
+
+    /* exit() - intercept workspace server disconnect exit during init */
+    { (const void *)replacement_exit,
+      (const void *)exit },
 };
 
 /* ================================================================
@@ -2378,6 +2470,24 @@ static void swizzle_bks_methods(void) {
         if (kwMethod) {
             method_setImplementation(kwMethod, (IMP)replacement_keyWindow);
             bridge_log("  Swizzled UIApplication.keyWindow");
+        }
+    }
+
+    /* UIApplication.workspaceShouldExit: — called when FBSWorkspace connection
+       fails (no SpringBoard). Without this swizzle, the app calls exit().
+       In RosettaSim there is no SpringBoard — this is expected, not an error. */
+    if (appClass) {
+        SEL wseSel = sel_registerName("workspaceShouldExit:");
+        Method wseMethod = class_getInstanceMethod(appClass, wseSel);
+        if (wseMethod) {
+            method_setImplementation(wseMethod, (IMP)_noopMethod);
+            bridge_log("  Swizzled UIApplication.workspaceShouldExit:");
+        }
+        SEL wse2Sel = sel_registerName("workspaceShouldExit:withTransitionContext:");
+        Method wse2Method = class_getInstanceMethod(appClass, wse2Sel);
+        if (wse2Method) {
+            method_setImplementation(wse2Method, (IMP)_noopMethod);
+            bridge_log("  Swizzled UIApplication.workspaceShouldExit:withTransitionContext:");
         }
     }
 
