@@ -345,6 +345,11 @@ class FrameLoader: ObservableObject {
 
     /// Send a key event to the shared framebuffer input region.
     /// Keyboard fields are after the touch ring buffer in the input region.
+    ///
+    /// IMPORTANT: Write key_char and key_flags BEFORE key_code.
+    /// The bridge uses key_code != 0 as the signal that a new key event
+    /// is ready. If we write key_code first, the bridge may read a partial
+    /// event (key_code set but key_char still 0 from previous clear).
     func sendKeyEvent(keyCode: UInt16, modifierFlags: UInt32, character: Character?) {
         guard let ptr = mmapPtr else { return }
 
@@ -354,13 +359,7 @@ class FrameLoader: ObservableObject {
         // Keyboard fields are after touch_write_index (8) + touch_ring (16*32=512) = offset 520
         let keyBase = inputPtr.advanced(by: 8 + kTouchRingSize * kTouchEventSize)
 
-        // Write key_code (offset 0 from keyBase)
-        keyBase.advanced(by: 0).assumingMemoryBound(to: UInt32.self).pointee = UInt32(keyCode)
-
-        // Write key_flags (offset 4)
-        keyBase.advanced(by: 4).assumingMemoryBound(to: UInt32.self).pointee = modifierFlags
-
-        // Write key_char (offset 8) - first UTF-8 scalar value
+        // Step 1: Write key_char FIRST (offset 8) - first UTF-8 scalar value
         let keyCharPtr = keyBase.advanced(by: 8).assumingMemoryBound(to: UInt32.self)
         if let ch = character {
             keyCharPtr.pointee = UInt32(ch.unicodeScalars.first?.value ?? 0)
@@ -368,11 +367,24 @@ class FrameLoader: ObservableObject {
             keyCharPtr.pointee = 0
         }
 
-        // Memory barrier to ensure key fields are visible
+        // Step 2: Write key_flags (offset 4)
+        keyBase.advanced(by: 4).assumingMemoryBound(to: UInt32.self).pointee = modifierFlags
+
+        // Step 3: Memory barrier to ensure char and flags are visible before the signal
         OSMemoryBarrier()
 
-        // Keyboard events are signaled by key_code being non-zero.
-        // DO NOT increment touch_write_index.
+        // Step 4: Write key_code LAST (offset 0) — this is the signal to the bridge
+        // that a complete key event is ready to be processed.
+        // For regular character input without a specific keyCode, use a sentinel
+        // value (0xFFFF) so the bridge sees a non-zero key_code even when the
+        // real keyCode is 0.
+        let effectiveKeyCode = UInt32(keyCode)
+        if effectiveKeyCode == 0 && character != nil {
+            // Character-only input (no specific keyCode) — use sentinel
+            keyBase.advanced(by: 0).assumingMemoryBound(to: UInt32.self).pointee = 0xFFFF
+        } else {
+            keyBase.advanced(by: 0).assumingMemoryBound(to: UInt32.self).pointee = effectiveKeyCode
+        }
     }
 
     /// Load a single frame from a PNG file (legacy/fallback)
@@ -445,6 +457,27 @@ class SimulatorDisplayView: NSView {
         }
 
         onKeyEvent?(keyCode, modifiers, character)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        // Consume keyUp to prevent the system beep and avoid
+        // AppKit thinking keys are stuck.
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Consume modifier key changes to prevent AppKit from
+        // intercepting Command/Option/Shift for menu shortcuts.
+    }
+
+    /// Intercept keyboard shortcuts before AppKit/SwiftUI menu system
+    /// captures them. This ensures all key events reach our keyDown handler.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only intercept if we're the first responder
+        if window?.firstResponder === self {
+            keyDown(with: event)
+            return true  // We handled it — don't pass to menu bar
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -530,32 +563,47 @@ struct DeviceChromeView: View {
     let device: DeviceConfig
     @ObservedObject var frameLoader: FrameLoader
 
+    // Bezel padding around the screen
+    private let bezelH: CGFloat = 20  // horizontal padding each side
+    private let bezelV: CGFloat = 70  // vertical padding top/bottom (for speaker/home button)
+    private let cornerR: CGFloat = 40
+
     var body: some View {
-        ZStack {
-            // Device bezel
-            RoundedRectangle(cornerRadius: 40)
-                .fill(Color(NSColor.darkGray))
-                .shadow(radius: 20)
+        GeometryReader { geo in
+            let available = geo.size
+            // Available space for the screen area (inside bezel)
+            let screenMaxW = available.width - bezelH * 2
+            let screenMaxH = available.height - bezelV * 2
+            // Fit screen into available area maintaining aspect ratio
+            let scaleW = screenMaxW / CGFloat(device.width)
+            let scaleH = screenMaxH / CGFloat(device.height)
+            let scale = min(scaleW, scaleH, 2.0)  // cap at 2x to avoid blurry upscaling
+            let screenW = CGFloat(device.width) * scale
+            let screenH = CGFloat(device.height) * scale
+            let chromeW = screenW + bezelH * 2
+            let chromeH = screenH + bezelV * 2
 
-            // Screen area
-            VStack(spacing: 0) {
-                Spacer().frame(height: 60)
+            ZStack {
+                // Device bezel
+                RoundedRectangle(cornerRadius: cornerR)
+                    .fill(Color(NSColor.darkGray))
+                    .shadow(radius: 10)
 
-                // Single NSView handles both display AND mouse events
-                SimulatorDisplayRepresentable(frameLoader: frameLoader)
-                    .frame(
-                        width: CGFloat(device.width),
-                        height: CGFloat(device.height)
-                    )
-                    .cornerRadius(8)
+                // Screen area
+                VStack(spacing: 0) {
+                    Spacer().frame(height: bezelV)
 
-                Spacer().frame(height: 60)
+                    // Single NSView handles both display AND mouse events
+                    SimulatorDisplayRepresentable(frameLoader: frameLoader)
+                        .frame(width: screenW, height: screenH)
+                        .cornerRadius(8)
+
+                    Spacer().frame(height: bezelV)
+                }
             }
+            .frame(width: chromeW, height: chromeH)
+            .position(x: available.width / 2, y: available.height / 2)
         }
-        .frame(
-            width: CGFloat(device.width) + 40,
-            height: CGFloat(device.height) + 140
-        )
     }
 }
 

@@ -48,8 +48,17 @@ static void find_root_window(id delegate);
 static void start_frame_capture(void);
 static void _mark_display_dirty(void);
 
-/* Display refresh control — declared early for use by _force_display_recursive */
-static int _force_full_refresh = 1;  /* Start with full refresh */
+/* Display refresh control — declared early for use by _force_display_recursive.
+ *
+ * _force_full_refresh: When 1, setNeedsDisplay is called on ALL layers with
+ * custom drawing, even those that already have content. This destroys cached
+ * backing stores (tint colors, selection states, etc.) and should ONLY be used
+ * during initial startup when content has never been drawn.
+ *
+ * For interaction-driven updates (touch, keyboard), use _force_display_countdown
+ * which calls setNeedsDisplay only on layers WITHOUT content (nil backing store).
+ * This preserves tint colors and selection state while still populating new layers. */
+static int _force_full_refresh = 1;  /* Only for initial startup */
 
 /* ================================================================
  * Logging
@@ -1100,10 +1109,40 @@ static void _force_display_recursive(id layer, int depth) {
             }
         }
 
-        /* Note: Private UIKit views (class name starts with '_') that only use
-         * backgroundColor are NOT force-displayed. The drawRect:/drawLayer:/
-         * displayLayer: checks above already cover private views that override
-         * those methods. No additional check is needed. */
+        /* 4. UISegmentedControl and views using tintColor-based rendering.
+         * UISegmentedControl's selected segment appearance is applied via
+         * template image colorization, which normally happens through
+         * CARenderServer's compositing pipeline. Without CARenderServer,
+         * the colorization doesn't happen automatically. Force these views
+         * to regenerate their appearance by calling tintColorDidChange.
+         *
+         * Also handle UIImageView with renderingMode=AlwaysTemplate, which
+         * uses tintColor for colorization. */
+        {
+            Class segClass = objc_getClass("UISegmentedControl");
+            Class imgViewClass = objc_getClass("UIImageView");
+            int isTintDependent = 0;
+            Class c = cls;
+            while (c) {
+                if ((segClass && c == segClass) ||
+                    (imgViewClass && c == imgViewClass)) {
+                    isTintDependent = 1;
+                    break;
+                }
+                c = class_getSuperclass(c);
+            }
+            if (isTintDependent) {
+                hasCustomDrawing = 1;
+                /* Trigger tintColor re-application which regenerates
+                 * template images and selection highlights */
+                SEL tintDidChangeSel = sel_registerName("tintColorDidChange");
+                if (class_respondsToSelector(cls, tintDidChangeSel)) {
+                    @try {
+                        ((void(*)(id, SEL))objc_msgSend)(delegate, tintDidChangeSel);
+                    } @catch (id e) { /* ignore */ }
+                }
+            }
+        }
 
         if (hasCustomDrawing) {
             /* Call setNeedsDisplay if:
@@ -1327,6 +1366,12 @@ static void check_and_inject_touch(void) {
         double tx = (double)ev->touch_x;
         double ty = (double)ev->touch_y;
 
+        /* NOTE: Do NOT wrap _inject_single_touch in @autoreleasepool here.
+         * _inject_single_touch uses siglongjmp for crash recovery, and jumping
+         * out of @autoreleasepool corrupts the ARC pool stack, causing a fatal
+         * crash in _wrapRunLoopWithAutoreleasePoolHandler on the next run loop
+         * iteration. The sendEvent: call inside _inject_single_touch has its
+         * own @autoreleasepool that is only entered on the non-crash path. */
         _inject_single_touch(phase, tx, ty);
     }
 
@@ -1755,15 +1800,17 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                 _sendEvent_guard_active = 1;
                 int crash_sig = sigsetjmp(_sendEvent_recovery, 1);
                 if (crash_sig == 0) {
-                    /* Wrap in @autoreleasepool to isolate any autorelease pool
-                     * corruption during crash recovery. Without this, siglongjmp
-                     * from the SIGSEGV handler can leave the ObjC autorelease pool
-                     * stack inconsistent, causing later crashes in
-                     * _wrapRunLoopWithAutoreleasePoolHandler. */
-                    @autoreleasepool {
+                    /* IMPORTANT: Do NOT use @autoreleasepool here.
+                     * If sendEvent: crashes, siglongjmp jumps OUT of the pool
+                     * block, which corrupts the ARC autorelease pool stack.
+                     * The next run loop iteration then crashes fatally in
+                     * _wrapRunLoopWithAutoreleasePoolHandler.
+                     *
+                     * Any autorelease'd objects created during sendEvent: will
+                     * be drained by the run loop's own autorelease pool at the
+                     * end of the current iteration. */
                     bridge_log("  Delivering via [UIApplication sendEvent:]");
                     ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, touchesEvent);
-                    }
                     _sendEvent_guard_active = 0;
                     sendEvent_succeeded = 1;
                     _sendEvent_crash_count = 0; /* Reset on success */
@@ -2184,14 +2231,20 @@ static void check_and_inject_keyboard(void) {
     uint32_t key_flags = inp->key_flags;
     uint32_t key_char = inp->key_char;
 
-    /* No pending key event — check both key_code and key_char since
-     * regular character input may have key_code=0 with key_char set */
-    if (key_code == 0 && key_char == 0) return;
+    /* No pending key event — key_code is the signal from the host.
+     * The host writes key_char and key_flags BEFORE key_code to avoid
+     * the bridge seeing a partial event. key_code==0 means no event. */
+    if (key_code == 0) return;
 
-    /* Clear key_code immediately to acknowledge processing */
+    /* Clear key_code immediately to acknowledge processing.
+     * key_code is cleared first (it's the signal), then the others. */
     inp->key_code = 0;
     inp->key_flags = 0;
     inp->key_char = 0;
+
+    /* Handle sentinel value: 0xFFFF means "character-only input, no specific
+     * key code." Convert to 0 for dispatch so character-specific paths fire. */
+    if (key_code == 0xFFFF) key_code = 0;
     __sync_synchronize();
 
     bridge_log("Keyboard event: code=%u flags=0x%x char=0x%x ('%c')",
@@ -2659,10 +2712,20 @@ static void _dump_view_hierarchy(id view, int depth) {
  * Periodic refresh catches timer-driven updates (animations, network responses). */
 static int _force_display_countdown = 60;  /* Force first 60 frames (~2s) */
 
-/* Called after a touch or keyboard event mutates the UI */
+/* Called after a touch or keyboard event mutates the UI.
+ *
+ * Sets the countdown to trigger _force_display_recursive for the next few
+ * frames, but does NOT set _force_full_refresh. This ensures layers that
+ * don't yet have content get populated (nil backing store → setNeedsDisplay),
+ * while layers that DO have content (tint colors, selection states, etc.)
+ * keep their cached backing stores intact.
+ *
+ * _force_full_refresh is only used during initial startup (first 60 frames)
+ * when no content has been drawn yet. */
 static void _mark_display_dirty(void) {
-    if (_force_display_countdown < 5) _force_display_countdown = 5;
-    _force_full_refresh = 1;
+    if (_force_display_countdown < 10) _force_display_countdown = 10;
+    /* Do NOT set _force_full_refresh — that destroys cached backing stores
+     * (tint colors, selection states) which causes visual regressions. */
 }
 
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
@@ -2677,7 +2740,10 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         bridge_log("=== End Dump ===");
     }
 
-    /* Check for and inject touch events from host */
+    /* Check for and inject touch events from host.
+     * Touch injection is wrapped in per-event @autoreleasepool (inside
+     * check_and_inject_touch) to isolate crash recovery from the outer
+     * run loop's autorelease pool. */
     check_and_inject_touch();
 
     /* Check for and inject keyboard events from host */
@@ -2705,7 +2771,33 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
      * force-populate layer backing stores (startup, after touch, periodic refresh).
      *
      * Optimization: when countdown is 0, still flush + layout (needed for timers
-     * and animations), but skip the expensive _force_display_recursive walk. */
+     * and animations), but skip the expensive _force_display_recursive walk.
+     *
+     * The entire layout+render section is wrapped in a SIGSEGV crash guard.
+     * UIScrollView's pan gesture recognizer modifies contentOffset, which can
+     * trigger CA internal layout passes that crash without CARenderServer.
+     * We catch the crash and skip that frame rather than killing the process. */
+    static sigjmp_buf _render_recovery;
+    static volatile sig_atomic_t _render_guard_active = 0;
+    if (!_sendEvent_handlers_installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = _sendEvent_crash_handler_siginfo;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
+        sigaction(SIGBUS, &sa, &_prev_sigbus_action);
+        _sendEvent_handlers_installed = 1;
+    }
+
+    _sendEvent_guard_active = 1;
+    int render_crash = sigsetjmp(_sendEvent_recovery, 1);
+    if (render_crash != 0) {
+        _sendEvent_guard_active = 0;
+        bridge_log("frame_capture_tick: layout/render CRASHED (signal %d) — skipping frame", render_crash);
+        return;
+    }
+
     int need_force_display = 0;
     if (_force_display_countdown > 0) {
         _force_display_countdown--;
@@ -2817,6 +2909,8 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
     }
     _cg_ReleaseCS(cs);
+
+    _sendEvent_guard_active = 0;
 }
 
 /*

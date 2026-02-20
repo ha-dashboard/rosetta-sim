@@ -2,11 +2,12 @@
  * fb_interact.c — Send a sequence of touches/keys to the simulator
  *
  * Usage: ./tests/fb_interact <command> [args...]
- *   tap <x> <y>          — send BEGAN + ENDED at (x,y)
- *   type <text>          — send each character as key_char
- *   key <keycode>        — send a special key (51=backspace, 36=return, etc.)
- *   wait <ms>            — sleep for N milliseconds
- *   screenshot <path>    — take a framebuffer screenshot via python
+ *   tap <x> <y>              — send BEGAN + ENDED at (x,y)
+ *   drag <x1> <y1> <x2> <y2> — drag from (x1,y1) to (x2,y2)
+ *   type <text>              — send each character as key_char
+ *   key <keycode>            — send a special key (51=backspace, 36=return, etc.)
+ *   wait <ms>                — sleep for N milliseconds
+ *   screenshot <path>        — take a framebuffer screenshot via python
  *
  * Compile: clang -o tests/fb_interact tests/fb_interact.c
  */
@@ -59,13 +60,35 @@ static void send_tap(float x, float y) {
     send_touch(3, x, y); /* ENDED */
 }
 
+/* Send a drag gesture: BEGAN at (x1,y1), MOVED steps to (x2,y2), then ENDED */
+static void send_drag(float x1, float y1, float x2, float y2, int steps) {
+    if (steps < 1) steps = 1;
+    send_touch(1, x1, y1); /* BEGAN */
+    usleep(30000);
+    for (int s = 1; s <= steps; s++) {
+        float t = (float)s / (float)steps;
+        float mx = x1 + (x2 - x1) * t;
+        float my = y1 + (y2 - y1) * t;
+        send_touch(2, mx, my); /* MOVED */
+        usleep(16000); /* ~60Hz */
+    }
+    usleep(30000);
+    send_touch(3, x2, y2); /* ENDED */
+}
+
 static void send_key(uint32_t code, uint32_t ch) {
     uint8_t *input = (uint8_t *)g_mmap + FB_HEADER;
     uint8_t *kb = input + 8 + (RING_SIZE * EVENT_SIZE);
-    *(uint32_t *)(kb + 0) = code;
-    *(uint32_t *)(kb + 4) = 0; /* flags */
-    *(uint32_t *)(kb + 8) = ch;
+    /* Write key_char and key_flags BEFORE key_code.
+     * The bridge uses key_code != 0 as the signal that a new event is ready.
+     * Writing key_code last prevents the bridge from reading a partial event.
+     * For character-only input (code==0, ch!=0), use sentinel 0xFFFF. */
+    *(uint32_t *)(kb + 8) = ch;       /* key_char first */
+    *(uint32_t *)(kb + 4) = 0;        /* key_flags */
     __sync_synchronize();
+    uint32_t effective_code = code;
+    if (effective_code == 0 && ch != 0) effective_code = 0xFFFF;
+    *(uint32_t *)(kb + 0) = effective_code;  /* key_code LAST (signal) */
 }
 
 int main(int argc, char *argv[]) {
@@ -83,6 +106,13 @@ int main(int argc, char *argv[]) {
             send_tap(x, y);
             usleep(200000);
             i += 3;
+        } else if (strcmp(argv[i], "drag") == 0 && i + 4 < argc) {
+            float x1 = atof(argv[i+1]), y1 = atof(argv[i+2]);
+            float x2 = atof(argv[i+3]), y2 = atof(argv[i+4]);
+            printf("drag (%.0f,%.0f) → (%.0f,%.0f)\n", x1, y1, x2, y2);
+            send_drag(x1, y1, x2, y2, 10);
+            usleep(200000);
+            i += 5;
         } else if (strcmp(argv[i], "type") == 0 && i + 1 < argc) {
             const char *text = argv[i+1];
             printf("type '%s'\n", text);
