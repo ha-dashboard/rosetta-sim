@@ -970,11 +970,17 @@ static void check_and_inject_touch(void) {
                     sel_registerName("setView:"), targetView);
             } @catch (id e) { /* fall through */ }
 
-            /* Set timestamp */
+            /* Set timestamp — use [[NSProcessInfo processInfo] systemUptime]
+               (instance method on shared processInfo, NOT class method) */
             @try {
-                double ts = ((double(*)(id, SEL))objc_msgSend)(
-                    (id)objc_getClass("NSProcessInfo"),
-                    sel_registerName("systemUptime"));
+                Class piClass = objc_getClass("NSProcessInfo");
+                id pi = piClass ? ((id(*)(id, SEL))objc_msgSend)(
+                    (id)piClass, sel_registerName("processInfo")) : nil;
+                double ts = 0;
+                if (pi) {
+                    ts = ((double(*)(id, SEL))objc_msgSend)(
+                        pi, sel_registerName("systemUptime"));
+                }
                 if (ts <= 0) ts = (double)mach_absolute_time() / 1e9;
                 ((void(*)(id, SEL, double))objc_msgSend)(
                     _bridge_current_touch,
@@ -1036,15 +1042,25 @@ static void check_and_inject_touch(void) {
 
 direct_delivery:
     /* ---- Approach 2: Direct touch method dispatch (fallback) ---- */
-    /* Works for custom UIView subclasses with touchesBegan: overrides */
+    bridge_log("  Direct delivery to %s", class_getName(object_getClass(targetView)));
     if (touchSel) {
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
-            id emptySet = ((id(*)(id, SEL))objc_msgSend)(
-                (id)objc_getClass("NSSet"), sel_registerName("set"));
+            /* Build touch set — include UITouch if we have one, otherwise empty */
+            id touchSetForDelivery;
+            if (_bridge_current_touch) {
+                touchSetForDelivery = ((id(*)(id, SEL, id))objc_msgSend)(
+                    (id)objc_getClass("NSSet"),
+                    sel_registerName("setWithObject:"),
+                    _bridge_current_touch);
+            } else {
+                touchSetForDelivery = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)objc_getClass("NSSet"), sel_registerName("set"));
+            }
             @try {
                 ((void(*)(id, SEL, id, id))objc_msgSend)(
-                    targetView, touchSel, emptySet, nil);
+                    targetView, touchSel, touchSetForDelivery, nil);
+                bridge_log("  Direct delivery succeeded");
             } @catch (id e) {
                 bridge_log("  Direct touch delivery failed: exception caught");
             }
