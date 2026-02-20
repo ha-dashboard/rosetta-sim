@@ -38,11 +38,7 @@ Xcode-8.3.3.app/Contents/
 │   └── dvt_plugin_hook.dylib      [NEW: DVT plugin system hooks]
 ├── PlugIns/
 │   └── IDEInterfaceBuilderKit.fw  [PATCHED: AppKit→AppKit_compat]
-├── PlugIns.disabled/              [Incompatible plugins moved here]
-│   ├── DebuggerLLDB*.ideplugin
-│   ├── IDEInterfaceBuilder*.framework
-│   ├── GPU*.ideplugin
-│   └── ...
+├── PlugIns/                       [All 120 plugins load — IB, LLDB, GPU all enabled]
 └── Developer/Platforms/           [All platforms intact]
 ```
 
@@ -95,9 +91,8 @@ Xcode-8.3.3.app/Contents/
 ### Remaining Issues
 
 1. **Simulator display — the final blocker** — iOS 9.3 boots ~40 processes, backboardd starts, SpringBoard launches but crashes in FBSceneManager because there's no display. Three possible paths forward:
-   - **Path A: RosettaSim bridge injection** — patch BackBoardServices.framework in the runtime to load a bridge dylib (via LC_LOAD_DYLIB) that interposes BKSDisplayServicesStart with screen info + offscreen rendering. The bridge code already exists and works (`rosettasim_bridge.m`, Phase 5 proven at 29fps).
+   - **Path A: RosettaSim bridge injection** — patch BackBoardServices.framework in the runtime to load a bridge dylib (via LC_LOAD_DYLIB) that interposes BKSDisplayServicesStart with screen info + offscreen rendering. The bridge code already exists and works (`rosettasim_bridge.m`, Phase 5 proven at 29fps). **This is the active path — waiting on RosettaSim bridge agent to reach maturity.**
    - **Path B: SimFramebuffer protocol bridge** — build a v554→v783 protocol translator so the old SimFramebufferClient can talk to the modern host. Complex but would enable native display pipeline.
-   - **Path C: Try iOS 13/14 runtimes** — these may have a compatible enough SimFramebufferClient protocol to work with Xcode 13 host frameworks (iOS 15.7 works natively).
 2. **Simulator download UI broken** — workaround: use `install_sim93.sh`
 3. **LLDB debugging non-functional** — Python 2.7 stub is no-ops, breakpoints/debugger console won't work
 4. **GPU frame capture non-functional** — GPU debugger loads but capture functionality depends on missing system frameworks
