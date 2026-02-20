@@ -686,6 +686,12 @@ static void *_fb_mmap = NULL;    /* Will be set to MAP_FAILED sentinel or valid 
 static size_t _fb_size = 0;
 static id _bridge_root_window = nil;
 
+/* Double-buffer: render to this local buffer, then memcpy to shared framebuffer.
+ * This prevents the host from seeing transient states (CGBitmapContextCreate
+ * clears to white before renderInContext: draws, which causes flashing). */
+static void *_render_buffer = NULL;
+static size_t _render_buffer_size = 0;
+
 /* CoreGraphics function pointers (resolved via dlsym) */
 static void *(*_cg_CreateColorSpace)(void);
 static void *(*_cg_CreateBitmap)(void *, size_t, size_t, size_t, size_t, void *, uint32_t);
@@ -800,16 +806,28 @@ static void _force_display_recursive(id layer, int depth) {
             }
         }
 
-        /* 4. Private UIKit backing views (class name starts with underscore) */
+        /* 4. Private UIKit backing views — only if they actually override drawing.
+         * The old catch-all `className[0] == '_'` created false positives on
+         * container views (_UIBarBackground, _UILayoutGuide) that use only
+         * backgroundColor. Forcing display on them creates empty opaque backing
+         * stores that cover the backgroundColor. */
         if (!hasCustomDrawing) {
             const char *className = class_getName(cls);
             if (className && className[0] == '_') {
-                hasCustomDrawing = 1;
+                /* Verify the private class actually overrides drawRect: */
+                if (drawRectIMP != baseDrawRectIMP) hasCustomDrawing = 1;
             }
         }
 
         if (hasCustomDrawing) {
-            ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+            /* Only call setNeedsDisplay if the layer has no content yet.
+             * Calling setNeedsDisplay on a layer with valid content destroys
+             * the existing backing store, causing a flash until displayIfNeeded
+             * repopulates it. */
+            id contents = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("contents"));
+            if (!contents) {
+                ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+            }
             ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
         }
         /* No custom drawing — skip to preserve backgroundColor rendering */
@@ -1228,33 +1246,40 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         _force_display_recursive(layer, 0);
     }
 
-    /* Create bitmap context over framebuffer pixel region */
+    /* Double-buffer: render into a local buffer first, then memcpy to the
+     * shared framebuffer. This prevents the host from seeing transient states:
+     *   - CGBitmapContextCreate clears to white before renderInContext: draws
+     *   - Partial renders (top half new, bottom half old)
+     * The host only ever sees complete frames. */
+    size_t pixel_size = px_w * px_h * 4;
+    if (!_render_buffer || _render_buffer_size != pixel_size) {
+        if (_render_buffer) free(_render_buffer);
+        _render_buffer = malloc(pixel_size);
+        _render_buffer_size = pixel_size;
+    }
+
     void *cs = _cg_CreateColorSpace();
     /* kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002 */
-    void *ctx = _cg_CreateBitmap(pixels, px_w, px_h, 8, px_w * 4, cs, 0x2002);
+    void *ctx = _cg_CreateBitmap(_render_buffer, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
-        /* Signal host to skip reads while we write pixels */
-        hdr->flags |= ROSETTASIM_FB_FLAG_RENDERING;
-        __sync_synchronize();
-
         /* Scale for Retina. CG origin is bottom-left; the host app handles
            the vertical flip when displaying. Do NOT flip here — negative Y
            scale mirrors text glyphs rendered by CoreText. */
         _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
 
-        /* Render the layer tree into the bitmap */
+        /* Render the layer tree into the local buffer */
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
 
-        /* Clear rendering flag, barrier, then update counter */
-        hdr->flags &= ~ROSETTASIM_FB_FLAG_RENDERING;
+        _cg_Release(ctx);
+
+        /* Copy completed frame to shared framebuffer in one shot */
+        memcpy(pixels, _render_buffer, pixel_size);
         __sync_synchronize();
         hdr->frame_counter++;
         hdr->timestamp_ns = mach_absolute_time();
         hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
-
-        _cg_Release(ctx);
     }
     _cg_ReleaseCS(cs);
 }
