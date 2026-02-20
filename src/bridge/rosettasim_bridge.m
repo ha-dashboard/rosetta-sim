@@ -2562,48 +2562,44 @@ static void check_and_inject_keyboard(void) {
         }
 
         if (shouldInsert) {
-            /* For UITextField: set text property directly because insertText:
-             * requires a fully initialized text input system (UIKeyboardImpl +
-             * UIFieldEditor) which doesn't exist without backboardd.
-             * Appending to the text property works reliably. */
-            int used_setText = 0;
-            if (isTextInput) {
-                SEL textSel = sel_registerName("text");
-                SEL setTextSel = sel_registerName("setText:");
-                if (class_respondsToSelector(object_getClass(firstResponder), textSel) &&
-                    class_respondsToSelector(object_getClass(firstResponder), setTextSel)) {
-                    @try {
-                        id currentText = ((id(*)(id, SEL))objc_msgSend)(
-                            firstResponder, textSel);
-                        id newText;
-                        if (currentText) {
-                            newText = ((id(*)(id, SEL, id))objc_msgSend)(
-                                currentText,
-                                sel_registerName("stringByAppendingString:"),
-                                charStr);
-                        } else {
-                            newText = charStr;
-                        }
-                        ((void(*)(id, SEL, id))objc_msgSend)(
-                            firstResponder, setTextSel, newText);
-                        used_setText = 1;
-                        bridge_log("  setText: '%s' → '%s'", utf8,
-                                   ((const char *(*)(id, SEL))objc_msgSend)(
-                                       newText, sel_registerName("UTF8String")));
-                    } @catch (id e) {
-                        bridge_log("  setText: failed, falling back to insertText:");
-                    }
-                }
-            }
-
-            /* Fallback to insertText: for non-UITextField responders */
-            if (!used_setText) {
+            /* Use insertText: (UIKeyInput protocol) as the primary text input
+             * method. insertText: delegates to UIFieldEditor which updates the
+             * text storage, fires delegate callbacks (shouldChangeCharactersInRange),
+             * maintains caret position, and triggers text validation.
+             *
+             * insertText: does NOT require UIKeyboardImpl — only UIFieldEditor,
+             * which exists when _editing=YES (set during our tap handler).
+             *
+             * Fall back to setText: only if insertText: fails (e.g., _fieldEditor
+             * is nil because _editing wasn't set correctly). */
+            {
+                int delivered = 0;
                 @try {
                     ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, charStr);
-                    bridge_log("  Delivered insertText: '%s'", utf8);
+                    delivered = 1;
+                    bridge_log("  insertText: '%s'", utf8);
                 } @catch (id e) {
-                    bridge_log("  insertText failed for char 0x%x", key_char);
-                    return;
+                    bridge_log("  insertText: threw, falling back to setText:");
+                }
+
+                /* Fallback: setText: for when insertText: fails */
+                if (!delivered && isTextInput) {
+                    @try {
+                        SEL textSel = sel_registerName("text");
+                        SEL setTextSel = sel_registerName("setText:");
+                        id currentText = ((id(*)(id, SEL))objc_msgSend)(
+                            firstResponder, textSel);
+                        id newText = currentText
+                            ? ((id(*)(id, SEL, id))objc_msgSend)(
+                                  currentText, sel_registerName("stringByAppendingString:"), charStr)
+                            : charStr;
+                        ((void(*)(id, SEL, id))objc_msgSend)(
+                            firstResponder, setTextSel, newText);
+                        bridge_log("  setText: fallback '%s'", utf8);
+                    } @catch (id e) {
+                        bridge_log("  setText: fallback also failed");
+                        return;
+                    }
                 }
             }
 
