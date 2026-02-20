@@ -1,13 +1,14 @@
 # RosettaSim Implementation Plan — Session 5 Onwards
 
 **Created**: 2026-02-20T15:58:12Z
-**Status**: All items need proper implementation. No priorities — each is equally important for system fidelity.
+**Updated**: 2026-02-20 (Session 6)
+**Status**: All 17 items implemented in commit ca3e5b8. See `docs/SESSION_6_RESULTS.md` for detailed session results including the IOHIDEvent discovery that makes the native sendEvent pipeline work.
 
 ## Project Overview
 
 RosettaSim runs legacy iOS 10.3 simulator apps on macOS 26 (ARM64 Apple Silicon) via Rosetta 2. The bridge library (`src/bridge/rosettasim_bridge.m`, ~2900 lines) is injected via `DYLD_INSERT_LIBRARIES` into the x86_64 simulator process and provides the services that UIKit expects from backboardd, SpringBoard, and CARenderServer.
 
-**Current state**: The app launches, renders at ~25fps, and the UI is visible. But touch delivery only works for UISegmentedControl (via explicit `setSelectedSegmentIndex:` + `sendActionsForControlEvents:`). Buttons, text fields, scroll views, and keyboard input do not work properly because gesture recognizers never fire.
+**Current state (post-session 6)**: Native `sendEvent:` pipeline works with IOHIDEvent. Gesture recognizers fire. Text input via native `insertText:`. Touch ring buffer with zero event loss. However, `_force_full_refresh` rendering change caused visual regressions (segment colors lost, visual state destroyed). See SESSION_6_RESULTS.md for details and recommendations.
 
 ## Architecture
 
