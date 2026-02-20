@@ -1975,16 +1975,56 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     void *ctx = _cg_CreateBitmap(_render_buffer, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
-        /* Scale for Retina. CG origin is bottom-left; the host app handles
-           the vertical flip when displaying. Do NOT flip here — negative Y
-           scale mirrors text glyphs rendered by CoreText. */
+        /* Scale for Retina. CG origin is bottom-left — we keep positive scale
+         * to avoid CoreText glyph mirroring, then rotate the buffer 180° in
+         * post-processing to convert from CG coordinate space (origin bottom-left)
+         * to raster coordinate space (origin top-left). */
         _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
+
+        /* Pre-fill with window's background color so plain-backgroundColor
+         * views (skipped by _force_display_recursive) are visible.
+         * Use CoreGraphics fill since we're already in a CG context. */
+        {
+            /* Get window.backgroundColor -> CGColor */
+            id bgColor = ((id(*)(id, SEL))objc_msgSend)(
+                _bridge_root_window, sel_registerName("backgroundColor"));
+            if (bgColor) {
+                void *cgColor = ((void *(*)(id, SEL))objc_msgSend)(
+                    bgColor, sel_registerName("CGColor"));
+                if (cgColor) {
+                    void (*cg_SetFillColor)(void *, void *) =
+                        dlsym(RTLD_DEFAULT, "CGContextSetFillColorWithColor");
+                    void (*cg_FillRect)(void *, _RSBridgeCGRect) =
+                        dlsym(RTLD_DEFAULT, "CGContextFillRect");
+                    if (cg_SetFillColor && cg_FillRect) {
+                        cg_SetFillColor(ctx, cgColor);
+                        _RSBridgeCGRect fullScreen = {0, 0, kScreenWidth, kScreenHeight};
+                        cg_FillRect(ctx, fullScreen);
+                    }
+                }
+            } else {
+                /* No backgroundColor set — fill with white as default */
+                void (*cg_SetGray)(void *, double, double) =
+                    dlsym(RTLD_DEFAULT, "CGContextSetGrayFillColor");
+                void (*cg_FillRect)(void *, _RSBridgeCGRect) =
+                    dlsym(RTLD_DEFAULT, "CGContextFillRect");
+                if (cg_SetGray && cg_FillRect) {
+                    cg_SetGray(ctx, 1.0, 1.0);  /* white, full alpha */
+                    _RSBridgeCGRect fullScreen = {0, 0, kScreenWidth, kScreenHeight};
+                    cg_FillRect(ctx, fullScreen);
+                }
+            }
+        }
 
         /* Render the layer tree into the local buffer */
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
 
         _cg_Release(ctx);
+
+        /* Pixel data is in CG coordinate convention (row 0 = bottom of visual).
+         * The host app handles the Y-flip when displaying via its NSView draw()
+         * method (translateBy + scaleBy). No flip needed here. */
 
         /* Copy completed frame to shared framebuffer in one shot */
         memcpy(pixels, _render_buffer, pixel_size);
@@ -2657,6 +2697,95 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                 center, sel_registerName("postNotificationName:object:userInfo:"),
                 notifName, self, nil);
             bridge_log("  Posted UIApplicationDidBecomeActiveNotification");
+        }
+    }
+
+    /* Scene lifecycle fix: if didFinishLaunching didn't call makeKeyAndVisible
+     * (apps like Preferences.app that depend on FBSScene lifecycle), try to
+     * force the app's windows visible. Without this, many Apple system apps
+     * never show their UI because they wait for scene activation events. */
+    if (!_bridge_root_window) {
+        bridge_log("  No root window after didFinishLaunching — trying scene lifecycle fix...");
+
+        /* Try loading the main storyboard/nib if the app has one.
+         * Many system apps define UIMainStoryboardFile in Info.plist but only
+         * load it when the scene lifecycle triggers. */
+        @try {
+            id mainBundle = ((id(*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("NSBundle"), sel_registerName("mainBundle"));
+            if (mainBundle) {
+                id storyboardName = ((id(*)(id, SEL, id))objc_msgSend)(
+                    ((id(*)(id, SEL))objc_msgSend)(mainBundle, sel_registerName("infoDictionary")),
+                    sel_registerName("objectForKey:"),
+                    ((id(*)(id, SEL, const char *))objc_msgSend)(
+                        (id)objc_getClass("NSString"),
+                        sel_registerName("stringWithUTF8String:"),
+                        "UIMainStoryboardFile"));
+                if (storyboardName) {
+                    bridge_log("  Loading main storyboard: %s",
+                               ((const char *(*)(id, SEL))objc_msgSend)(
+                                   storyboardName, sel_registerName("UTF8String")));
+                    Class sbClass = objc_getClass("UIStoryboard");
+                    if (sbClass) {
+                        id sb = ((id(*)(id, SEL, id, id))objc_msgSend)(
+                            (id)sbClass,
+                            sel_registerName("storyboardWithName:bundle:"),
+                            storyboardName, mainBundle);
+                        if (sb) {
+                            id initialVC = ((id(*)(id, SEL))objc_msgSend)(
+                                sb, sel_registerName("instantiateInitialViewController"));
+                            if (initialVC) {
+                                bridge_log("  Created initial view controller: %s",
+                                           class_getName(object_getClass(initialVC)));
+                                /* Create a window and install the VC */
+                                Class winClass = objc_getClass("UIWindow");
+                                _RSBridgeCGRect frame = {0, 0, kScreenWidth, kScreenHeight};
+                                typedef id (*initFrame_fn)(id, SEL, _RSBridgeCGRect);
+                                id window = ((initFrame_fn)objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)((id)winClass, sel_registerName("alloc")),
+                                    sel_registerName("initWithFrame:"), frame);
+                                if (window) {
+                                    ((void(*)(id, SEL, id))objc_msgSend)(
+                                        window, sel_registerName("setRootViewController:"), initialVC);
+                                    replacement_makeKeyAndVisible(window, sel_registerName("makeKeyAndVisible"));
+                                    bridge_log("  Storyboard window made key and visible");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } @catch (id e) {
+            bridge_log("  Storyboard loading failed — falling back to window search");
+        }
+    }
+
+    /* Fallback: if still no root window, search existing UIWindow instances */
+    if (!_bridge_root_window) {
+        Class appClass = objc_getClass("UIApplication");
+        if (appClass) {
+            id app = ((id(*)(id, SEL))objc_msgSend)((id)appClass, sel_registerName("sharedApplication"));
+            if (app) {
+                id windows = ((id(*)(id, SEL))objc_msgSend)(app, sel_registerName("windows"));
+                if (windows) {
+                    long count = ((long(*)(id, SEL))objc_msgSend)(windows, sel_registerName("count"));
+                    bridge_log("  Searching %ld existing windows for content...", count);
+                    for (long i = 0; i < count; i++) {
+                        id win = ((id(*)(id, SEL, long))objc_msgSend)(
+                            windows, sel_registerName("objectAtIndex:"), i);
+                        if (win) {
+                            id rootVC = ((id(*)(id, SEL))objc_msgSend)(
+                                win, sel_registerName("rootViewController"));
+                            if (rootVC) {
+                                bridge_log("  Found window %ld with rootVC %s — making visible",
+                                           i, class_getName(object_getClass(rootVC)));
+                                replacement_makeKeyAndVisible(win, sel_registerName("makeKeyAndVisible"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
