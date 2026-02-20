@@ -354,7 +354,8 @@ static void replacement_abort(void) {
         /* not reached */
     }
     bridge_log("abort() called (#%d) outside guard → terminating", _abort_count);
-    _exit(134);
+    /* Use syscall to bypass our _exit interposition */
+    syscall(1, 134); /* SYS_exit = 1 */
 }
 
 /*
@@ -366,35 +367,35 @@ static void replacement_abort(void) {
 static volatile int _init_phase = 1;  /* 1 = during startup, 0 = app running */
 
 static void replacement_exit(int status) {
-    if (_init_phase) {
-        bridge_log("exit(%d) BLOCKED during init phase (workspace disconnect expected)", status);
-        /* The workspace server disconnect calls exit() on an XPC callback thread.
-         * Returning from exit() is UB and causes SIGSEGV. Instead, terminate
-         * only THIS thread (the XPC callback thread) using pthread_exit().
-         * The main thread continues UIApplicationMain initialization. */
-        if (!pthread_main_np()) {
-            bridge_log("  Suspending XPC callback thread (workspace disconnect expected)");
-            /* Block this thread using select() on no FDs — this sleeps the thread
-             * without blocking GCD's dispatch queue (dispatch_semaphore_wait causes
-             * GCD to detect a blocked worker and kill the process). */
-            while (1) {
-                struct timeval tv = { .tv_sec = 86400, .tv_usec = 0 };
-                select(0, NULL, NULL, NULL, &tv);
-            }
-            /* not reached */
+    /* In RosettaSim, exit() is NEVER allowed. UIKit/FBSWorkspace calls exit()
+     * when the workspace server disconnects — this is expected since there's
+     * no SpringBoard. The exit may come immediately or after a ~8s retry timeout
+     * on any GCD thread.
+     *
+     * For background threads: sleep forever via select() (doesn't block GCD).
+     * For main thread: use longjmp if guard active, otherwise log and return. */
+    bridge_log("exit(%d) BLOCKED on %s thread",
+               status, pthread_main_np() ? "main" : "background");
+
+    if (!pthread_main_np()) {
+        /* Background thread: sleep forever */
+        while (1) {
+            struct timeval tv = { .tv_sec = 86400, .tv_usec = 0 };
+            select(0, NULL, NULL, NULL, &tv);
         }
-        /* If we're on the main thread, use longjmp if guard is active */
-        if (_abort_guard_active) {
-            bridge_log("  exit() on main thread inside guard → longjmp recovery");
-            longjmp(_abort_recovery, 200 + status);
-            /* not reached */
-        }
-        /* Last resort: block this thread forever (prevent process exit) */
-        bridge_log("  exit() on main thread outside guard → blocking thread");
-        while (1) { sleep(86400); }
+        /* not reached */
     }
-    bridge_log("exit(%d) called in running phase → terminating", status);
-    _exit(status);
+
+    /* Main thread */
+    if (_abort_guard_active) {
+        bridge_log("  exit() on main thread inside guard → longjmp recovery");
+        longjmp(_abort_recovery, 200 + status);
+        /* not reached */
+    }
+
+    /* Main thread, outside guard: log warning but do NOT exit.
+     * Returning from exit() is UB but prevents process death. */
+    bridge_log("  WARNING: exit(%d) on main thread outside guard — returning (UB)", status);
 }
 
 /* ================================================================
@@ -2145,6 +2146,10 @@ __attribute__((section("__DATA,__interpose"))) = {
     /* exit() - intercept workspace server disconnect exit during init */
     { (const void *)replacement_exit,
       (const void *)exit },
+
+    /* _exit() - intercept direct exit that bypasses exit() */
+    { (const void *)replacement_exit,
+      (const void *)_exit },
 };
 
 /* ================================================================
