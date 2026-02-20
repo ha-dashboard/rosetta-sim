@@ -1129,6 +1129,7 @@ static void check_and_inject_touch(void) {
 
     Class touchClass = objc_getClass("UITouch");
     int sendEvent_succeeded = 0;
+    int gesture_delivery_succeeded = 0;
 
     if (app && touchClass) {
         /* Create UITouch on BEGAN only (Fix #3: drop orphan MOVED/ENDED) */
@@ -1216,162 +1217,182 @@ static void check_and_inject_touch(void) {
                     sel_registerName("setIsTap:"), true);
             } @catch (id e) { /* fall through */ }
 
-            /* ---- Proper UITouchesEvent delivery ----
+            /* ---- UITouchesEvent delivery with gesture recognizer support ----
              *
-             * [UIApplication _touchesEvent] returns nil because _eventDispatcher
-             * was never initialized (our longjmp recovery skips that code path).
-             * Instead, create our own UITouchesEvent using _init (which calls
-             * _UITouchesEventCommonInit to create all internal dictionaries),
-             * then populate with _addTouch:forDelayedDelivery: and sendEvent:.
+             * With UIEventDispatcher properly initialized (created in
+             * replacement_runWithMainScene), UIGestureEnvironment exists.
+             * We use the real _touchesEvent singleton and _addTouch:forDelayedDelivery:NO
+             * which registers touches with gesture recognizers (UIButton tap,
+             * UITextField tap, UIScrollView pan, etc.).
              *
-             * Wrapped in SIGSEGV/SIGBUS guard for safety under Rosetta 2.
+             * If _addTouch crashes (gesture env partially broken), we fall back
+             * to ivar manipulation (old approach, no gesture recognizer support).
              */
             SEL clearTouchesSel = sel_registerName("_clearTouches");
             SEL addTouchSel = sel_registerName("_addTouch:forDelayedDelivery:");
             SEL sendEventSel = sel_registerName("sendEvent:");
+            int addTouch_succeeded = 0;
+            static int _addTouch_known_broken = 0;
 
-            /* Create or reuse our bridge-owned UITouchesEvent */
-            if (!_bridge_current_event) {
-                Class touchesEventClass = objc_getClass("UITouchesEvent");
-                if (touchesEventClass) {
-                    SEL initSel = sel_registerName("_init");
-                    if (class_respondsToSelector(touchesEventClass, initSel) ||
-                        class_getInstanceMethod(touchesEventClass, initSel)) {
+            /* Step 1: Try the real _touchesEvent singleton from UIEventEnvironment */
+            id touchesEvent = nil;
+            SEL touchesEventSel = sel_registerName("_touchesEvent");
+            if (class_respondsToSelector(object_getClass(app), touchesEventSel)) {
+                @try {
+                    touchesEvent = ((id(*)(id, SEL))objc_msgSend)(app, touchesEventSel);
+                } @catch (id e) { touchesEvent = nil; }
+            }
+            int using_real_singleton = (touchesEvent != nil);
+            if (touchesEvent) {
+                bridge_log("  Using real _touchesEvent singleton: %p", (void *)touchesEvent);
+            }
+
+            /* Step 2: Fall back to bridge-owned UITouchesEvent if singleton unavailable */
+            if (!touchesEvent) {
+                if (!_bridge_current_event) {
+                    Class touchesEventClass = objc_getClass("UITouchesEvent");
+                    if (touchesEventClass) {
+                        SEL initSel = sel_registerName("_init");
                         @try {
                             _bridge_current_event = ((id(*)(id, SEL))objc_msgSend)(
                                 ((id(*)(id, SEL))objc_msgSend)((id)touchesEventClass,
-                                    sel_registerName("alloc")),
-                                initSel);
+                                    sel_registerName("alloc")), initSel);
                             if (_bridge_current_event) {
                                 ((id(*)(id, SEL))objc_msgSend)(_bridge_current_event,
                                     sel_registerName("retain"));
                                 bridge_log("  Created bridge-owned UITouchesEvent: %p",
                                            (void *)_bridge_current_event);
                             }
-                        } @catch (id e) {
-                            bridge_log("  UITouchesEvent _init threw exception");
-                            _bridge_current_event = nil;
-                        }
+                        } @catch (id e) { _bridge_current_event = nil; }
                     }
                 }
+                touchesEvent = _bridge_current_event;
             }
 
-            id touchesEvent = _bridge_current_event;
-
             if (touchesEvent) {
-                /* Clear previous touch data (empties dicts, does NOT nil them) */
+                /* Step 3: Clear previous touch data */
                 @try {
                     ((void(*)(id, SEL))objc_msgSend)(touchesEvent, clearTouchesSel);
                 } @catch (id e) { /* ignore */ }
 
-                /* Populate internal dictionaries via direct ivar manipulation.
-                 *
-                 * We can't use _addTouch:forDelayedDelivery: because it calls
-                 * _addGestureRecognizersForView:toTouch: which crashes when
-                 * UIScrollView's gesture recognizers check internal state that
-                 * doesn't exist without backboardd.
-                 *
-                 * Manual approach: get ivar offsets for _touches, _keyedTouches,
-                 * _keyedTouchesByWindow and populate them directly. The dictionary
-                 * keys are raw pointers (NULL key callbacks). */
-                Class teClass = object_getClass(touchesEvent);
-                Ivar touchesIvar = class_getInstanceVariable(teClass, "_touches");
-                Ivar keyedIvar = class_getInstanceVariable(teClass, "_keyedTouches");
-                Ivar byWindowIvar = class_getInstanceVariable(teClass, "_keyedTouchesByWindow");
+                /* Step 4: Try _addTouch:forDelayedDelivery:NO
+                 * This registers the touch with gesture recognizers via
+                 * _addGestureRecognizersForView:toTouch:. With UIGestureEnvironment
+                 * now properly initialized, this should work. */
+                if (!_addTouch_known_broken) {
+                    /* Install SIGSEGV/SIGBUS handlers */
+                    if (!_sendEvent_handlers_installed) {
+                        struct sigaction sa;
+                        memset(&sa, 0, sizeof(sa));
+                        sa.sa_handler = _sendEvent_crash_handler;
+                        sigemptyset(&sa.sa_mask);
+                        sa.sa_flags = 0;
+                        sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
+                        sigaction(SIGBUS, &sa, &_prev_sigbus_action);
+                        _sendEvent_handlers_installed = 1;
+                    }
 
-                if (touchesIvar && keyedIvar && byWindowIvar) {
-                    ptrdiff_t touchesOff = ivar_getOffset(touchesIvar);
-                    ptrdiff_t keyedOff = ivar_getOffset(keyedIvar);
-                    ptrdiff_t byWindowOff = ivar_getOffset(byWindowIvar);
-
-                    /* _touches is an NSMutableSet */
-                    id touchesSet = *(id *)((uint8_t *)touchesEvent + touchesOff);
-                    /* _keyedTouches and _keyedTouchesByWindow are CFMutableDictionaryRef */
-                    CFMutableDictionaryRef keyedDict = *(CFMutableDictionaryRef *)((uint8_t *)touchesEvent + keyedOff);
-                    CFMutableDictionaryRef byWindowDict = *(CFMutableDictionaryRef *)((uint8_t *)touchesEvent + byWindowOff);
-
-                    if (touchesSet && keyedDict && byWindowDict) {
-                        /* Add touch to _touches */
-                        ((void(*)(id, SEL, id))objc_msgSend)(touchesSet,
-                            sel_registerName("addObject:"), _bridge_current_touch);
-
-                        /* Add to _keyedTouches[view] */
-                        if (targetView) {
-                            const void *viewKey = (__bridge const void *)targetView;
-                            id viewSet = (id)CFDictionaryGetValue(keyedDict, viewKey);
-                            if (!viewSet) {
-                                viewSet = ((id(*)(id, SEL))objc_msgSend)(
-                                    (id)objc_getClass("NSMutableSet"), sel_registerName("set"));
-                                CFDictionarySetValue(keyedDict, viewKey, (__bridge const void *)viewSet);
-                            }
-                            ((void(*)(id, SEL, id))objc_msgSend)(viewSet,
-                                sel_registerName("addObject:"), _bridge_current_touch);
+                    _sendEvent_guard_active = 1;
+                    int addTouch_crash = sigsetjmp(_sendEvent_recovery, 1);
+                    if (addTouch_crash == 0) {
+                        @try {
+                            typedef void (*addTouchFn)(id, SEL, id, bool);
+                            ((addTouchFn)objc_msgSend)(touchesEvent, addTouchSel,
+                                _bridge_current_touch, false);
+                            addTouch_succeeded = 1;
+                            bridge_log("  _addTouch:forDelayedDelivery:NO succeeded");
+                        } @catch (id e) {
+                            bridge_log("  _addTouch: threw exception");
                         }
-
-                        /* Add to _keyedTouchesByWindow[window] — THIS IS THE CRITICAL ONE */
-                        if (_bridge_root_window) {
-                            const void *winKey = (__bridge const void *)_bridge_root_window;
-                            id winSet = (id)CFDictionaryGetValue(byWindowDict, winKey);
-                            if (!winSet) {
-                                winSet = ((id(*)(id, SEL))objc_msgSend)(
-                                    (id)objc_getClass("NSMutableSet"), sel_registerName("set"));
-                                CFDictionarySetValue(byWindowDict, winKey, (__bridge const void *)winSet);
-                            }
-                            ((void(*)(id, SEL, id))objc_msgSend)(winSet,
-                                sel_registerName("addObject:"), _bridge_current_touch);
-                        }
-
-                        bridge_log("  Populated UITouchesEvent dicts via ivar manipulation");
                     } else {
-                        bridge_log("  UITouchesEvent internal sets/dicts are nil");
+                        bridge_log("  _addTouch: CRASHED (signal %d) — marking broken", addTouch_crash);
+                        _addTouch_known_broken = 1;
+                    }
+                    _sendEvent_guard_active = 0;
+                }
+
+                /* Step 5: Fall back to ivar manipulation if _addTouch failed */
+                if (!addTouch_succeeded) {
+                    Class teClass = object_getClass(touchesEvent);
+                    Ivar touchesIvar = class_getInstanceVariable(teClass, "_touches");
+                    Ivar keyedIvar = class_getInstanceVariable(teClass, "_keyedTouches");
+                    Ivar byWindowIvar = class_getInstanceVariable(teClass, "_keyedTouchesByWindow");
+                    if (touchesIvar && keyedIvar && byWindowIvar) {
+                        ptrdiff_t touchesOff = ivar_getOffset(touchesIvar);
+                        ptrdiff_t keyedOff = ivar_getOffset(keyedIvar);
+                        ptrdiff_t byWindowOff = ivar_getOffset(byWindowIvar);
+                        id touchesSet = *(id *)((uint8_t *)touchesEvent + touchesOff);
+                        CFMutableDictionaryRef keyedDict = *(CFMutableDictionaryRef *)((uint8_t *)touchesEvent + keyedOff);
+                        CFMutableDictionaryRef byWindowDict = *(CFMutableDictionaryRef *)((uint8_t *)touchesEvent + byWindowOff);
+                        if (touchesSet && keyedDict && byWindowDict) {
+                            ((void(*)(id, SEL, id))objc_msgSend)(touchesSet,
+                                sel_registerName("addObject:"), _bridge_current_touch);
+                            if (targetView) {
+                                const void *vk = (__bridge const void *)targetView;
+                                id vs = (id)CFDictionaryGetValue(keyedDict, vk);
+                                if (!vs) {
+                                    vs = ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)objc_getClass("NSMutableSet"), sel_registerName("set"));
+                                    CFDictionarySetValue(keyedDict, vk, (__bridge const void *)vs);
+                                }
+                                ((void(*)(id, SEL, id))objc_msgSend)(vs,
+                                    sel_registerName("addObject:"), _bridge_current_touch);
+                            }
+                            if (_bridge_root_window) {
+                                const void *wk = (__bridge const void *)_bridge_root_window;
+                                id ws = (id)CFDictionaryGetValue(byWindowDict, wk);
+                                if (!ws) {
+                                    ws = ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)objc_getClass("NSMutableSet"), sel_registerName("set"));
+                                    CFDictionarySetValue(byWindowDict, wk, (__bridge const void *)ws);
+                                }
+                                ((void(*)(id, SEL, id))objc_msgSend)(ws,
+                                    sel_registerName("addObject:"), _bridge_current_touch);
+                            }
+                            bridge_log("  ivar fallback: populated dicts (no gesture recognizers)");
+                        } else {
+                            touchesEvent = nil;
+                        }
+                    } else {
                         touchesEvent = nil;
                     }
-                } else {
-                    bridge_log("  Could not find UITouchesEvent ivars");
-                    touchesEvent = nil;
                 }
             }
 
+            /* Step 6: [UIApplication sendEvent:] with crash guard */
             if (touchesEvent) {
-                /* Store reference to singleton (NOT retained — it's app-owned) */
-                _bridge_current_event = touchesEvent;
+                if (!using_real_singleton) _bridge_current_event = touchesEvent;
 
-                /* Install SIGSEGV/SIGBUS handlers if not yet done */
                 if (!_sendEvent_handlers_installed) {
                     struct sigaction sa;
                     memset(&sa, 0, sizeof(sa));
                     sa.sa_handler = _sendEvent_crash_handler;
                     sigemptyset(&sa.sa_mask);
-                    sa.sa_flags = 0; /* No SA_RESTART — we want siglongjmp */
+                    sa.sa_flags = 0;
                     sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
                     sigaction(SIGBUS, &sa, &_prev_sigbus_action);
                     _sendEvent_handlers_installed = 1;
                 }
 
-                /* Try sendEvent: with crash guard */
                 _sendEvent_guard_active = 1;
                 int crash_sig = sigsetjmp(_sendEvent_recovery, 1);
                 if (crash_sig == 0) {
-                    /* Normal path — deliver the event */
-                    bridge_log("  Delivering via [UIApplication sendEvent:] with UITouchesEvent");
+                    bridge_log("  Delivering via [UIApplication sendEvent:]");
                     ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, touchesEvent);
                     _sendEvent_guard_active = 0;
                     sendEvent_succeeded = 1;
-                    bridge_log("  sendEvent: delivery succeeded");
-                    /* Fall through to direct delivery for UIControl tracking.
-                     * Our sendEvent: replacement delivers touchesBegan:/touchesEnded:
-                     * to views, but UIControl needs explicit beginTracking/endTracking/
-                     * sendActionsForControlEvents to fire target-action handlers.
-                     * The direct delivery code below handles this. */
+                    if (addTouch_succeeded) {
+                        gesture_delivery_succeeded = 1;
+                        bridge_log("  sendEvent: with gesture recognizers succeeded");
+                    } else {
+                        bridge_log("  sendEvent: succeeded (no gesture recognizers)");
+                    }
                 } else {
-                    /* Crashed in sendEvent: — recovered via siglongjmp */
-                    bridge_log("  sendEvent: CRASHED (signal %d) — falling through to direct delivery",
-                               crash_sig);
+                    bridge_log("  sendEvent: CRASHED (signal %d)", crash_sig);
                     _sendEvent_guard_active = 0;
-                    /* Fall through to direct_delivery below */
                 }
             } else {
-                bridge_log("  UITouchesEvent singleton unavailable — using direct delivery");
+                bridge_log("  No UITouchesEvent — direct delivery only");
             }
         }
     }
@@ -1422,7 +1443,7 @@ static void check_and_inject_touch(void) {
         }
     }
 
-    if (controlTarget && _bridge_current_touch) {
+    if (controlTarget && _bridge_current_touch && !gesture_delivery_succeeded) {
         const char *ctrlName = class_getName(object_getClass(controlTarget));
         bridge_log("  UIControl found: %s %p", ctrlName, (void *)controlTarget);
 
