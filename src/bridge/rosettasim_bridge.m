@@ -897,13 +897,10 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     void *ctx = _cg_CreateBitmap(pixels, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
-        /* Flip Y and scale for Retina.
-           CGBitmapContext origin is bottom-left (first pixel in memory = bottom).
-           We want standard image order (first pixel = top-left) so the host
-           app can display it directly without flipping.
-           Transform: translate to top of pixel buffer, then scale with negative Y. */
-        _cg_TranslateCTM(ctx, 0, (double)px_h);
-        _cg_ScaleCTM(ctx, (double)kScreenScaleX, -(double)kScreenScaleY);
+        /* Scale for Retina. CG origin is bottom-left; the host app handles
+           the vertical flip when displaying. Do NOT flip here — negative Y
+           scale mirrors text glyphs rendered by CoreText. */
+        _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
 
         /* Render the layer tree into the bitmap */
         ((void(*)(id, SEL, void *))objc_msgSend)(
