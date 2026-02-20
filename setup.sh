@@ -165,7 +165,8 @@ if [ ! -f "$STUBS/dvt_plugin_hook.m" ]; then
     err "stubs/dvt_plugin_hook.m not found. This file should be in the rosetta project."
 fi
 
-arch -x86_64 clang -arch x86_64 -dynamiclib -framework Foundation -lobjc \
+arch -x86_64 clang -arch x86_64 -dynamiclib \
+    -framework Foundation -framework AppKit -framework QuartzCore -lobjc \
     -install_name @rpath/dvt_plugin_hook.dylib \
     -o "$STUBS/dvt_plugin_hook.dylib" "$STUBS/dvt_plugin_hook.m" 2>/dev/null
 codesign --force --sign - "$STUBS/dvt_plugin_hook.dylib" 2>/dev/null
@@ -374,7 +375,21 @@ for dir in SharedFrameworks Frameworks; do
     done
 done
 
-# Sign outer bundle
+# Sign Swift runtime libraries (needed for simctl/SimulatorKit)
+for lib in "$XCODE/Contents/Frameworks"/libswift*.dylib; do
+    [ -f "$lib" ] && codesign --force --sign - "$lib" 2>/dev/null
+done
+
+# Sign Developer tool binaries
+for bin in \
+    "$XCODE/Contents/Developer/usr/bin/simctl" \
+    "$XCODE/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/Versions/A/SimulatorKit" \
+    "$XCODE/Contents/Developer/Library/PrivateFrameworks/CoreSimulator.framework/Versions/A/CoreSimulator"
+do
+    [ -f "$bin" ] && codesign --force --sign - "$bin" 2>/dev/null
+done
+
+# Sign outer bundle (may fail due to PlugIns.disabled - that's OK)
 codesign --force --sign - "$XCODE" 2>/dev/null || true
 
 # =============================================================================
@@ -391,8 +406,10 @@ echo "Known limitations:"
 echo "  - Interface Builder is disabled (private API incompatibilities)"
 echo "  - LLDB debugger is disabled (Python 2.7 dependency)"
 echo "  - GPU debugger is disabled (Python 2.7 dependency)"
-echo "  - Creating new projects may crash (CALayer.view compatibility)"
 echo "  - Devices, Preferences, and Simulator management work"
+echo ""
+echo "To install the iOS 9.3 Simulator:"
+echo "  ./install_sim93.sh"
 echo ""
 echo "Disabled plugins are saved in:"
 echo "  $DISABLED"
