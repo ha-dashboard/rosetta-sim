@@ -3866,41 +3866,28 @@ static void swizzle_bks_methods(void) {
        on-screen keyboard window from being created (it would overlap the
        app's UI and serve no purpose with hardware keyboard input). */
     {
-        /* Let UIKeyboardImpl initialize normally — do NOT swizzle sharedInstance.
-           Its initialization may crash on backboardd calls, but those are caught
-           by the SIGSEGV guard or the @try below. If it succeeds, text field
-           cursor/caret display works properly. */
+        /* UIKeyboardImpl.sharedInstance → nil.
+         *
+         * The keyboard UI infrastructure (UIKeyboardImpl, UIInputWindowController,
+         * BKSTextInputSessionManager) cannot function without backboardd — it
+         * hangs on animation fences and window presentation during
+         * becomeFirstResponder. Returning nil prevents the hang while still
+         * allowing gesture recognizers to fire becomeFirstResponder natively.
+         *
+         * Text input is delivered via the mmap keyboard mechanism:
+         *   Host captures keyDown → writes to shared framebuffer → bridge
+         *   calls setText:/insertText: on the first responder.
+         *
+         * Cursor/caret display requires UIKeyboardImpl — this is a known
+         * limitation. The text field accepts input but won't show a blinking
+         * cursor. */
         Class kbImplClass = objc_getClass("UIKeyboardImpl");
         if (kbImplClass) {
-            bridge_log("  UIKeyboardImpl: NOT stubbed (allowing natural init for cursor support)");
-            /* Pre-create the shared instance inside a crash guard to see if it works */
-            _sendEvent_guard_active = 1;
-            int kb_crash = sigsetjmp(_sendEvent_recovery, 1);
-            if (kb_crash == 0) {
-                @try {
-                    id kbImpl = ((id(*)(id, SEL))objc_msgSend)(
-                        (id)kbImplClass, sel_registerName("sharedInstance"));
-                    _sendEvent_guard_active = 0;
-                    if (kbImpl) {
-                        bridge_log("  UIKeyboardImpl.sharedInstance created: %p", (void *)kbImpl);
-                    } else {
-                        bridge_log("  UIKeyboardImpl.sharedInstance returned nil");
-                    }
-                } @catch (id e) {
-                    _sendEvent_guard_active = 0;
-                    bridge_log("  UIKeyboardImpl.sharedInstance threw exception — stubbing to nil");
-                    /* Fall back to nil if natural init fails */
-                    SEL sharedSel = sel_registerName("sharedInstance");
-                    Method m = class_getClassMethod(kbImplClass, sharedSel);
-                    if (m) method_setImplementation(m, (IMP)_noopMethod);
-                }
-            } else {
-                _sendEvent_guard_active = 0;
-                bridge_log("  UIKeyboardImpl.sharedInstance crashed (signal %d) — stubbing to nil",
-                           kb_crash);
-                SEL sharedSel = sel_registerName("sharedInstance");
-                Method m = class_getClassMethod(kbImplClass, sharedSel);
-                if (m) method_setImplementation(m, (IMP)_noopMethod);
+            SEL sharedSel = sel_registerName("sharedInstance");
+            Method m = class_getClassMethod(kbImplClass, sharedSel);
+            if (m) {
+                method_setImplementation(m, (IMP)_noopMethod);
+                bridge_log("  Swizzled +[UIKeyboardImpl sharedInstance] → nil (prevents becomeFirstResponder hang)");
             }
         }
 
