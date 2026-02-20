@@ -1155,7 +1155,21 @@ static struct sigaction _prev_sigsegv_action;
 static struct sigaction _prev_sigbus_action;
 static volatile sig_atomic_t _sendEvent_handlers_installed = 0;
 
-static void _sendEvent_crash_handler(int sig) {
+/* Store the last crash address for diagnostics */
+static volatile void *_last_crash_addr = NULL;
+static volatile void *_last_crash_pc = NULL;
+
+static void _sendEvent_crash_handler_siginfo(int sig, siginfo_t *info, void *ctx) {
+    if (info) {
+        _last_crash_addr = info->si_addr;
+        /* Extract PC from ucontext if available */
+#if defined(__x86_64__)
+        if (ctx) {
+            ucontext_t *uc = (ucontext_t *)ctx;
+            _last_crash_pc = (void *)uc->uc_mcontext->__ss.__rip;
+        }
+#endif
+    }
     if (_sendEvent_guard_active) {
         _sendEvent_guard_active = 0;
         siglongjmp(_sendEvent_recovery, sig);
@@ -1163,10 +1177,8 @@ static void _sendEvent_crash_handler(int sig) {
     }
     /* Not our crash — invoke previous handler */
     struct sigaction *prev = (sig == SIGSEGV) ? &_prev_sigsegv_action : &_prev_sigbus_action;
-    if (prev->sa_flags & SA_SIGINFO) {
-        /* Can't call sa_sigaction without siginfo_t, just re-raise */
-        signal(sig, SIG_DFL);
-        raise(sig);
+    if (prev->sa_flags & SA_SIGINFO && prev->sa_sigaction) {
+        prev->sa_sigaction(sig, info, ctx);
     } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
         prev->sa_handler(sig);
     } else {
@@ -1457,16 +1469,97 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                     sel_registerName("setIsTap:"), true);
             } @catch (id e) { /* fall through */ }
 
-            /* ---- UITouchesEvent delivery with gesture recognizer support ----
+            /* Create and attach an IOHIDEvent to the UITouch.
              *
-             * With UIEventDispatcher properly initialized (created in
-             * replacement_runWithMainScene), UIGestureEnvironment exists.
-             * We use the real _touchesEvent singleton and _addTouch:forDelayedDelivery:NO
-             * which registers touches with gesture recognizers (UIButton tap,
-             * UITextField tap, UIScrollView pan, etc.).
+             * UIKit's native sendEvent: pipeline calls IOHIDEventConformsTo()
+             * on the touch's _hidEvent ivar during gesture recognizer processing.
+             * Without a valid IOHIDEvent, this dereferences nil+0x20 → SIGSEGV.
              *
-             * If _addTouch crashes (gesture env partially broken), we fall back
-             * to ivar manipulation (old approach, no gesture recognizer support).
+             * IOHIDEventCreateDigitizerFingerEvent creates a proper digitizer
+             * touch event that UIKit can process natively. */
+            {
+                /* Resolve IOHIDEvent functions via dlsym (private API) */
+                typedef void *(*IOHIDEventCreateDigitizerFingerEventFn)(
+                    void *allocator, uint64_t timeStamp,
+                    uint32_t index, uint32_t identity,
+                    uint32_t eventMask, double x, double y, double z,
+                    double tipPressure, double twist,
+                    uint8_t range, uint8_t touch, uint32_t options);
+
+                static IOHIDEventCreateDigitizerFingerEventFn _createFingerEvent = NULL;
+                static int _hid_resolved = 0;
+                if (!_hid_resolved) {
+                    _createFingerEvent = dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerFingerEvent");
+                    _hid_resolved = 1;
+                    if (_createFingerEvent) {
+                        bridge_log("  IOHIDEventCreateDigitizerFingerEvent resolved");
+                    } else {
+                        bridge_log("  WARNING: IOHIDEventCreateDigitizerFingerEvent not found");
+                    }
+                }
+
+                if (_createFingerEvent) {
+                    /* Map our touch phase to IOHIDDigitizerEventMask:
+                     *   kIOHIDDigitizerEventRange  = 0x01
+                     *   kIOHIDDigitizerEventTouch  = 0x02
+                     *   kIOHIDDigitizerEventPosition = 0x04 */
+                    uint32_t eventMask = 0;
+                    uint8_t range = 0, touchBit = 0;
+                    if (uiTouchPhase == 0) { /* Began */
+                        eventMask = 0x01 | 0x02 | 0x04; /* range + touch + position */
+                        range = 1; touchBit = 1;
+                    } else if (uiTouchPhase == 1) { /* Moved */
+                        eventMask = 0x04; /* position only */
+                        range = 1; touchBit = 1;
+                    } else if (uiTouchPhase == 3) { /* Ended */
+                        eventMask = 0x01 | 0x02 | 0x04;
+                        range = 0; touchBit = 0;
+                    }
+
+                    /* Timestamp as AbsoluteTime (mach_absolute_time) */
+                    uint64_t ts = mach_absolute_time();
+
+                    void *hidEvent = _createFingerEvent(
+                        NULL,           /* allocator (NULL = default) */
+                        ts,             /* timeStamp */
+                        0,              /* index (finger 0) */
+                        2,              /* identity (arbitrary nonzero) */
+                        eventMask,      /* eventMask */
+                        tx / kScreenWidth,   /* x (normalized 0-1) */
+                        ty / kScreenHeight,  /* y (normalized 0-1) */
+                        0.0,            /* z */
+                        (uiTouchPhase == 3) ? 0.0 : 1.0, /* tipPressure */
+                        0.0,            /* twist */
+                        range,          /* range (in range of digitizer) */
+                        touchBit,       /* touch (touching surface) */
+                        0);             /* options */
+
+                    if (hidEvent) {
+                        /* Set _hidEvent on UITouch via ivar or setter */
+                        SEL setHidSel = sel_registerName("_setHidEvent:");
+                        if (class_respondsToSelector(object_getClass(_bridge_current_touch), setHidSel)) {
+                            ((void(*)(id, SEL, void *))objc_msgSend)(
+                                _bridge_current_touch, setHidSel, hidEvent);
+                        } else {
+                            /* Direct ivar access */
+                            Ivar hidIvar = class_getInstanceVariable(
+                                object_getClass(_bridge_current_touch), "_hidEvent");
+                            if (hidIvar) {
+                                *(void **)((uint8_t *)_bridge_current_touch +
+                                           ivar_getOffset(hidIvar)) = hidEvent;
+                            }
+                        }
+                        bridge_log("  Attached IOHIDEvent %p to UITouch", hidEvent);
+                    }
+                }
+            }
+
+            /* ---- UITouchesEvent delivery via [UIApplication sendEvent:] ----
+             *
+             * With UIEventDispatcher initialized and IOHIDEvent attached to the
+             * UITouch, UIKit's native event pipeline processes the touch through
+             * gesture recognizers (UIButton tap, UITextField tap, UIScrollView
+             * pan, etc.).
              */
             SEL clearTouchesSel = sel_registerName("_clearTouches");
             SEL addTouchSel = sel_registerName("_addTouch:forDelayedDelivery:");
@@ -1523,7 +1616,8 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                     if (!_sendEvent_handlers_installed) {
                         struct sigaction sa;
                         memset(&sa, 0, sizeof(sa));
-                        sa.sa_handler = _sendEvent_crash_handler;
+                        sa.sa_sigaction = _sendEvent_crash_handler_siginfo;
+                        sa.sa_flags = SA_SIGINFO;
                         sigemptyset(&sa.sa_mask);
                         sa.sa_flags = 0;
                         sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
@@ -1607,12 +1701,58 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                 if (!_sendEvent_handlers_installed) {
                     struct sigaction sa;
                     memset(&sa, 0, sizeof(sa));
-                    sa.sa_handler = _sendEvent_crash_handler;
+                    sa.sa_sigaction = _sendEvent_crash_handler_siginfo;
+                        sa.sa_flags = SA_SIGINFO;
                     sigemptyset(&sa.sa_mask);
                     sa.sa_flags = 0;
                     sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
                     sigaction(SIGBUS, &sa, &_prev_sigbus_action);
                     _sendEvent_handlers_installed = 1;
+                }
+
+                /* Diagnostic: check UIApplication._gestureEnvironment before sendEvent */
+                {
+                    SEL geSel = sel_registerName("_gestureEnvironment");
+                    if (class_respondsToSelector(object_getClass(app), geSel)) {
+                        id ge = ((id(*)(id, SEL))objc_msgSend)(app, geSel);
+                        bridge_log("  UIApplication._gestureEnvironment = %p", (void *)ge);
+                    }
+                }
+
+                /* Also set IOHIDEvent on the UITouchesEvent (UIEvent._hidEvent).
+                 * sendEvent: → _sendTouchesForEvent: may read the event-level
+                 * IOHIDEvent in addition to the per-touch one. */
+                {
+                    SEL setHidEventSel = sel_registerName("_setHIDEvent:");
+                    if (class_respondsToSelector(object_getClass(touchesEvent), setHidEventSel)) {
+                        /* Use the same IOHIDEvent from the current touch */
+                        Ivar tHidIvar = class_getInstanceVariable(
+                            object_getClass(_bridge_current_touch), "_hidEvent");
+                        if (tHidIvar) {
+                            void *hid = *(void **)((uint8_t *)_bridge_current_touch +
+                                                    ivar_getOffset(tHidIvar));
+                            if (hid) {
+                                ((void(*)(id, SEL, void *))objc_msgSend)(
+                                    touchesEvent, setHidEventSel, hid);
+                            }
+                        }
+                    } else {
+                        /* Direct ivar access on UIEvent */
+                        Ivar eHidIvar = class_getInstanceVariable(
+                            object_getClass(touchesEvent), "_hidEvent");
+                        if (eHidIvar && _bridge_current_touch) {
+                            Ivar tHidIvar = class_getInstanceVariable(
+                                object_getClass(_bridge_current_touch), "_hidEvent");
+                            if (tHidIvar) {
+                                void *hid = *(void **)((uint8_t *)_bridge_current_touch +
+                                                        ivar_getOffset(tHidIvar));
+                                if (hid) {
+                                    *(void **)((uint8_t *)touchesEvent +
+                                               ivar_getOffset(eHidIvar)) = hid;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 _sendEvent_guard_active = 1;
@@ -1632,12 +1772,28 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                 } else {
                     _sendEvent_guard_active = 0;
                     _sendEvent_crash_count++;
+                    {
+                        /* Use dladdr to resolve crash PC to a symbol */
+                        typedef struct { const char *dli_fname; void *dli_fbase;
+                                         const char *dli_sname; void *dli_saddr; } Dl_info_t;
+                        Dl_info_t info;
+                        memset(&info, 0, sizeof(info));
+                        int (*dladdr_fn)(const void *, Dl_info_t *) = dlsym(RTLD_DEFAULT, "dladdr");
+                        if (dladdr_fn && _last_crash_pc) {
+                            dladdr_fn(_last_crash_pc, &info);
+                        }
+                        bridge_log("  sendEvent: CRASHED (signal %d, count %d/%d)\n"
+                                   "    fault addr=%p, PC=%p\n"
+                                   "    symbol: %s + %ld\n"
+                                   "    library: %s",
+                                   crash_sig, _sendEvent_crash_count, SENDEVENT_MAX_CRASHES,
+                                   _last_crash_addr, _last_crash_pc,
+                                   info.dli_sname ? info.dli_sname : "?",
+                                   info.dli_saddr ? (long)((char *)_last_crash_pc - (char *)info.dli_saddr) : 0,
+                                   info.dli_fname ? info.dli_fname : "?");
+                    }
                     if (_sendEvent_crash_count >= SENDEVENT_MAX_CRASHES) {
-                        bridge_log("  sendEvent: CRASHED %d times — disabling (direct delivery only)",
-                                   _sendEvent_crash_count);
-                    } else {
-                        bridge_log("  sendEvent: CRASHED (signal %d, count %d/%d)",
-                                   crash_sig, _sendEvent_crash_count, SENDEVENT_MAX_CRASHES);
+                        bridge_log("  sendEvent: disabling after %d crashes", _sendEvent_crash_count);
                     }
                 }
             } else if (!touchesEvent) {
@@ -2916,81 +3072,92 @@ static void _noopMethod(id self, SEL _cmd, ...) {
 }
 
 /* Replacement for -[UIWindow makeKeyAndVisible].
-   The original triggers BKSEventFocusManager which crashes without backboardd.
-   We perform the essential parts: show the window, load the rootViewController's
-   view into the window, and trigger layout — skipping event registration. */
+ *
+ * APPROACH: Call UIKit's REAL internal methods instead of reimplementing them.
+ * BKSEventFocusManager's backboardd-calling methods are already stubbed to
+ * no-ops (in swizzle_bks_methods), so UIKit's native makeKeyAndVisible path
+ * can run safely — the inter-process focus calls become harmless no-ops while
+ * the local event registration (UIGestureEnvironment, key window state) proceeds
+ * normally.
+ *
+ * Previous approach manually did view installation + layout but SKIPPED the
+ * internal key window registration (_makeKeyWindowIgnoringOldKeyWindow:) which
+ * is where UIGestureEnvironment learns about the window. This caused sendEvent:
+ * to crash because gesture recognizer processing couldn't find the window.
+ */
+static IMP _original_makeKeyAndVisible_IMP = NULL;
+
 static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
-    bridge_log("  [UIWindow makeKeyAndVisible] intercepted");
+    bridge_log("  [UIWindow makeKeyAndVisible] intercepted — calling UIKit's real impl");
 
-    /* 1. Set layer visible */
-    id layer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));
-    if (layer) {
-        ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
-    }
-
-    /* 2. Load rootViewController's view into the window if not already there.
-       Normally makeKeyAndVisible triggers _installRootViewControllerIntoWindow:
-       which does this, but that path crashes via BKSEventFocusManager. */
-    SEL rvcSel = sel_registerName("rootViewController");
-    if (class_respondsToSelector(object_getClass(self), rvcSel)) {
-        id rootVC = ((id(*)(id, SEL))objc_msgSend)(self, rvcSel);
-        if (rootVC) {
-            id rootView = ((id(*)(id, SEL))objc_msgSend)(rootVC, sel_registerName("view"));
-            if (rootView) {
-                /* Check if rootView is already in the window */
-                id superview = ((id(*)(id, SEL))objc_msgSend)(rootView, sel_registerName("superview"));
-                if (!superview || superview != self) {
-                    /* Set frame to window's screen size (avoid CGRect struct return
-                       which crashes under Rosetta 2 — 32 bytes requires stret). */
-                    _RSBridgeCGRect windowFrame = {0, 0, kScreenWidth, kScreenHeight};
-                    typedef void (*setFrameFn)(id, SEL, _RSBridgeCGRect);
-                    ((setFrameFn)objc_msgSend)(rootView, sel_registerName("setFrame:"), windowFrame);
-
-                    /* Add to window */
-                    ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("addSubview:"), rootView);
-                    bridge_log("  Added rootViewController.view (%s) to window",
-                               class_getName(object_getClass(rootView)));
-                }
-
-                /* Notify view controller of appearance lifecycle.
-                   Both viewWillAppear: and viewDidAppear: are needed:
-                   - viewWillAppear: triggers UIAppearance proxy application
-                   - viewDidAppear: triggers post-layout theme code in many apps */
-                @try {
-                    ((void(*)(id, SEL, bool))objc_msgSend)(rootVC,
-                        sel_registerName("viewWillAppear:"), false);
-                } @catch (id e) { /* ignore */ }
-                @try {
-                    ((void(*)(id, SEL, bool))objc_msgSend)(rootVC,
-                        sel_registerName("viewDidAppear:"), false);
-                } @catch (id e) { /* ignore */ }
-            }
-        }
-    }
-
-    /* 3. Register this as the key window and add to the window stack.
-       Track multiple windows for proper z-ordering (alerts, keyboard, etc.).
-       The first window to call makeKeyAndVisible becomes _bridge_root_window
-       (used for frame capture). All windows are tracked in the window stack. */
+    /* Track in our window stack (for frame capture and key window queries) */
     _bridge_track_window(self);
     _bridge_key_window = self;
     if (!_bridge_root_window) {
         _bridge_root_window = self;
         ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("retain"));
     }
+
+    /* Call UIKit's ORIGINAL makeKeyAndVisible.
+     * BKSEventFocusManager methods are already no-op'd, so the inter-process
+     * calls are harmless. The important local work (view installation, key
+     * window registration, gesture environment setup) runs normally. */
+    if (_original_makeKeyAndVisible_IMP) {
+        bridge_log("  Calling original makeKeyAndVisible IMP");
+        ((void(*)(id, SEL))_original_makeKeyAndVisible_IMP)(self, _cmd);
+        bridge_log("  Original makeKeyAndVisible completed");
+    } else {
+        /* Fallback: if we couldn't save the original IMP, do manual setup.
+         * This shouldn't happen but prevents a dead-end. */
+        bridge_log("  WARNING: No original IMP — manual fallback");
+
+        /* Show window */
+        ((void(*)(id, SEL, bool))objc_msgSend)(self, sel_registerName("setHidden:"), false);
+
+        /* Use _makeKeyWindowIgnoringOldKeyWindow: for local key window registration.
+         * This registers the window with UIGestureEnvironment WITHOUT going through
+         * the full makeKeyAndVisible path. */
+        SEL mkwSel = sel_registerName("_makeKeyWindowIgnoringOldKeyWindow:");
+        if (class_respondsToSelector(object_getClass(self), mkwSel)) {
+            @try {
+                ((void(*)(id, SEL, bool))objc_msgSend)(self, mkwSel, true);
+                bridge_log("  Called _makeKeyWindowIgnoringOldKeyWindow:YES");
+            } @catch (id e) {
+                bridge_log("  _makeKeyWindowIgnoringOldKeyWindow threw");
+            }
+        } else {
+            /* Even more minimal fallback — call makeKeyWindow */
+            @try {
+                ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("makeKeyWindow"));
+            } @catch (id e) { /* ignore */ }
+        }
+
+        /* Install rootVC if present */
+        SEL rvcSel = sel_registerName("rootViewController");
+        if (class_respondsToSelector(object_getClass(self), rvcSel)) {
+            id rootVC = ((id(*)(id, SEL))objc_msgSend)(self, rvcSel);
+            if (rootVC) {
+                id rootView = ((id(*)(id, SEL))objc_msgSend)(rootVC, sel_registerName("view"));
+                if (rootView) {
+                    id superview = ((id(*)(id, SEL))objc_msgSend)(
+                        rootView, sel_registerName("superview"));
+                    if (!superview || superview != self) {
+                        _RSBridgeCGRect windowFrame = {0, 0, kScreenWidth, kScreenHeight};
+                        typedef void (*setFrameFn)(id, SEL, _RSBridgeCGRect);
+                        ((setFrameFn)objc_msgSend)(rootView,
+                            sel_registerName("setFrame:"), windowFrame);
+                        ((void(*)(id, SEL, id))objc_msgSend)(self,
+                            sel_registerName("addSubview:"), rootView);
+                    }
+                }
+            }
+        }
+
+        ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("setNeedsLayout"));
+        ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("layoutIfNeeded"));
+    }
+
     bridge_log("  Window %p made key (stack: %d windows)", (void *)self, _bridge_window_count);
-
-    /* 4. Set window level to UIWindowLevelNormal (0) to ensure proper ordering */
-    @try {
-        ((void(*)(id, SEL, double))objc_msgSend)(self,
-            sel_registerName("setWindowLevel:"), 0.0);
-    } @catch (id e) { /* ignore */ }
-
-    /* 5. Force layout */
-    ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("setNeedsLayout"));
-    ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("layoutIfNeeded"));
-
-    bridge_log("  makeKeyAndVisible complete — window visible with rootVC view");
 }
 
 /* Replacement for -[UIWindow isKeyWindow].
@@ -3098,7 +3265,8 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
         if (!_sendEvent_handlers_installed) {
             struct sigaction sa;
             memset(&sa, 0, sizeof(sa));
-            sa.sa_handler = _sendEvent_crash_handler;
+            sa.sa_sigaction = _sendEvent_crash_handler_siginfo;
+                        sa.sa_flags = SA_SIGINFO;
             sigemptyset(&sa.sa_mask);
             sa.sa_flags = 0;
             sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
@@ -3529,28 +3697,20 @@ static void swizzle_bks_methods(void) {
         SEL mkavSel = sel_registerName("makeKeyAndVisible");
         Method m = class_getInstanceMethod(windowClass, mkavSel);
         if (m) {
+            _original_makeKeyAndVisible_IMP = method_getImplementation(m);
             method_setImplementation(m, (IMP)replacement_makeKeyAndVisible);
         }
 
-        /* UIWindow.isKeyWindow — return YES for our bridge root window */
-        SEL ikwSel = sel_registerName("isKeyWindow");
-        Method ikwMethod = class_getInstanceMethod(windowClass, ikwSel);
-        if (ikwMethod) {
-            method_setImplementation(ikwMethod, (IMP)replacement_isKeyWindow);
-            bridge_log("  Swizzled UIWindow.isKeyWindow");
-        }
+        /* UIWindow.isKeyWindow — let UIKit manage natively.
+         * With the real makeKeyAndVisible running, UIKit tracks key window
+         * state internally. Our replacement_isKeyWindow is kept as fallback
+         * but UIKit's native impl should work. */
+        bridge_log("  UIWindow.isKeyWindow NOT swizzled — using UIKit native");
     }
 
-    /* UIApplication.keyWindow — return _bridge_root_window directly */
+    /* UIApplication.keyWindow — let UIKit manage natively. */
     Class appClass = objc_getClass("UIApplication");
-    if (appClass) {
-        SEL kwSel = sel_registerName("keyWindow");
-        Method kwMethod = class_getInstanceMethod(appClass, kwSel);
-        if (kwMethod) {
-            method_setImplementation(kwMethod, (IMP)replacement_keyWindow);
-            bridge_log("  Swizzled UIApplication.keyWindow");
-        }
-    }
+    bridge_log("  UIApplication.keyWindow NOT swizzled — using UIKit native");
 
     /* UIApplication.workspaceShouldExit: — called when FBSWorkspace connection
        fails (no SpringBoard). Without this swizzle, the app calls exit().
