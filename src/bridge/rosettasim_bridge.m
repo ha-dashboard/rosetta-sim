@@ -2762,43 +2762,19 @@ static void swizzle_bks_methods(void) {
         }
     }
 
-    /* UIApplication.sendEvent: — the original calls _sendTouchesForEvent:
-       which crashes in gesture recognizer processing because UIGestureEnvironment
-       is not initialized. Replace with a version that handles UITouchesEvent
-       directly and passes other event types through. */
-    if (appClass) {
-        /* Try _sendTouchesForEvent: first (internal method) */
-        SEL stfeSel = sel_registerName("_sendTouchesForEvent:");
-        Method m = class_getInstanceMethod(appClass, stfeSel);
-        if (m) {
-            method_setImplementation(m, (IMP)replacement_sendTouchesForEvent);
-            bridge_log("  Swizzled UIApplication._sendTouchesForEvent:");
-        } else {
-            /* _sendTouchesForEvent: not found — swizzle sendEvent: directly.
-               Store original IMP to call for non-touch events. */
-            SEL sendEventSel = sel_registerName("sendEvent:");
-            Method sem = class_getInstanceMethod(appClass, sendEventSel);
-            if (sem) {
-                /* We can't easily chain to original for non-touch events without
-                   storing the original IMP. Instead, just replace with our version
-                   that handles UITouchesEvent and no-ops other event types. */
-                method_setImplementation(sem, (IMP)replacement_sendTouchesForEvent);
-                bridge_log("  Swizzled UIApplication.sendEvent: (fallback)");
-            }
-        }
-    }
+    /* UIApplication.sendEvent: — with UIEventDispatcher properly initialized
+       (created in replacement_runWithMainScene), UIKit's real event pipeline
+       should work. Do NOT swizzle sendEvent: — let UIKit handle it natively.
 
-    /* UITextField.becomeFirstResponder — crashes in UITextInteractionAssistant
-       gesture recognizer setup */
-    Class textFieldClass = objc_getClass("UITextField");
-    if (textFieldClass) {
-        SEL bfrSel = sel_registerName("becomeFirstResponder");
-        Method m = class_getInstanceMethod(textFieldClass, bfrSel);
-        if (m) {
-            method_setImplementation(m, (IMP)replacement_UITextFieldBecomeFirstResponder);
-            bridge_log("  Swizzled UITextField.becomeFirstResponder");
-        }
-    }
+       If UIKit's real _sendTouchesForEvent: crashes (gesture environment not
+       fully initialized), the SIGSEGV crash guard in check_and_inject_touch()
+       will catch it and fall through to direct delivery. */
+    bridge_log("  sendEvent: NOT swizzled — using UIKit's real event pipeline");
+
+    /* UITextField.becomeFirstResponder — with UIEventDispatcher and
+       UIGestureEnvironment properly initialized, the real becomeFirstResponder
+       should work. Do NOT swizzle — let UIKit handle it natively. */
+    bridge_log("  UITextField.becomeFirstResponder NOT swizzled — using native");
 
     /* BKSEventFocusManager - event focus management */
     const char *classesToSwizzle[] = {
