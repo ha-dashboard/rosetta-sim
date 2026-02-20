@@ -507,18 +507,42 @@ Bridge (x86_64):                      Host App (ARM64):
 
 **Live content verified:** Uptime counter and clock label update every second, confirming the run loop, NSTimer, and re-rendering pipeline all function correctly.
 
-### Phase 6: Input and Interaction — PLANNED
-**Goal:** Touch, keyboard, and device interaction.
+### Phase 6: Touch Injection + Real App Loading — COMPLETE (2026-02-20)
+**Goal:** Interactive touch from host app, real .app bundle loading.
 
-**Implementation:**
-- Mouse click → UITouch event injection via GraphicsServices
-- Keyboard → UIKeyboard event injection
-- Rotation → UIDevice orientation change notification
-- Shake gesture, screenshot, etc.
+**Architecture (touch):**
+```
+Host App (ARM64):                Bridge (x86_64):
+  NSView mouseDown/Up              check_and_inject_touch()
+       │                                │
+  Convert to iOS points            Read input region from mmap
+  (375x667 coordinate space)            │
+       │                           convertPoint:fromView: per subview
+  Write to mmap input region       pointInside:withEvent: for hit test
+  (offset 64, counter+phase+xy)         │
+                                   touchesBegan:/touchesEnded: on target
+```
 
-**Deliverable:** Interactive simulated iOS app.
+**Shared Framebuffer v2:**
+- Meta region expanded to 128 bytes (64-byte header + 64-byte input region)
+- Input region: touch_counter(u64), phase(u32), x(f32), y(f32), id(u32), timestamp(u64)
+- Pixel data at offset 128
 
-### Phase 6: App Management
+**Key fixes this session:**
+1. **UIApplication.sharedApplication recovered** — singleton pointer `_UIApp` was nil after longjmp. Fix: catch "only one UIApplication" NSException from alloc+init, then alloc again post-exception to get the existing instance, write it to `_UIApp` via dlsym.
+2. **BKSEventFocusManager swizzled** — with sharedApplication working, UIKit triggers more code paths that call backboardd. Swizzled BKSEventFocusManager and BKSAnimationFenceHandle methods to no-ops.
+3. **makeKeyAndVisible swizzled** — real apps call this during didFinishLaunching. Replaced with layer setHidden:NO to avoid BKSEventFocusManager crash.
+4. **Multi-box rendering** — `_force_display_recursive` was calling displayIfNeeded on ALL layers, creating empty backing stores that covered backgroundColor. Fix: compare drawRect: IMP against UIView base to only force display for views with custom drawing (UILabel, etc.).
+5. **Font rendering in .app bundles** — CoreText auto-activation fails without fontd. Fix: `__CTFontManagerDisableAutoActivation=1` env var.
+6. **Host app mmap** — O_RDONLY fd with PROT_WRITE mmap fails silently. Fix: O_RDWR.
+7. **Display orientation** — Bridge renders in standard CG coords (bottom-up, text correct). Host app flips via translateBy/scaleBy(-1) in NSView draw().
+8. **Position-based hit testing** — Uses convertPoint:fromView: + pointInside:withEvent: per subview instead of CGRect reading (which crashes under Rosetta 2 via objc_msgSend_stret).
+
+**Real app results:**
+- **Preferences.app** (iOS 10.3 SDK system app): Launches, UIApplication subclass detected, didFinishLaunchingWithOptions called. Hangs in UI setup (needs more infrastructure stubs).
+- **hass-dashboard** (user's real iOS app): Compiled for x86_64 simulator with modern Xcode. Full startup: font loading, keychain reads, login view controller, navigation controller. Hits makeKeyAndVisible → swizzled → enters run loop at 30fps. White screen (UINavigationBar/UITextField layers need display cycle refinement).
+
+### Phase 7: App Management
 **Goal:** Install and launch arbitrary simulator apps.
 
 **Implementation:**
