@@ -702,12 +702,34 @@ static int setup_shared_framebuffer(void) {
     return 0;
 }
 
-/* Recursively force all layers in the tree to display their content */
+/* Recursively force layers with custom drawing to display their content.
+ *
+ * Only calls displayIfNeeded on layers whose delegate overrides drawRect:
+ * (e.g. UILabel for text rendering). For plain UIView layers that only use
+ * backgroundColor, displayIfNeeded creates an empty backing store that
+ * covers the backgroundColor during renderInContext:. We skip those. */
 static void _force_display_recursive(id layer, int depth) {
-    if (!layer || depth > 20) return; /* guard against infinite recursion */
+    if (!layer || depth > 20) return;
 
-    ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
-    ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
+    id delegate = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("delegate"));
+    if (delegate) {
+        Class cls = object_getClass(delegate);
+        Class uiViewBase = objc_getClass("UIView");
+        SEL drawSel = sel_registerName("drawRect:");
+        IMP clsIMP = class_getMethodImplementation(cls, drawSel);
+        IMP baseIMP = class_getMethodImplementation(uiViewBase, drawSel);
+
+        if (clsIMP != baseIMP) {
+            /* Custom drawRect: (UILabel, UIImageView, etc.) — force display */
+            ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+            ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
+        }
+        /* Plain UIView — skip to preserve backgroundColor rendering */
+    } else {
+        /* Standalone CALayer — safe to force display */
+        ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+        ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
+    }
 
     id sublayers = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("sublayers"));
     if (sublayers) {
