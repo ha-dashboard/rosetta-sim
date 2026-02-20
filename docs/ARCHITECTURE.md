@@ -540,7 +540,40 @@ Host App (ARM64):                Bridge (x86_64):
 
 **Real app results:**
 - **Preferences.app** (iOS 10.3 SDK system app): Launches, UIApplication subclass detected, didFinishLaunchingWithOptions called. Hangs in UI setup (needs more infrastructure stubs).
-- **hass-dashboard** (user's real iOS app): Compiled for x86_64 simulator with modern Xcode. Full startup: font loading, keychain reads, login view controller, navigation controller. Hits makeKeyAndVisible → swizzled → enters run loop at 30fps. White screen (UINavigationBar/UITextField layers need display cycle refinement).
+- **hass-dashboard** (user's real iOS app): Compiled for x86_64 simulator with modern Xcode. Full startup: font loading, keychain reads, login view controller, navigation controller. Enters run loop at 30fps.
+
+### Phase 6b: White Screen Fix + Performance (2026-02-20, Session 2)
+**Goal:** Fix hass-dashboard white screen, improve display forcing, add UIEvent touch delivery, eliminate flashing.
+
+**Key fixes:**
+1. **makeKeyAndVisible rootVC loading** — The swizzled makeKeyAndVisible only set layer hidden=NO but didn't load the rootViewController's view. Real apps set `window.rootViewController = navController` and expect makeKeyAndVisible to call `_installRootViewControllerIntoWindow:`. Fix: manually get rootVC.view, set its frame, add as subview, call viewWillAppear:. Avoids CGRect struct return (crashes under Rosetta 2 via objc_msgSend_stret) by using known screen dimensions.
+
+2. **Widened display forcing** — Original only checked drawRect: IMP. Now also checks: drawLayer:inContext: (UIPageControl, UIProgressView), displayLayer: (custom CALayer delegates), and private UIKit classes (class name starts with `_`, e.g. _UIBarBackground, _UINavigationBarBackground). Still skips plain UIView to preserve backgroundColor rendering.
+
+3. **UITouch/UIEvent-based touch delivery** — Previous approach called touchesBegan: directly with empty NSSet + nil event. New approach: creates UITouch objects with phase, location (_setLocationInWindow:resetPrevious:), window, view, and timestamp properties. Attempts UIEvent creation via _initWithEvent:touches: and delivery via [UIApplication sendEvent:]. Falls back to direct dispatch for custom UIView subclasses.
+
+4. **Recursive hit testing** — Replaced flat window-subviews iteration with full recursive _hitTestView that walks the entire view hierarchy, respecting userInteractionEnabled, hidden, and back-to-front z-ordering. Hit target locked on BEGAN, reused for MOVED/ENDED.
+
+5. **Frame-limited force-display** — _force_display_recursive was running every frame (30fps), causing visible flashing as backing stores were constantly recreated. Fix: countdown system — force first 10 frames for initial population, 5 frames after touch events, periodic refresh every ~1s for timer-driven updates. All other frames use cached backing stores.
+
+6. **hass-dashboard compile script** — `scripts/build_hassdash.sh` builds with modern Xcode (`-sdk iphonesimulator ARCHS=x86_64 IPHONEOS_DEPLOYMENT_TARGET=10.0 CODE_SIGNING_ALLOWED=NO`), ad-hoc signs output.
+
+7. **View hierarchy diagnostic dump** — One-time dump of the full UIView tree on first frame capture tick, logging class name, pointer, hidden state, and alpha for every view.
+
+**hass-dashboard results (updated):**
+- Full view hierarchy loads: UINavigationController → UINavigationBar, HALoginViewController → UIScrollView → HAConnectionFormView → UITextFields, UISegmentedControl, UIButton, UILabels, UIActivityIndicatorView
+- 45+ distinct colors rendered (constellation gradient background visible)
+- Light gray theme renders instead of dark theme (UIAppearance proxies not yet activated)
+- ~14fps with selective display forcing
+
+**Open problems for next session:**
+
+| Priority | Problem | Detail |
+|---|---|---|
+| 1 | Dark theme not applied | hass-dashboard renders in default UIKit light gray instead of custom dark theme. UIAppearance proxies may need explicit activation or the view controller lifecycle needs viewDidAppear: |
+| 2 | UIControl touch delivery | UIEvent creation via _initWithEvent:touches: needs verification. UIButton/UITextField may need proper UITouch with HID event backing |
+| 3 | Performance | 14fps with complex apps (force-display is expensive). IOSurface zero-copy would eliminate mmap overhead |
+| 4 | viewDidAppear lifecycle | Only viewWillAppear: is called in makeKeyAndVisible replacement. viewDidAppear: may trigger additional view setup |
 
 ### Phase 7: App Management
 **Goal:** Install and launch arbitrary simulator apps.
