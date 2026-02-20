@@ -1,15 +1,28 @@
 import SwiftUI
 import AppKit
 
-// MARK: - Framebuffer Constants (must match rosettasim_framebuffer.h)
+// MARK: - Framebuffer Constants (must match rosettasim_framebuffer.h v3)
 private let kFBMagic: UInt32     = 0x4D495352  // 'RSIM'
 private let kFBHeaderSize        = 64
-private let kFBInputSize         = 64
-private let kFBMetaSize          = 128  // header + input region
 private let kFBFlagFrameReady: UInt32 = 0x01
 private let kFBFlagAppRunning: UInt32 = 0x02
 private let kFBFlagRendering: UInt32   = 0x04  // Bridge is writing pixels — skip read
 private let kFBDefaultPath       = "/tmp/rosettasim_framebuffer"
+
+// Touch ring buffer constants (v3)
+private let kTouchRingSize       = 16
+private let kTouchEventSize      = 32   // sizeof(RosettaSimTouchEvent)
+// Input region layout:
+//   offset 0:   touch_write_index (uint64_t, 8 bytes)
+//   offset 8:   touch_ring[16] (16 * 32 = 512 bytes)
+//   offset 520: key_code (uint32_t)
+//   offset 524: key_flags (uint32_t)
+//   offset 528: key_char (uint32_t)
+// Total input region is calculated from struct layout
+private let kInputRegionOffset   = kFBHeaderSize  // input starts after header
+// Input region size: 8 (write_index) + 16*32 (ring) + 12 (key fields) + 20 (reserved) = 552
+private let kFBInputSize         = 8 + kTouchRingSize * kTouchEventSize + 12 + 20
+private let kFBMetaSize          = kFBHeaderSize + kFBInputSize  // 616
 
 // Touch phase constants (must match rosettasim_framebuffer.h)
 private let kTouchPhaseNone: UInt32      = 0
@@ -289,59 +302,66 @@ class FrameLoader: ObservableObject {
         }
     }
 
-    /// Send a touch event to the shared framebuffer input region
+    /// Send a touch event to the ring buffer in the shared framebuffer.
+    /// Events are written to touch_ring[write_index % RING_SIZE], then
+    /// write_index is incremented. The bridge reads all events between
+    /// its read_index and write_index, so no events are lost.
     func sendTouch(phase: UInt32, x: Float, y: Float) {
         guard let ptr = mmapPtr else { return }
 
-        // Input region is at offset 64 (kFBHeaderSize)
-        let inputPtr = ptr.advanced(by: kFBHeaderSize)
+        // Input region is at offset kFBHeaderSize
+        let inputPtr = ptr.advanced(by: kInputRegionOffset)
 
-        // Write ALL fields BEFORE incrementing counter (Fix #2: avoid race with bridge reader)
-        // Write touch phase (offset 8)
-        let phasePtr = inputPtr.advanced(by: 8).assumingMemoryBound(to: UInt32.self)
-        phasePtr.pointee = phase
+        // Read current write index
+        let writeIndexPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
+        let currentIndex = writeIndexPtr.pointee
 
-        // Write x coordinate (offset 12)
-        let xPtr = inputPtr.advanced(by: 12).assumingMemoryBound(to: Float.self)
-        xPtr.pointee = x
+        // Calculate slot in ring buffer
+        let slot = Int(currentIndex % UInt64(kTouchRingSize))
 
-        // Write y coordinate (offset 16)
-        let yPtr = inputPtr.advanced(by: 16).assumingMemoryBound(to: Float.self)
-        yPtr.pointee = y
+        // Touch ring starts at offset 8 (after write_index)
+        // Each RosettaSimTouchEvent is 32 bytes:
+        //   offset 0: touch_phase (uint32_t)
+        //   offset 4: touch_x (float)
+        //   offset 8: touch_y (float)
+        //   offset 12: touch_id (uint32_t)
+        //   offset 16: touch_timestamp (uint64_t)
+        //   offset 24: _pad[2] (8 bytes)
+        let eventBase = inputPtr.advanced(by: 8 + slot * kTouchEventSize)
 
-        // Write touch ID (offset 20) - always 0 for primary touch
-        let idPtr = inputPtr.advanced(by: 20).assumingMemoryBound(to: UInt32.self)
-        idPtr.pointee = 0
+        // Write event fields
+        eventBase.advanced(by: 0).assumingMemoryBound(to: UInt32.self).pointee = phase
+        eventBase.advanced(by: 4).assumingMemoryBound(to: Float.self).pointee = x
+        eventBase.advanced(by: 8).assumingMemoryBound(to: Float.self).pointee = y
+        eventBase.advanced(by: 12).assumingMemoryBound(to: UInt32.self).pointee = 0  // touch_id
+        eventBase.advanced(by: 16).assumingMemoryBound(to: UInt64.self).pointee = mach_absolute_time()
 
-        // Write timestamp (offset 24)
-        let tsPtr = inputPtr.advanced(by: 24).assumingMemoryBound(to: UInt64.self)
-        tsPtr.pointee = mach_absolute_time()
-
-        // Memory barrier: ensure all fields are visible before counter increment
+        // Memory barrier: ensure event fields are visible before index increment
         OSMemoryBarrier()
 
-        // Increment touch counter LAST — this is the signal to the bridge
-        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
-        counterPtr.pointee += 1
+        // Increment write index — signals the bridge that a new event is available
+        writeIndexPtr.pointee = currentIndex + 1
     }
 
-    /// Send a key event to the shared framebuffer input region
+    /// Send a key event to the shared framebuffer input region.
+    /// Keyboard fields are after the touch ring buffer in the input region.
     func sendKeyEvent(keyCode: UInt16, modifierFlags: UInt32, character: Character?) {
         guard let ptr = mmapPtr else { return }
 
-        // Input region is at offset 64 (kFBHeaderSize)
-        let inputPtr = ptr.advanced(by: kFBHeaderSize)
+        // Input region is at offset kFBHeaderSize
+        let inputPtr = ptr.advanced(by: kInputRegionOffset)
 
-        // Write key_code (offset 32 in input region = after touch fields)
-        let keyCodePtr = inputPtr.advanced(by: 32).assumingMemoryBound(to: UInt32.self)
-        keyCodePtr.pointee = UInt32(keyCode)
+        // Keyboard fields are after touch_write_index (8) + touch_ring (16*32=512) = offset 520
+        let keyBase = inputPtr.advanced(by: 8 + kTouchRingSize * kTouchEventSize)
 
-        // Write key_flags (offset 36 in input region)
-        let keyFlagsPtr = inputPtr.advanced(by: 36).assumingMemoryBound(to: UInt32.self)
-        keyFlagsPtr.pointee = modifierFlags
+        // Write key_code (offset 0 from keyBase)
+        keyBase.advanced(by: 0).assumingMemoryBound(to: UInt32.self).pointee = UInt32(keyCode)
 
-        // Write key_char (offset 40 in input region) - first UTF-8 scalar value
-        let keyCharPtr = inputPtr.advanced(by: 40).assumingMemoryBound(to: UInt32.self)
+        // Write key_flags (offset 4)
+        keyBase.advanced(by: 4).assumingMemoryBound(to: UInt32.self).pointee = modifierFlags
+
+        // Write key_char (offset 8) - first UTF-8 scalar value
+        let keyCharPtr = keyBase.advanced(by: 8).assumingMemoryBound(to: UInt32.self)
         if let ch = character {
             keyCharPtr.pointee = UInt32(ch.unicodeScalars.first?.value ?? 0)
         } else {
@@ -351,9 +371,8 @@ class FrameLoader: ObservableObject {
         // Memory barrier to ensure key fields are visible
         OSMemoryBarrier()
 
-        // DO NOT increment touch_counter — keyboard events are signaled by
-        // key_code being non-zero, which check_and_inject_keyboard() polls.
-        // Incrementing touch_counter causes phantom touch events (Fix #1).
+        // Keyboard events are signaled by key_code being non-zero.
+        // DO NOT increment touch_write_index.
     }
 
     /// Load a single frame from a PNG file (legacy/fallback)

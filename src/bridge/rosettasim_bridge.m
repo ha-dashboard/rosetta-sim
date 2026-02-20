@@ -1195,6 +1195,12 @@ static id _bridge_touch_target_view = nil;
  * Reset after pre-warm so real touches get a fresh chance. */
 static int _addTouch_known_broken = 0;
 
+/* Tracks whether sendEvent: has been observed to crash with real touches.
+ * After N consecutive crashes, skip sendEvent entirely and go straight
+ * to direct delivery (avoids SIGSEGV overhead on every touch). */
+static int _sendEvent_crash_count = 0;
+#define SENDEVENT_MAX_CRASHES 3  /* Skip after this many crashes */
+
 /* Hit testing — delegates to UIKit's own hitTest:withEvent: which respects:
  *   - Custom hitTest:withEvent: overrides (many UIKit views expand/contract hit areas)
  *   - alpha < 0.01 check (UIKit skips transparent views)
@@ -1260,33 +1266,59 @@ static id _hitTestView(id view, _RSBridgeCGPoint windowPt) {
     return view;
 }
 
+/* Process a single touch event — called from check_and_inject_touch for each
+ * event in the ring buffer. */
+static void _inject_single_touch(uint32_t phase, double tx, double ty);
+
 static void check_and_inject_touch(void) {
     if (!_fb_mmap || !_bridge_root_window) return;
 
     /* Read input region */
     RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
 
-    /* Check if there's a new touch event */
-    static uint64_t last_touch_counter = 0;
-    uint64_t current_counter = inp->touch_counter;
+    /* Read the ring buffer write index */
+    static uint64_t last_read_index = 0;
+    uint64_t write_index = inp->touch_write_index;
 
-    if (current_counter == last_touch_counter) {
-        return; /* No new touch */
+    if (write_index == last_read_index) {
+        return; /* No new events */
     }
-    last_touch_counter = current_counter;
 
-    /* Memory barrier: ensure we see the fields written before the counter (Fix #6) */
+    /* Memory barrier: ensure we see events written before the index */
     __sync_synchronize();
 
-    uint32_t phase = inp->touch_phase;
-    if (phase == ROSETTASIM_TOUCH_NONE) return;
+    /* Process all pending events in the ring buffer */
+    uint64_t events_to_process = write_index - last_read_index;
+    if (events_to_process > ROSETTASIM_TOUCH_RING_SIZE) {
+        /* Ring buffer overflowed — skip to most recent events */
+        bridge_log("Touch ring overflow: missed %llu events",
+                   events_to_process - ROSETTASIM_TOUCH_RING_SIZE);
+        last_read_index = write_index - ROSETTASIM_TOUCH_RING_SIZE;
+        events_to_process = ROSETTASIM_TOUCH_RING_SIZE;
+    }
 
-    /* Get touch coordinates (in points) */
-    double tx = (double)inp->touch_x;
-    double ty = (double)inp->touch_y;
+    for (uint64_t i = last_read_index; i < write_index; i++) {
+        int slot = (int)(i % ROSETTASIM_TOUCH_RING_SIZE);
+        RosettaSimTouchEvent *ev = &inp->touch_ring[slot];
 
+        uint32_t phase = ev->touch_phase;
+        if (phase == ROSETTASIM_TOUCH_NONE) continue;
+
+        double tx = (double)ev->touch_x;
+        double ty = (double)ev->touch_y;
+
+        _inject_single_touch(phase, tx, ty);
+    }
+
+    last_read_index = write_index;
+}
+
+static void _inject_single_touch(uint32_t phase, double tx, double ty) {
+
+    static uint64_t _touch_seq = 0;
+    _touch_seq++;
     bridge_log("Touch event #%llu: phase=%u x=%.1f y=%.1f",
-               current_counter, phase, tx, ty);
+               _touch_seq, phase, tx, ty);
 
     /* ---- Hit test on BEGAN, reuse target for MOVED/ENDED ---- */
     if (phase == ROSETTASIM_TOUCH_BEGAN) {
@@ -1558,8 +1590,10 @@ static void check_and_inject_touch(void) {
                 }
             }
 
-            /* Step 6: [UIApplication sendEvent:] with crash guard */
-            if (touchesEvent) {
+            /* Step 6: [UIApplication sendEvent:] with crash guard.
+             * Skip entirely after SENDEVENT_MAX_CRASHES consecutive crashes
+             * to avoid SIGSEGV overhead on every touch. */
+            if (touchesEvent && _sendEvent_crash_count < SENDEVENT_MAX_CRASHES) {
                 if (!using_real_singleton) _bridge_current_event = touchesEvent;
 
                 if (!_sendEvent_handlers_installed) {
@@ -1580,6 +1614,7 @@ static void check_and_inject_touch(void) {
                     ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, touchesEvent);
                     _sendEvent_guard_active = 0;
                     sendEvent_succeeded = 1;
+                    _sendEvent_crash_count = 0; /* Reset on success */
                     if (addTouch_succeeded) {
                         gesture_delivery_succeeded = 1;
                         bridge_log("  sendEvent: with gesture recognizers succeeded");
@@ -1587,12 +1622,20 @@ static void check_and_inject_touch(void) {
                         bridge_log("  sendEvent: succeeded (no gesture recognizers)");
                     }
                 } else {
-                    bridge_log("  sendEvent: CRASHED (signal %d)", crash_sig);
                     _sendEvent_guard_active = 0;
+                    _sendEvent_crash_count++;
+                    if (_sendEvent_crash_count >= SENDEVENT_MAX_CRASHES) {
+                        bridge_log("  sendEvent: CRASHED %d times — disabling (direct delivery only)",
+                                   _sendEvent_crash_count);
+                    } else {
+                        bridge_log("  sendEvent: CRASHED (signal %d, count %d/%d)",
+                                   crash_sig, _sendEvent_crash_count, SENDEVENT_MAX_CRASHES);
+                    }
                 }
-            } else {
+            } else if (!touchesEvent) {
                 bridge_log("  No UITouchesEvent — direct delivery only");
             }
+            /* else: sendEvent disabled after too many crashes — direct delivery only */
         }
     }
 
@@ -1663,13 +1706,69 @@ static void check_and_inject_touch(void) {
         }
 
         if (isTextField) {
-            /* UITextField: do NOT call becomeFirstResponder explicitly.
-             * UIKit's real event pipeline (via sendEvent:) delivers touches
-             * to the UITextField, and its internal tap gesture recognizer
-             * fires becomeFirstResponder after ENDED. Calling it on BEGAN
-             * is premature and triggers keyboard infrastructure that crashes
-             * without backboardd (UIKeyboardImpl → UIInputWindowController). */
-            bridge_log("  UITextField touch — UIKit handles via gesture recognizer");
+            /* UITextField: set as first responder on ENDED so keyboard
+             * input (via mmap) routes to this field.
+             *
+             * Do NOT call UITextField's native becomeFirstResponder — it
+             * triggers UITextInteractionAssistant → gesture recognizer
+             * setup → fatal crash (backboardd-dependent state + nested
+             * siglongjmp inside @try = corrupted ObjC exception state).
+             *
+             * Instead, directly register the text field as first responder
+             * via the window's private API + UIResponder's base impl. */
+            if (phase == ROSETTASIM_TOUCH_ENDED) {
+                bridge_log("  UITextField tapped — setting as first responder");
+
+                /* Set via window._setFirstResponder: (private API) */
+                id targetWindow = _bridge_key_window ? _bridge_key_window : _bridge_root_window;
+                if (targetWindow) {
+                    SEL setFRSel = sel_registerName("_setFirstResponder:");
+                    if (class_respondsToSelector(object_getClass(targetWindow), setFRSel)) {
+                        @try {
+                            ((void(*)(id, SEL, id))objc_msgSend)(
+                                targetWindow, setFRSel, controlTarget);
+                            bridge_log("  Set first responder via window._setFirstResponder:");
+                        } @catch (id e) { /* ignore */ }
+                    }
+                }
+
+                /* Call UIResponder's BASE becomeFirstResponder (not UITextField's
+                 * override). UIResponder's impl calls [UIApplication _setFirstResponder:]
+                 * without touching gesture recognizers. */
+                Class uiResponderClass = objc_getClass("UIResponder");
+                if (uiResponderClass) {
+                    SEL bfrSel = sel_registerName("becomeFirstResponder");
+                    Method respMethod = class_getInstanceMethod(uiResponderClass, bfrSel);
+                    if (respMethod) {
+                        IMP baseBFR = method_getImplementation(respMethod);
+                        if (baseBFR) {
+                            @try {
+                                ((bool(*)(id, SEL))baseBFR)(controlTarget, bfrSel);
+                                bridge_log("  Called UIResponder.becomeFirstResponder (base)");
+                            } @catch (id e) {
+                                bridge_log("  UIResponder.becomeFirstResponder threw");
+                            }
+                        }
+                    }
+                }
+
+                /* Post UITextFieldTextDidBeginEditingNotification */
+                @try {
+                    Class nc = objc_getClass("NSNotificationCenter");
+                    id ctr = nc ? ((id(*)(id, SEL))objc_msgSend)(
+                        (id)nc, sel_registerName("defaultCenter")) : nil;
+                    if (ctr) {
+                        id nn = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                            (id)objc_getClass("NSString"),
+                            sel_registerName("stringWithUTF8String:"),
+                            "UITextFieldTextDidBeginEditingNotification");
+                        ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+                            ctr, sel_registerName("postNotificationName:object:userInfo:"),
+                            nn, controlTarget, nil);
+                        bridge_log("  Posted UITextFieldTextDidBeginEditingNotification");
+                    }
+                } @catch (id e) { /* ignore */ }
+            }
         } else if (isSegmented) {
             /* UISegmentedControl: needs special handling.
              * 1. Determine which segment was tapped via hit position
@@ -1888,10 +1987,12 @@ static void check_and_inject_keyboard(void) {
     RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
 
     uint32_t key_code = inp->key_code;
-    if (key_code == 0) return; /* No pending key event */
-
     uint32_t key_flags = inp->key_flags;
     uint32_t key_char = inp->key_char;
+
+    /* No pending key event — check both key_code and key_char since
+     * regular character input may have key_code=0 with key_char set */
+    if (key_code == 0 && key_char == 0) return;
 
     /* Clear key_code immediately to acknowledge processing */
     inp->key_code = 0;

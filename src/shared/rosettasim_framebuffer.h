@@ -9,9 +9,15 @@
  * Both poll their respective counters for changes.
  *
  * Memory layout:
- *   Offset 0:    Header (64 bytes) — frame metadata
- *   Offset 64:   Input region (64 bytes) — touch/keyboard events
- *   Offset 128:  Pixel data (width * height * 4 bytes, BGRA format)
+ *   Offset 0:      Header (64 bytes) — frame metadata
+ *   Offset 64:     Input region — touch event ring buffer + keyboard
+ *   Offset 1088:   Pixel data (width * height * 4 bytes, BGRA format)
+ *
+ * VERSION 3: Touch events use a ring buffer (16 slots) to prevent
+ * event loss when the host sends events faster than the bridge polls.
+ * The host writes to events[write_index % RING_SIZE] and increments
+ * write_index. The bridge reads all events between its read_index and
+ * the current write_index.
  */
 
 #ifndef ROSETTASIM_FRAMEBUFFER_H
@@ -20,12 +26,10 @@
 #include <stdint.h>
 
 #define ROSETTASIM_FB_MAGIC       0x4D495352  /* 'RSIM' little-endian */
-#define ROSETTASIM_FB_VERSION     2
+#define ROSETTASIM_FB_VERSION     3
 #define ROSETTASIM_FB_FORMAT_BGRA 0x42475241  /* 'BGRA' */
 #define ROSETTASIM_FB_PATH        "/tmp/rosettasim_framebuffer"
 #define ROSETTASIM_FB_HEADER_SIZE 64
-#define ROSETTASIM_FB_INPUT_SIZE  64
-#define ROSETTASIM_FB_META_SIZE   (ROSETTASIM_FB_HEADER_SIZE + ROSETTASIM_FB_INPUT_SIZE) /* 128 */
 
 /* Flags */
 #define ROSETTASIM_FB_FLAG_FRAME_READY  0x01
@@ -53,19 +57,38 @@ typedef struct __attribute__((packed)) {
     uint32_t _reserved[4];    /* Pad header to 64 bytes */
 } RosettaSimFramebufferHeader;
 
-/* Input event region — host writes, bridge reads */
+/* Single touch event entry in the ring buffer */
 typedef struct __attribute__((packed)) {
-    uint64_t touch_counter;   /* Incremented by host on each new touch event */
     uint32_t touch_phase;     /* ROSETTASIM_TOUCH_* */
     float    touch_x;         /* X coordinate in points (0..375) */
     float    touch_y;         /* Y coordinate in points (0..667) */
     uint32_t touch_id;        /* Finger ID for multi-touch (0 = primary) */
     uint64_t touch_timestamp; /* mach_absolute_time() of the touch */
+    uint32_t _pad[2];         /* Pad to 32 bytes */
+} RosettaSimTouchEvent;
+
+/* Touch event ring buffer — prevents event loss when host sends faster
+ * than bridge polls. Host writes to events[write_index % RING_SIZE],
+ * then increments write_index. Bridge reads all events between its
+ * read_index and write_index. */
+#define ROSETTASIM_TOUCH_RING_SIZE 16
+
+/* Input region — host writes, bridge reads.
+ * Contains the touch ring buffer + keyboard event fields. */
+typedef struct __attribute__((packed)) {
+    /* Touch ring buffer */
+    uint64_t touch_write_index;   /* Incremented by host after writing each event */
+    RosettaSimTouchEvent touch_ring[ROSETTASIM_TOUCH_RING_SIZE]; /* 16 * 32 = 512 bytes */
+
+    /* Keyboard events (single-buffered — keys are slow enough) */
     uint32_t key_code;        /* Key code (0 = none) */
     uint32_t key_flags;       /* Modifier flags */
     uint32_t key_char;        /* UTF-8 character (first byte, 0 = none) */
-    uint32_t _reserved[3];    /* Pad to 64 bytes */
+    uint32_t _reserved[5];    /* Pad to 1024 bytes total for input region */
 } RosettaSimInputRegion;
+
+#define ROSETTASIM_FB_INPUT_SIZE  sizeof(RosettaSimInputRegion)
+#define ROSETTASIM_FB_META_SIZE   (ROSETTASIM_FB_HEADER_SIZE + ROSETTASIM_FB_INPUT_SIZE)
 
 /* Total mmap size: header + input + pixel data */
 #define ROSETTASIM_FB_PIXEL_SIZE(w, h)  ((w) * (h) * 4)
