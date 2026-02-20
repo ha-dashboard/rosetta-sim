@@ -14,8 +14,13 @@ Run Xcode 8.3.3 (latest with iOS 9 simulator support) on macOS 26.3 (ARM64 Apple
 - Devices window works (shows simulators)
 - Components tab shows downloadable iOS 9.x simulator runtimes
 - Simulator management works
-- Creating new projects crashes (CALayer.view private API change - next fix)
-- iOS 9 simulator download reported "non-interactive" error
+- **iOS 9.3 Simulator runtime installed** and recognized by modern CoreSimulator
+- iOS 9.3 device creates and boots (~40 processes, backboardd stable)
+- SpringBoard launches but crashes — display pipeline has no working framebuffer
+- **Creating/opening projects works** — workspace window renders with all 120 plugins loaded
+- Xcode's built-in simulator download UI still fails (use `install_sim93.sh` instead)
+- **All plugins enabled** — no plugins in PlugIns.disabled, IB/LLDB/GPU all load
+- **Next step**: inject RosettaSim bridge into runtime for display bypass
 
 ## Architecture
 
@@ -49,13 +54,27 @@ Xcode-8.3.3.app/Contents/
 | 2 | Missing PubSub.framework | Removed from macOS | Stub dylib + install_name_tool redirect |
 | 3 | Missing AppKit private ivar symbols | 10 ivar offset symbols no longer exported | AppKit_compat.dylib wrapper re-exporting AppKit |
 | 4 | DYLD_* env vars stripped | Security restriction for Rosetta apps | Direct binary patching instead |
-| 5 | All 118 plugin scan records pruned | Unknown check in _pruneUnusablePlugInsAndScanRecords | Prune-then-restore strategy |
+| 5 | All 118 plugin scan records pruned | Unknown check in _pruneUnusablePlugInsAndScanRecords | Prune-then-restore (only restores bundles that exist on disk) |
 | 6 | Scan record properties nil (identifier, UUIDs) | Info.plist not loaded during scan on macOS 26 | Lazy-loading hooks on property getters |
 | 7 | Platform support plugins filtered by activation | "build-system" capability chicken-and-egg | Bypass activation rules |
 | 8 | "Required content for platform X missing" | Extension points not yet registered when queried | Platform validation bypass + error clearing |
-| 9 | Missing Python 2.7 for LLDB/GPU debugger | Python 2.7 removed from macOS | Stub + move plugins to disabled |
-| 10 | IB heartbeat method swizzle assertion | _addHeartBeatClientView: removed from AppKit | Missing method stubs + move IB plugins |
+| 9 | Missing Python 2.7 for LLDB/GPU debugger | Python 2.7 removed from macOS | Full 124-symbol no-op stub (all plugins load) |
+| 10 | IB heartbeat method swizzle assertion | _addHeartBeatClientView: removed from AppKit | Method stubs with correct type encodings (v@:c for NSProgressIndicator) |
 | 11 | NSTableView._reserved ivar missing | Private ivar removed from AppKit | Added to AppKit_compat wrapper |
+| 12 | CALayer.view crash creating projects | DVTKit category calls removed private CALayer API | Replaced DVTKit's `-[CALayer view]` via `method_setImplementation` → returns delegate if NSView |
+| 13 | Simulator download fails at install | PackageKit XPC service rejects old Xcode's client | Manual DMG extraction + direct runtime install |
+| 14 | iOS 9.3 runtime "unavailable" | CoreSimulator hardcodes maxHostVersion=10.14.99 for iOS 9.x | Override `maxHostVersion` in profile.plist to 99.99.99 |
+| 15 | simctl/SimulatorKit code signing | Swift libs flagged as non-platform binaries | Ad-hoc re-sign all libswift*.dylib + SimulatorKit |
+| 16 | backboardd "No window server display found" | `BKDisplayStartWindowServer()` can't enumerate displays from modern CoreSimulator | Binary patch: skip assertion (`je` → `jmp` to post-assertion path) |
+| 17 | SpringBoard "main display is nil" in BKSDisplayServicesStart | Cascading nil display through BackBoardServices | Binary patch: `BKSDisplayServicesStart` → `mov eax,1; ret` |
+| 18 | SpringBoard FBSceneManager crash | `_createSceneWithIdentifier:display:` called with nil display | **UNSOLVED** — requires display protocol bridge or RosettaSim approach |
+| 19 | DVTExtension valueForKey:error: throws | Extensions from broken/disabled plugins throw NSInternalInconsistencyException | Wrapped in `@try/@catch`, returns nil+NSError instead |
+| 20 | DVTInvalidExtension crashes Rosetta | `__cxa_throw` under Rosetta causes pointer auth SIGSEGV | Hook `valueForKey:` to return defaults, prevent `_throwInvalidExtensionExceptionForProperty:` |
+| 21 | IDEMenuBuilder assertion on disabled plugins | Menu definitions reference extensions from disabled plugins | Wrapped `_appendItemsToMenu:` in `@try/@catch`, skips missing |
+| 22 | _autolayout_cellSize infinite recursion | `_autolayout_cellSize` calls `[self cellSize]`, subclass calls back | Call `NSCell` IMP directly via `class_getMethodImplementation`, bypassing override |
+| 23 | NSFont._fFlags reads CoreText internals | Dummy offset 8 reads CTFont data (NSFont instance_size=8) | Changed offset to 16 (consistently zero across all font instances) |
+| 24 | IB _whenResizingUseEngineFrame: missing | `IBCocoaTouchPlugin` swizzles removed NSView private method | Added stub with correct encoding `v@:^c^c` |
+| 25 | IDEAssertionHandler aborts on stale refs | Assertions from disabled plugin stale references kill process | Convert assertion failures to warnings, uncaught exceptions to log-only |
 
 ### Key Technical Discoveries
 
@@ -65,21 +84,43 @@ Xcode-8.3.3.app/Contents/
 4. **Plugin activation rules create a chicken-and-egg** - platform plugins require "build-system" capability, but the build system needs platform plugins
 5. **253 extension points and 4411 extensions** successfully register once the plugin system is properly hooked
 6. **NSFont is fully opaque** in modern AppKit (0 ivars) - old code accessing _fFlags reads dummy memory
+7. **CoreSimulator's maxHostVersion is overridable** - the profile.plist `maxHostVersion` key takes precedence over the hardcoded version table in the CoreSimulator binary. Setting it to `99.99.99` makes any runtime "available" on any macOS version.
+8. **Modern CoreSimulator (1051.x) can boot legacy x86_64 runtimes** - iOS 9.3 boots via `SimLaunchHost.x86` on Apple Silicon. The old simctl can't connect (protocol mismatch) but the modern simctl works.
+9. **iOS 9.3 simulator DMG still available** on Apple CDN at `devimages-cdn.apple.com/downloads/xcode/simulators/` (as of Feb 2026)
+10. **CALayer.view was a private property** returning the NSView backing a layer. Removed in modern CoreAnimation. `self.delegate` is the backing view in layer-backed views.
+11. **Simulator display pipeline requires protocol bridging** — backboardd → BackBoardServices → FrontBoard → UIKit all assume a non-nil CADisplay from `BKSDisplayServicesStart`. Patching individual assertions reveals the next one downstream. The entire display init chain needs either: (a) a working SimFramebuffer connection, or (b) a RosettaSim-style bridge that provides screen info + offscreen rendering.
+12. **iOS 9.3 backboardd survives patching** — with the assertion bypassed, backboardd starts successfully, monitors SpringBoard, and accepts connections. The crash cascade is entirely in SpringBoard/UIKit, not backboardd.
+13. **Existing RosettaSim bridge is the proven approach** — `rosettasim_bridge.m` already solves this for standalone apps via DYLD_INSERT_LIBRARIES interposition of BKSDisplayServicesStart + GSSetMainScreenInfo + offscreen CALayer rendering. Phase 5 achieved 29fps continuous rendering. The challenge is injecting it into CoreSimulator-managed processes where env vars are stripped.
 
 ### Remaining Issues
 
-1. **CALayer.view crash** - DVTKit's `CALayer(DVTCALayerAdditions)` calls a removed private CoreAnimation API when creating project windows
-2. **Simulator download** - Reports "non-interactive" error
-3. **Interface Builder** disabled - heartbeat method swizzling and type encoding mismatches
-4. **LLDB/GPU Debugger** disabled - Python 2.7 dependency (needs full C API stub)
-5. **Unknown prune reason** - All scan records marked "unusable" by the prune step (we bypass but root cause unknown)
+1. **Simulator display — the final blocker** — iOS 9.3 boots ~40 processes, backboardd starts, SpringBoard launches but crashes in FBSceneManager because there's no display. Three possible paths forward:
+   - **Path A: RosettaSim bridge injection** — patch BackBoardServices.framework in the runtime to load a bridge dylib (via LC_LOAD_DYLIB) that interposes BKSDisplayServicesStart with screen info + offscreen rendering. The bridge code already exists and works (`rosettasim_bridge.m`, Phase 5 proven at 29fps).
+   - **Path B: SimFramebuffer protocol bridge** — build a v554→v783 protocol translator so the old SimFramebufferClient can talk to the modern host. Complex but would enable native display pipeline.
+   - **Path C: Try iOS 13/14 runtimes** — these may have a compatible enough SimFramebufferClient protocol to work with Xcode 13 host frameworks (iOS 15.7 works natively).
+2. **Simulator download UI broken** — workaround: use `install_sim93.sh`
+3. **LLDB debugging non-functional** — Python 2.7 stub is no-ops, breakpoints/debugger console won't work
+4. **GPU frame capture non-functional** — GPU debugger loads but capture functionality depends on missing system frameworks
+5. **Unknown prune reason** — all scan records marked "unusable" by the prune step (we bypass but root cause unknown)
+6. **Some assertion warnings at startup** — non-fatal, from stale extension references in disabled plugin menu definitions
+
+### Binary Patches Applied to iOS 9.3 Runtime
+
+| Binary | Offset | Patch | Purpose |
+|--------|--------|-------|---------|
+| `backboardd` (x86_64) | 0x10daa (fat: 0x86daa) | `0f8490000000` → `0f8412010000` | Skip assertion in BKDisplayStartWindowServer |
+| `BackBoardServices` (x86_64) | 0xade3 (fat: 0x58de3) | `c645df00` → `c645df01` | Set display-started flag to TRUE |
+| `BackBoardServices` (x86_64) | 0xadf4 (fat: 0x58df4) | `e8c7beffff` → `9090909090` | NOP call to _BKSDisplayStart |
+| `BackBoardServices` (x86_64) | 0xaf06 (fat: 0x59f06) | `0f8589000000` → `90e989000000` | Skip "main display is nil" assertion |
+| `BackBoardServices` (x86_64) | 0xadd4 (fat: 0x58dd4) | `554889e54157` → `b801000000c3` | BKSDisplayServicesStart returns TRUE immediately |
 
 ## Files
 
 ```
 rosetta/
-├── setup.sh                    # Automated setup script
-├── launch_xcode833.sh          # Launch helper
+├── setup.sh                    # Automated Xcode 8.3.3 patching script
+├── install_sim93.sh            # iOS 9.3 simulator manual install script
+├── launch_xcode833.sh          # Launch helper with log capture
 ├── PROGRESS.md                 # This file
 └── stubs/
     ├── dvt_plugin_hook.m       # DVT plugin system hooks (source)
