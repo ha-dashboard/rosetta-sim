@@ -1475,9 +1475,16 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
              * on the touch's _hidEvent ivar during gesture recognizer processing.
              * Without a valid IOHIDEvent, this dereferences nil+0x20 → SIGSEGV.
              *
-             * IOHIDEventCreateDigitizerFingerEvent creates a proper digitizer
-             * touch event that UIKit can process natively. */
+             * IMPORTANT: Create the IOHIDEvent ONCE on BEGAN and REUSE it for
+             * MOVED/ENDED. Creating a new IOHIDEvent per phase and overwriting
+             * the UIEvent._hidEvent causes dangling references — UIKit's gesture
+             * processing caches internal pointers to the IOHIDEvent from BEGAN,
+             * and overwriting it with a new object makes those pointers garbage.
+             * Crash: objc_msgSend + 5 with corrupted address.
+             */
             {
+                static void *_bridge_current_hidEvent = NULL;
+
                 /* Resolve IOHIDEvent functions via dlsym (private API) */
                 typedef void *(*IOHIDEventCreateDigitizerFingerEventFn)(
                     void *allocator, uint64_t timeStamp,
@@ -1499,57 +1506,57 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                 }
 
                 if (_createFingerEvent) {
-                    /* Map our touch phase to IOHIDDigitizerEventMask:
-                     *   kIOHIDDigitizerEventRange  = 0x01
-                     *   kIOHIDDigitizerEventTouch  = 0x02
-                     *   kIOHIDDigitizerEventPosition = 0x04 */
-                    uint32_t eventMask = 0;
-                    uint8_t range = 0, touchBit = 0;
-                    if (uiTouchPhase == 0) { /* Began */
-                        eventMask = 0x01 | 0x02 | 0x04; /* range + touch + position */
-                        range = 1; touchBit = 1;
-                    } else if (uiTouchPhase == 1) { /* Moved */
-                        eventMask = 0x04; /* position only */
-                        range = 1; touchBit = 1;
-                    } else if (uiTouchPhase == 3) { /* Ended */
-                        eventMask = 0x01 | 0x02 | 0x04;
-                        range = 0; touchBit = 0;
+                    if (uiTouchPhase == 0) {
+                        /* BEGAN: create a new IOHIDEvent for this touch sequence.
+                         * Release the old one if it exists. */
+                        if (_bridge_current_hidEvent) {
+                            CFRelease(_bridge_current_hidEvent);
+                            _bridge_current_hidEvent = NULL;
+                        }
+
+                        uint64_t ts = mach_absolute_time();
+                        _bridge_current_hidEvent = _createFingerEvent(
+                            NULL, ts,
+                            0,              /* index (finger 0) */
+                            2,              /* identity (arbitrary nonzero) */
+                            0x01 | 0x02 | 0x04, /* range + touch + position */
+                            tx / kScreenWidth,
+                            ty / kScreenHeight,
+                            0.0,            /* z */
+                            1.0,            /* tipPressure */
+                            0.0,            /* twist */
+                            1,              /* range = in range */
+                            1,              /* touch = touching */
+                            0);             /* options */
+
+                        if (_bridge_current_hidEvent) {
+                            bridge_log("  Created IOHIDEvent %p for touch sequence",
+                                       _bridge_current_hidEvent);
+                        }
                     }
+                    /* MOVED and ENDED: reuse the same IOHIDEvent from BEGAN.
+                     * UIKit's gesture processing holds cached references to it. */
 
-                    /* Timestamp as AbsoluteTime (mach_absolute_time) */
-                    uint64_t ts = mach_absolute_time();
-
-                    void *hidEvent = _createFingerEvent(
-                        NULL,           /* allocator (NULL = default) */
-                        ts,             /* timeStamp */
-                        0,              /* index (finger 0) */
-                        2,              /* identity (arbitrary nonzero) */
-                        eventMask,      /* eventMask */
-                        tx / kScreenWidth,   /* x (normalized 0-1) */
-                        ty / kScreenHeight,  /* y (normalized 0-1) */
-                        0.0,            /* z */
-                        (uiTouchPhase == 3) ? 0.0 : 1.0, /* tipPressure */
-                        0.0,            /* twist */
-                        range,          /* range (in range of digitizer) */
-                        touchBit,       /* touch (touching surface) */
-                        0);             /* options */
-
-                    if (hidEvent) {
-                        /* Set _hidEvent on UITouch via ivar or setter */
+                    if (_bridge_current_hidEvent) {
+                        /* Set on UITouch */
                         SEL setHidSel = sel_registerName("_setHidEvent:");
                         if (class_respondsToSelector(object_getClass(_bridge_current_touch), setHidSel)) {
                             ((void(*)(id, SEL, void *))objc_msgSend)(
-                                _bridge_current_touch, setHidSel, hidEvent);
+                                _bridge_current_touch, setHidSel, _bridge_current_hidEvent);
                         } else {
-                            /* Direct ivar access */
                             Ivar hidIvar = class_getInstanceVariable(
                                 object_getClass(_bridge_current_touch), "_hidEvent");
                             if (hidIvar) {
                                 *(void **)((uint8_t *)_bridge_current_touch +
-                                           ivar_getOffset(hidIvar)) = hidEvent;
+                                           ivar_getOffset(hidIvar)) = _bridge_current_hidEvent;
                             }
                         }
-                        bridge_log("  Attached IOHIDEvent %p to UITouch", hidEvent);
+                    }
+
+                    /* Release on ENDED */
+                    if (uiTouchPhase == 3 && _bridge_current_hidEvent) {
+                        /* Don't release yet — UIKit may still reference it during
+                         * sendEvent processing. Release on next BEGAN instead. */
                     }
                 }
             }
@@ -1702,27 +1709,17 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                     struct sigaction sa;
                     memset(&sa, 0, sizeof(sa));
                     sa.sa_sigaction = _sendEvent_crash_handler_siginfo;
-                        sa.sa_flags = SA_SIGINFO;
                     sigemptyset(&sa.sa_mask);
-                    sa.sa_flags = 0;
+                    sa.sa_flags = SA_SIGINFO;
                     sigaction(SIGSEGV, &sa, &_prev_sigsegv_action);
                     sigaction(SIGBUS, &sa, &_prev_sigbus_action);
                     _sendEvent_handlers_installed = 1;
                 }
 
-                /* Diagnostic: check UIApplication._gestureEnvironment before sendEvent */
-                {
-                    SEL geSel = sel_registerName("_gestureEnvironment");
-                    if (class_respondsToSelector(object_getClass(app), geSel)) {
-                        id ge = ((id(*)(id, SEL))objc_msgSend)(app, geSel);
-                        bridge_log("  UIApplication._gestureEnvironment = %p", (void *)ge);
-                    }
-                }
-
-                /* Also set IOHIDEvent on the UITouchesEvent (UIEvent._hidEvent).
-                 * sendEvent: → _sendTouchesForEvent: may read the event-level
-                 * IOHIDEvent in addition to the per-touch one. */
-                {
+                /* Set IOHIDEvent on the UITouchesEvent (UIEvent._hidEvent) on BEGAN only.
+                 * The same IOHIDEvent persists for MOVED/ENDED to avoid dangling
+                 * references in UIKit's gesture processing cache. */
+                if (uiTouchPhase == 0 /* BEGAN */) {
                     SEL setHidEventSel = sel_registerName("_setHIDEvent:");
                     if (class_respondsToSelector(object_getClass(touchesEvent), setHidEventSel)) {
                         /* Use the same IOHIDEvent from the current touch */
@@ -3676,6 +3673,19 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
     /* Set up frame capture (rendering pipeline) */
     bridge_log("  Setting up frame capture from _runWithMainScene...");
     find_root_window(_bridge_delegate);
+
+    /* Post-window warmup: send a synthetic BEGAN+ENDED touch with the real
+     * root window and a proper IOHIDEvent. This exercises the full gesture
+     * recognizer codepath including the ENDED phase. The first ENDED event
+     * through sendEvent: crashes (one-time initialization in gesture processing),
+     * so doing it here means real user touches work from the first tap. */
+    if (_bridge_root_window) {
+        bridge_log("  Post-window warmup: synthetic BEGAN+ENDED on root window...");
+        _inject_single_touch(ROSETTASIM_TOUCH_BEGAN, 0.0, 0.0);
+        _inject_single_touch(ROSETTASIM_TOUCH_ENDED, 0.0, 0.0);
+        bridge_log("  Post-window warmup complete");
+    }
+
     start_frame_capture();
 
     /* Mark init complete — exit() calls are now allowed */
