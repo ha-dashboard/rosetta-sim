@@ -704,27 +704,64 @@ static int setup_shared_framebuffer(void) {
 
 /* Recursively force layers with custom drawing to display their content.
  *
- * Only calls displayIfNeeded on layers whose delegate overrides drawRect:
- * (e.g. UILabel for text rendering). For plain UIView layers that only use
- * backgroundColor, displayIfNeeded creates an empty backing store that
- * covers the backgroundColor during renderInContext:. We skip those. */
+ * Without CARenderServer, the normal display cycle never runs. We walk the
+ * layer tree and force layers to populate backing stores.
+ *
+ * Checks multiple drawing methods:
+ *   - drawRect:           (UILabel, UIImageView, custom views)
+ *   - drawLayer:inContext: (UIPageControl, UIActivityIndicatorView, UIProgressView)
+ *   - displayLayer:       (some CALayer-backed views)
+ *   - Private UIKit views  (_UIBarBackground, _UINavigationBarBackground, etc.)
+ *
+ * Plain UIView layers that only use backgroundColor are SKIPPED — calling
+ * displayIfNeeded on them creates empty backing stores that cover the
+ * backgroundColor during renderInContext:. */
 static void _force_display_recursive(id layer, int depth) {
-    if (!layer || depth > 20) return;
+    if (!layer || depth > 25) return;
 
     id delegate = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("delegate"));
     if (delegate) {
         Class cls = object_getClass(delegate);
         Class uiViewBase = objc_getClass("UIView");
-        SEL drawSel = sel_registerName("drawRect:");
-        IMP clsIMP = class_getMethodImplementation(cls, drawSel);
-        IMP baseIMP = class_getMethodImplementation(uiViewBase, drawSel);
+        int hasCustomDrawing = 0;
 
-        if (clsIMP != baseIMP) {
-            /* Custom drawRect: (UILabel, UIImageView, etc.) — force display */
+        /* 1. drawRect: override */
+        SEL drawRectSel = sel_registerName("drawRect:");
+        IMP drawRectIMP = class_getMethodImplementation(cls, drawRectSel);
+        IMP baseDrawRectIMP = class_getMethodImplementation(uiViewBase, drawRectSel);
+        if (drawRectIMP != baseDrawRectIMP) hasCustomDrawing = 1;
+
+        /* 2. drawLayer:inContext: override */
+        if (!hasCustomDrawing) {
+            SEL drawLayerSel = sel_registerName("drawLayer:inContext:");
+            IMP drawLayerIMP = class_getMethodImplementation(cls, drawLayerSel);
+            IMP baseDrawLayerIMP = class_getMethodImplementation(uiViewBase, drawLayerSel);
+            if (drawLayerIMP != baseDrawLayerIMP) hasCustomDrawing = 1;
+        }
+
+        /* 3. displayLayer: override */
+        if (!hasCustomDrawing) {
+            SEL displayLayerSel = sel_registerName("displayLayer:");
+            if (class_respondsToSelector(cls, displayLayerSel)) {
+                IMP displayLayerIMP = class_getMethodImplementation(cls, displayLayerSel);
+                IMP baseDisplayLayerIMP = class_getMethodImplementation(uiViewBase, displayLayerSel);
+                if (displayLayerIMP != baseDisplayLayerIMP) hasCustomDrawing = 1;
+            }
+        }
+
+        /* 4. Private UIKit backing views (class name starts with underscore) */
+        if (!hasCustomDrawing) {
+            const char *className = class_getName(cls);
+            if (className && className[0] == '_') {
+                hasCustomDrawing = 1;
+            }
+        }
+
+        if (hasCustomDrawing) {
             ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
             ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
         }
-        /* Plain UIView — skip to preserve backgroundColor rendering */
+        /* No custom drawing — skip to preserve backgroundColor rendering */
     } else {
         /* Standalone CALayer — safe to force display */
         ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
@@ -746,11 +783,67 @@ static void _force_display_recursive(id layer, int depth) {
  * Touch injection system
  *
  * Reads touch events from the input region (written by host app)
- * and delivers them directly to UIViews by calling their touch
- * methods (touchesBegan:withEvent:, etc).
+ * and delivers them through UIKit's event pipeline:
+ *
+ *   1. Create a UITouch object with correct properties
+ *   2. Create a UIEvent containing the touch
+ *   3. Send via [UIApplication sendEvent:] so UIControl target-action
+ *      handlers, gesture recognizers, and the responder chain all work.
+ *
+ * Falls back to direct touchesBegan:/touchesEnded: delivery for views
+ * with custom touch methods (e.g. Phase 6 TapView) when UIEvent-based
+ * delivery isn't possible.
  * ================================================================ */
 
 typedef struct { double x, y; } _RSBridgeCGPoint;
+
+/* Persistent UITouch for the current finger (reused across began/moved/ended) */
+static id _bridge_current_touch = nil;
+static id _bridge_current_event = nil;
+static id _bridge_touch_target_view = nil;
+
+/* Recursive hit testing — walks the view hierarchy to find the deepest
+ * view containing the point, respecting userInteractionEnabled and hidden. */
+static id _hitTestView(id view, _RSBridgeCGPoint windowPt) {
+    if (!view) return nil;
+
+    SEL convertSel = sel_registerName("convertPoint:fromView:");
+    SEL pointInsideSel = sel_registerName("pointInside:withEvent:");
+    typedef _RSBridgeCGPoint (*convertPt_fn)(id, SEL, _RSBridgeCGPoint, id);
+    typedef bool (*pointInside_fn)(id, SEL, _RSBridgeCGPoint, id);
+
+    /* Convert to view-local coords */
+    _RSBridgeCGPoint localPt = ((convertPt_fn)objc_msgSend)(
+        view, convertSel, windowPt, nil); /* nil = window coords */
+
+    /* Check containment */
+    bool inside = ((pointInside_fn)objc_msgSend)(view, pointInsideSel, localPt, nil);
+    if (!inside) return nil;
+
+    /* Check userInteractionEnabled */
+    bool enabled = ((bool(*)(id, SEL))objc_msgSend)(
+        view, sel_registerName("isUserInteractionEnabled"));
+    if (!enabled) return nil;
+
+    /* Check hidden */
+    bool hidden = ((bool(*)(id, SEL))objc_msgSend)(
+        view, sel_registerName("isHidden"));
+    if (hidden) return nil;
+
+    /* Walk subviews back-to-front (topmost first) */
+    id subviews = ((id(*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+    if (subviews) {
+        long count = ((long(*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
+        for (long i = count - 1; i >= 0; i--) {
+            id sv = ((id(*)(id, SEL, long))objc_msgSend)(
+                subviews, sel_registerName("objectAtIndex:"), i);
+            id hit = _hitTestView(sv, windowPt);
+            if (hit) return hit;
+        }
+    }
+
+    return view;
+}
 
 static void check_and_inject_touch(void) {
     if (!_fb_mmap || !_bridge_root_window) return;
@@ -768,87 +861,230 @@ static void check_and_inject_touch(void) {
     last_touch_counter = current_counter;
 
     uint32_t phase = inp->touch_phase;
-    bridge_log("Touch event #%llu: phase=%u x=%.1f y=%.1f",
-               current_counter, phase, (double)inp->touch_x, (double)inp->touch_y);
     if (phase == ROSETTASIM_TOUCH_NONE) return;
 
-    /* Get touch coordinates */
+    /* Get touch coordinates (in points) */
     double tx = (double)inp->touch_x;
     double ty = (double)inp->touch_y;
 
-    /* Find the subview at the touch point.
-     * Use convertPoint:fromView: to transform window coords to each subview's
-     * local coords, then pointInside:withEvent: to check containment.
-     * Iterate back-to-front (highest index = topmost) for correct z-ordering. */
-    id targetView = nil;
-    SEL convertSel = sel_registerName("convertPoint:fromView:");
-    SEL pointInsideSel = sel_registerName("pointInside:withEvent:");
-    typedef _RSBridgeCGPoint (*convertPt_fn)(id, SEL, _RSBridgeCGPoint, id);
-    typedef bool (*pointInside_fn)(id, SEL, _RSBridgeCGPoint, id);
+    bridge_log("Touch event #%llu: phase=%u x=%.1f y=%.1f",
+               current_counter, phase, tx, ty);
 
-    id subviews = ((id(*)(id, SEL))objc_msgSend)(
-        _bridge_root_window, sel_registerName("subviews"));
-    if (subviews) {
+    /* ---- Hit test on BEGAN, reuse target for MOVED/ENDED ---- */
+    if (phase == ROSETTASIM_TOUCH_BEGAN) {
         _RSBridgeCGPoint windowPt = { tx, ty };
-        long count = ((long(*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
-        for (long i = count - 1; i >= 0; i--) {
-            id sv = ((id(*)(id, SEL, long))objc_msgSend)(
-                subviews, sel_registerName("objectAtIndex:"), i);
-
-            /* Convert touch point from window coords to subview local coords */
-            _RSBridgeCGPoint localPt = ((convertPt_fn)objc_msgSend)(
-                sv, convertSel, windowPt, _bridge_root_window);
-
-            /* Check if point is inside this subview */
-            bool inside = ((pointInside_fn)objc_msgSend)(
-                sv, pointInsideSel, localPt, nil);
-            if (!inside) continue;
-
-            /* Check userInteractionEnabled */
-            bool enabled = ((bool(*)(id, SEL))objc_msgSend)(
-                sv, sel_registerName("isUserInteractionEnabled"));
-            if (!enabled) continue;
-
-            /* Check if view has custom touch handling */
-            Class svClass = object_getClass(sv);
-            Class uiViewBase = objc_getClass("UIView");
-            SEL tSel = sel_registerName("touchesBegan:withEvent:");
-            IMP svIMP = class_getMethodImplementation(svClass, tSel);
-            IMP baseIMP = class_getMethodImplementation(uiViewBase, tSel);
-            if (svIMP != baseIMP) {
-                targetView = sv;
-                break;
-            }
-        }
+        _bridge_touch_target_view = _hitTestView(_bridge_root_window, windowPt);
+        if (!_bridge_touch_target_view)
+            _bridge_touch_target_view = _bridge_root_window;
     }
+    id targetView = _bridge_touch_target_view;
     if (!targetView) targetView = _bridge_root_window;
 
-    /* Determine which touch method to call */
-    SEL touchSel = NULL;
     const char *phaseName = "";
+    SEL touchSel = NULL;
+    long uiTouchPhase = 0;
     if (phase == ROSETTASIM_TOUCH_BEGAN) {
         touchSel = sel_registerName("touchesBegan:withEvent:");
         phaseName = "BEGAN";
+        uiTouchPhase = 0; /* UITouchPhaseBegan */
     } else if (phase == ROSETTASIM_TOUCH_MOVED) {
         touchSel = sel_registerName("touchesMoved:withEvent:");
         phaseName = "MOVED";
+        uiTouchPhase = 1; /* UITouchPhaseMoved */
     } else if (phase == ROSETTASIM_TOUCH_ENDED) {
         touchSel = sel_registerName("touchesEnded:withEvent:");
         phaseName = "ENDED";
+        uiTouchPhase = 3; /* UITouchPhaseEnded */
+    } else {
+        return;
     }
 
-    if (touchSel) {
-        bridge_log("Touch %s at (%.0f, %.0f) → %s %p",
-                   phaseName, tx, ty,
-                   class_getName(object_getClass(targetView)),
-                   (void *)targetView);
+    bridge_log("Touch %s at (%.0f, %.0f) → %s %p",
+               phaseName, tx, ty,
+               class_getName(object_getClass(targetView)),
+               (void *)targetView);
 
+    /* ---- Approach 1: Try UIEvent-based delivery via [UIApplication sendEvent:] ---- */
+    Class appClass = objc_getClass("UIApplication");
+    id app = appClass ? ((id(*)(id, SEL))objc_msgSend)(
+        (id)appClass, sel_registerName("sharedApplication")) : nil;
+
+    Class touchClass = objc_getClass("UITouch");
+    if (app && touchClass) {
+        /* Create or reuse UITouch */
+        if (phase == ROSETTASIM_TOUCH_BEGAN || !_bridge_current_touch) {
+            /* Release previous touch if any */
+            if (_bridge_current_touch) {
+                ((void(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("release"));
+                _bridge_current_touch = nil;
+            }
+            if (_bridge_current_event) {
+                ((void(*)(id, SEL))objc_msgSend)(_bridge_current_event, sel_registerName("release"));
+                _bridge_current_event = nil;
+            }
+
+            /* Allocate UITouch */
+            _bridge_current_touch = ((id(*)(id, SEL))objc_msgSend)(
+                ((id(*)(id, SEL))objc_msgSend)((id)touchClass, sel_registerName("alloc")),
+                sel_registerName("init"));
+            if (_bridge_current_touch) {
+                ((id(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("retain"));
+            }
+        }
+
+        if (_bridge_current_touch) {
+            /* Set touch properties via KVC — UITouch properties are read-only publicly
+               but settable through KVC or direct ivar manipulation. */
+            _RSBridgeCGPoint pt = { tx, ty };
+
+            /* Set phase */
+            @try {
+                ((void(*)(id, SEL, long))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setPhase:"), uiTouchPhase);
+            } @catch (id e) { /* fall through */ }
+
+            /* Set location via _setLocationInWindow:resetPrevious: (private) */
+            SEL setLocSel = sel_registerName("_setLocationInWindow:resetPrevious:");
+            if (class_respondsToSelector(object_getClass(_bridge_current_touch), setLocSel)) {
+                typedef void (*setLoc_fn)(id, SEL, _RSBridgeCGPoint, bool);
+                ((setLoc_fn)objc_msgSend)(_bridge_current_touch, setLocSel, pt,
+                    (phase == ROSETTASIM_TOUCH_BEGAN) ? true : false);
+            }
+
+            /* Set window */
+            @try {
+                ((void(*)(id, SEL, id))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setWindow:"), _bridge_root_window);
+            } @catch (id e) { /* fall through */ }
+
+            /* Set view */
+            @try {
+                ((void(*)(id, SEL, id))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setView:"), targetView);
+            } @catch (id e) { /* fall through */ }
+
+            /* Set timestamp */
+            @try {
+                double ts = ((double(*)(id, SEL))objc_msgSend)(
+                    (id)objc_getClass("NSProcessInfo"),
+                    sel_registerName("systemUptime"));
+                if (ts <= 0) ts = (double)mach_absolute_time() / 1e9;
+                ((void(*)(id, SEL, double))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setTimestamp:"), ts);
+            } @catch (id e) { /* fall through */ }
+
+            /* Try to send via [UIApplication sendEvent:] with UIEvent containing our touch */
+            id touchSet = ((id(*)(id, SEL, id))objc_msgSend)(
+                (id)objc_getClass("NSSet"),
+                sel_registerName("setWithObject:"),
+                _bridge_current_touch);
+
+            /* Try [UIWindow sendEvent:] or direct touch method dispatch */
+            SEL sendEventSel = sel_registerName("sendEvent:");
+
+            /* Create UIEvent — try _initWithEvent:touches: (private) */
+            Class eventClass = objc_getClass("UIEvent");
+            id event = nil;
+            if (eventClass) {
+                SEL eventInitSel = sel_registerName("_initWithEvent:touches:");
+                if (class_respondsToSelector(object_getClass(eventClass), eventInitSel) ||
+                    class_respondsToSelector(eventClass, eventInitSel)) {
+                    @try {
+                        event = ((id(*)(id, SEL, id, id))objc_msgSend)(
+                            ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
+                            eventInitSel, nil, touchSet);
+                    } @catch (id e) { event = nil; }
+                }
+            }
+
+            /* Deliver: prefer sendEvent: if we have an event, otherwise direct */
+            if (event && app) {
+                bridge_log("  Delivering via [UIApplication sendEvent:]");
+                @try {
+                    ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, event);
+                } @catch (id e) {
+                    bridge_log("  sendEvent: failed, falling back to direct delivery");
+                    goto direct_delivery;
+                }
+            } else {
+                goto direct_delivery;
+            }
+
+            /* Clean up on ENDED */
+            if (phase == ROSETTASIM_TOUCH_ENDED) {
+                if (_bridge_current_touch) {
+                    ((void(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("release"));
+                    _bridge_current_touch = nil;
+                }
+                if (_bridge_current_event) {
+                    ((void(*)(id, SEL))objc_msgSend)(_bridge_current_event, sel_registerName("release"));
+                    _bridge_current_event = nil;
+                }
+                _bridge_touch_target_view = nil;
+            }
+            return;
+        }
+    }
+
+direct_delivery:
+    /* ---- Approach 2: Direct touch method dispatch (fallback) ---- */
+    /* Works for custom UIView subclasses with touchesBegan: overrides */
+    if (touchSel) {
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
             id emptySet = ((id(*)(id, SEL))objc_msgSend)(
                 (id)objc_getClass("NSSet"), sel_registerName("set"));
-            ((void(*)(id, SEL, id, id))objc_msgSend)(
-                targetView, touchSel, emptySet, nil);
+            @try {
+                ((void(*)(id, SEL, id, id))objc_msgSend)(
+                    targetView, touchSel, emptySet, nil);
+            } @catch (id e) {
+                bridge_log("  Direct touch delivery failed: exception caught");
+            }
+        }
+    }
+
+    /* Clean up on ENDED */
+    if (phase == ROSETTASIM_TOUCH_ENDED) {
+        if (_bridge_current_touch) {
+            ((void(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("release"));
+            _bridge_current_touch = nil;
+        }
+        if (_bridge_current_event) {
+            ((void(*)(id, SEL))objc_msgSend)(_bridge_current_event, sel_registerName("release"));
+            _bridge_current_event = nil;
+        }
+        _bridge_touch_target_view = nil;
+    }
+}
+
+/* One-time diagnostic dump of the view/layer hierarchy */
+static int _diag_dumped = 0;
+static void _dump_view_hierarchy(id view, int depth) {
+    if (!view || depth > 15) return;
+    char indent[64] = {0};
+    for (int i = 0; i < depth && i < 30; i++) { indent[i*2] = ' '; indent[i*2+1] = ' '; }
+
+    Class cls = object_getClass(view);
+    const char *name = class_getName(cls);
+
+    /* Get frame via layer.bounds (avoid CGRect struct return issues) */
+    id layer = ((id(*)(id, SEL))objc_msgSend)(view, sel_registerName("layer"));
+    bool hidden = ((bool(*)(id, SEL))objc_msgSend)(view, sel_registerName("isHidden"));
+    double alpha = ((double(*)(id, SEL))objc_msgSend)(view, sel_registerName("alpha"));
+
+    bridge_log("  %s%s %p hidden=%d alpha=%.1f", indent, name, (void *)view, hidden, alpha);
+
+    id subviews = ((id(*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+    if (subviews) {
+        long count = ((long(*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
+        for (long i = 0; i < count; i++) {
+            id sv = ((id(*)(id, SEL, long))objc_msgSend)(
+                subviews, sel_registerName("objectAtIndex:"), i);
+            _dump_view_hierarchy(sv, depth + 1);
         }
     }
 }
@@ -856,6 +1092,14 @@ static void check_and_inject_touch(void) {
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     if (!_bridge_root_window || !_fb_mmap) return;
     if (!_cg_CreateColorSpace || !_cg_CreateBitmap) return;
+
+    /* One-time view hierarchy dump for diagnostics */
+    if (!_diag_dumped) {
+        _diag_dumped = 1;
+        bridge_log("=== View Hierarchy Dump ===");
+        _dump_view_hierarchy(_bridge_root_window, 0);
+        bridge_log("=== End Dump ===");
+    }
 
     /* Check for and inject touch events from host */
     check_and_inject_touch();
@@ -1127,13 +1371,54 @@ static void _noopMethod(id self, SEL _cmd, ...) {
 
 /* Replacement for -[UIWindow makeKeyAndVisible].
    The original triggers BKSEventFocusManager which crashes without backboardd.
-   We just set the layer hidden=NO (for rendering) and skip the event registration. */
+   We perform the essential parts: show the window, load the rootViewController's
+   view into the window, and trigger layout — skipping event registration. */
 static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
-    bridge_log("  [UIWindow makeKeyAndVisible] intercepted → layer setHidden:NO");
+    bridge_log("  [UIWindow makeKeyAndVisible] intercepted");
+
+    /* 1. Set layer visible */
     id layer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));
     if (layer) {
         ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
     }
+
+    /* 2. Load rootViewController's view into the window if not already there.
+       Normally makeKeyAndVisible triggers _installRootViewControllerIntoWindow:
+       which does this, but that path crashes via BKSEventFocusManager. */
+    SEL rvcSel = sel_registerName("rootViewController");
+    if (class_respondsToSelector(object_getClass(self), rvcSel)) {
+        id rootVC = ((id(*)(id, SEL))objc_msgSend)(self, rvcSel);
+        if (rootVC) {
+            id rootView = ((id(*)(id, SEL))objc_msgSend)(rootVC, sel_registerName("view"));
+            if (rootView) {
+                /* Check if rootView is already in the window */
+                id superview = ((id(*)(id, SEL))objc_msgSend)(rootView, sel_registerName("superview"));
+                if (!superview || superview != self) {
+                    /* Set frame to window's screen size (avoid CGRect struct return
+                       which crashes under Rosetta 2 — 32 bytes requires stret). */
+                    _RSBridgeCGRect windowFrame = {0, 0, kScreenWidth, kScreenHeight};
+                    typedef void (*setFrameFn)(id, SEL, _RSBridgeCGRect);
+                    ((setFrameFn)objc_msgSend)(rootView, sel_registerName("setFrame:"), windowFrame);
+
+                    /* Add to window */
+                    ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("addSubview:"), rootView);
+                    bridge_log("  Added rootViewController.view (%s) to window",
+                               class_getName(object_getClass(rootView)));
+                }
+
+                /* Notify view controller */
+                @try {
+                    ((void(*)(id, SEL, bool))objc_msgSend)(rootVC,
+                        sel_registerName("viewWillAppear:"), false);
+                } @catch (id e) { /* ignore */ }
+            }
+        }
+    }
+
+    /* 3. Force layout */
+    ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("setNeedsLayout"));
+    ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("layoutIfNeeded"));
+    bridge_log("  makeKeyAndVisible complete — window visible with rootVC view");
 }
 
 static void swizzle_bks_methods(void) {
