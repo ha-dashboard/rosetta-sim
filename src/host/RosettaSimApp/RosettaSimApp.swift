@@ -169,7 +169,7 @@ class FrameLoader: ObservableObject {
         guard mmapPtr == nil else { return true }
         guard FileManager.default.fileExists(atPath: fbPath) else { return false }
 
-        let fd = open(fbPath, O_RDONLY)
+        let fd = open(fbPath, O_RDWR)
         guard fd >= 0 else { return false }
         defer { close(fd) }
 
