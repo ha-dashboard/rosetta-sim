@@ -296,10 +296,7 @@ class FrameLoader: ObservableObject {
         // Input region is at offset 64 (kFBHeaderSize)
         let inputPtr = ptr.advanced(by: kFBHeaderSize)
 
-        // Increment touch counter (offset 0 in input region)
-        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
-        counterPtr.pointee += 1
-
+        // Write ALL fields BEFORE incrementing counter (Fix #2: avoid race with bridge reader)
         // Write touch phase (offset 8)
         let phasePtr = inputPtr.advanced(by: 8).assumingMemoryBound(to: UInt32.self)
         phasePtr.pointee = phase
@@ -319,6 +316,13 @@ class FrameLoader: ObservableObject {
         // Write timestamp (offset 24)
         let tsPtr = inputPtr.advanced(by: 24).assumingMemoryBound(to: UInt64.self)
         tsPtr.pointee = mach_absolute_time()
+
+        // Memory barrier: ensure all fields are visible before counter increment
+        OSMemoryBarrier()
+
+        // Increment touch counter LAST — this is the signal to the bridge
+        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
+        counterPtr.pointee += 1
     }
 
     /// Send a key event to the shared framebuffer input region
@@ -344,9 +348,12 @@ class FrameLoader: ObservableObject {
             keyCharPtr.pointee = 0
         }
 
-        // Increment touch counter (offset 0 in input region) to signal new event
-        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
-        counterPtr.pointee += 1
+        // Memory barrier to ensure key fields are visible
+        OSMemoryBarrier()
+
+        // DO NOT increment touch_counter — keyboard events are signaled by
+        // key_code being non-zero, which check_and_inject_keyboard() polls.
+        // Incrementing touch_counter causes phantom touch events (Fix #1).
     }
 
     /// Load a single frame from a PNG file (legacy/fallback)
@@ -454,6 +461,11 @@ class SimulatorDisplayView: NSView {
 
         let cx = max(0, min(375, x))
         let cy = max(0, min(667, y))
+
+        let phaseName = phase == kTouchPhaseBegan ? "BEGAN" :
+                        phase == kTouchPhaseEnded ? "ENDED" :
+                        phase == kTouchPhaseMoved ? "MOVED" : "?"
+        NSLog("[Host] sendTouch %@ at (%.0f, %.0f)", phaseName, cx, cy)
 
         onTouch?(phase, cx, cy)
     }

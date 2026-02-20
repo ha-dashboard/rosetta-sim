@@ -967,6 +967,9 @@ static void check_and_inject_touch(void) {
     }
     last_touch_counter = current_counter;
 
+    /* Memory barrier: ensure we see the fields written before the counter (Fix #6) */
+    __sync_synchronize();
+
     uint32_t phase = inp->touch_phase;
     if (phase == ROSETTASIM_TOUCH_NONE) return;
 
@@ -1023,16 +1026,14 @@ static void check_and_inject_touch(void) {
     int sendEvent_succeeded = 0;
 
     if (app && touchClass) {
-        /* Create or reuse UITouch on BEGAN */
-        if (phase == ROSETTASIM_TOUCH_BEGAN || !_bridge_current_touch) {
+        /* Create UITouch on BEGAN only (Fix #3: drop orphan MOVED/ENDED) */
+        if (phase == ROSETTASIM_TOUCH_BEGAN) {
             /* Release previous touch if any */
             if (_bridge_current_touch) {
                 ((void(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("release"));
                 _bridge_current_touch = nil;
             }
-            /* _bridge_current_event is NOT retained by us — it's a singleton.
-             * Don't release it. Just clear our reference. */
-            _bridge_current_event = nil;
+            /* Keep _bridge_current_event for reuse — _clearTouches resets it (Fix #5) */
 
             /* Allocate UITouch */
             _bridge_current_touch = ((id(*)(id, SEL))objc_msgSend)(
@@ -1041,6 +1042,10 @@ static void check_and_inject_touch(void) {
             if (_bridge_current_touch) {
                 ((id(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("retain"));
             }
+        } else if (!_bridge_current_touch) {
+            /* MOVED or ENDED without a preceding BEGAN — drop this orphan event */
+            bridge_log("  Dropping orphan %s event (no active touch)", phaseName);
+            return;
         }
 
         if (_bridge_current_touch) {
@@ -1248,17 +1253,11 @@ static void check_and_inject_touch(void) {
                     _sendEvent_guard_active = 0;
                     sendEvent_succeeded = 1;
                     bridge_log("  sendEvent: delivery succeeded");
-
-                    /* Clean up on ENDED — release the touch but keep the event (reusable) */
-                    if (phase == ROSETTASIM_TOUCH_ENDED) {
-                        if (_bridge_current_touch) {
-                            ((void(*)(id, SEL))objc_msgSend)(_bridge_current_touch, sel_registerName("release"));
-                            _bridge_current_touch = nil;
-                        }
-                        /* Keep _bridge_current_event — it's our reusable UITouchesEvent */
-                        _bridge_touch_target_view = nil;
-                    }
-                    return;
+                    /* Fall through to direct delivery for UIControl tracking.
+                     * Our sendEvent: replacement delivers touchesBegan:/touchesEnded:
+                     * to views, but UIControl needs explicit beginTracking/endTracking/
+                     * sendActionsForControlEvents to fire target-action handlers.
+                     * The direct delivery code below handles this. */
                 } else {
                     /* Crashed in sendEvent: — recovered via siglongjmp */
                     bridge_log("  sendEvent: CRASHED (signal %d) — falling through to direct delivery",
@@ -1329,15 +1328,73 @@ static void check_and_inject_touch(void) {
         }
 
         if (isTextField) {
-            /* UITextField: becomeFirstResponder crashes because
-               UITextInteractionAssistant.setGestureRecognizers tries to
-               removeGestureRecognizer: on nil (gesture environment not initialized
-               without backboardd). Skip becomeFirstResponder for now — just deliver
-               the touch event to the text field. Keyboard input is handled via the
-               mmap key_code/key_char mechanism instead. */
-            bridge_log("  UITextField touched (becomeFirstResponder skipped — crashes without gesture env)");
-        } else if (isButton || isSegmented) {
-            /* UIButton / UISegmentedControl: highlight + tracking API */
+            /* UITextField: becomeFirstResponder is now swizzled to avoid the
+               UITextInteractionAssistant gesture recognizer crash. Call it
+               to enter editing mode and fire delegate callbacks. */
+            if (phase == ROSETTASIM_TOUCH_BEGAN) {
+                @try {
+                    ((bool(*)(id, SEL))objc_msgSend)(controlTarget,
+                        sel_registerName("becomeFirstResponder"));
+                    bridge_log("  UITextField becomeFirstResponder (swizzled)");
+                } @catch (id e) {
+                    bridge_log("  UITextField becomeFirstResponder failed");
+                }
+            }
+        } else if (isSegmented) {
+            /* UISegmentedControl: needs special handling.
+             * 1. Determine which segment was tapped via hit position
+             * 2. Set selectedSegmentIndex directly
+             * 3. Fire UIControlEventValueChanged (1 << 12 = 4096) */
+            if (phase == ROSETTASIM_TOUCH_ENDED) {
+                @try {
+                    /* Get number of segments */
+                    long numSegs = ((long(*)(id, SEL))objc_msgSend)(controlTarget,
+                        sel_registerName("numberOfSegments"));
+                    long currentSel = ((long(*)(id, SEL))objc_msgSend)(controlTarget,
+                        sel_registerName("selectedSegmentIndex"));
+
+                    /* Determine which segment was tapped based on X position.
+                     * Get the control's frame width and divide by segment count. */
+                    _RSBridgeCGPoint localPt = { tx, ty };
+                    /* Convert touch point to control's local coordinates */
+                    id ctrlView = controlTarget;
+                    _RSBridgeCGPoint ctrlPt = localPt;
+                    @try {
+                        /* Use the raw X coordinate relative to the control */
+                        typedef _RSBridgeCGPoint (*convertFn)(id, SEL, _RSBridgeCGPoint, id);
+                        ctrlPt = ((convertFn)objc_msgSend)(ctrlView,
+                            sel_registerName("convertPoint:fromView:"), localPt, nil);
+                    } @catch (id ex) { /* use raw coords */ }
+
+                    /* Estimate segment width (control frame is tricky to get via stret) */
+                    /* Use a simple heuristic: divide 375 points by segment count
+                     * and use the X position to determine which segment */
+                    long newSeg = currentSel;
+                    if (numSegs > 0) {
+                        /* Get segment widths from subview positions */
+                        double segWidth = 335.0 / numSegs; /* approximate control width */
+                        newSeg = (long)(ctrlPt.x / segWidth);
+                        if (newSeg < 0) newSeg = 0;
+                        if (newSeg >= numSegs) newSeg = numSegs - 1;
+                    }
+
+                    if (newSeg != currentSel) {
+                        ((void(*)(id, SEL, long))objc_msgSend)(controlTarget,
+                            sel_registerName("setSelectedSegmentIndex:"), newSeg);
+                        /* UIControlEventValueChanged = 1 << 12 = 4096 */
+                        ((void(*)(id, SEL, unsigned long))objc_msgSend)(controlTarget,
+                            sel_registerName("sendActionsForControlEvents:"), 4096);
+                        bridge_log("  UISegmentedControl selectedIndex %ld → %ld + ValueChanged",
+                                   currentSel, newSeg);
+                    } else {
+                        bridge_log("  UISegmentedControl tapped same segment %ld (no change)", currentSel);
+                    }
+                } @catch (id e) {
+                    bridge_log("  UISegmentedControl handling failed");
+                }
+            }
+        } else if (isButton) {
+            /* UIButton: highlight + tracking API */
             if (phase == ROSETTASIM_TOUCH_BEGAN) {
                 @try {
                     ((void(*)(id, SEL, bool))objc_msgSend)(controlTarget,
@@ -1346,9 +1403,9 @@ static void check_and_inject_touch(void) {
                     ((trackFn)objc_msgSend)(controlTarget,
                         sel_registerName("beginTrackingWithTouch:withEvent:"),
                         _bridge_current_touch, nil);
-                    bridge_log("  UIButton/Segmented setHighlighted:YES + beginTracking");
+                    bridge_log("  UIButton setHighlighted:YES + beginTracking");
                 } @catch (id e) {
-                    bridge_log("  UIButton/Segmented beginTracking failed");
+                    bridge_log("  UIButton beginTracking failed");
                 }
             } else if (phase == ROSETTASIM_TOUCH_MOVED) {
                 @try {
@@ -1362,14 +1419,14 @@ static void check_and_inject_touch(void) {
                     ((void(*)(id, SEL, id, id))objc_msgSend)(controlTarget,
                         sel_registerName("endTrackingWithTouch:withEvent:"),
                         _bridge_current_touch, nil);
-                    /* Fire touch-up-inside (UIControlEventTouchUpInside = 1 << 6 = 64) */
+                    /* UIControlEventTouchUpInside = 1 << 6 = 64 */
                     ((void(*)(id, SEL, unsigned long))objc_msgSend)(controlTarget,
                         sel_registerName("sendActionsForControlEvents:"), 64);
                     ((void(*)(id, SEL, bool))objc_msgSend)(controlTarget,
                         sel_registerName("setHighlighted:"), false);
-                    bridge_log("  UIButton/Segmented endTracking + sendActions + setHighlighted:NO");
+                    bridge_log("  UIButton endTracking + sendActions + setHighlighted:NO");
                 } @catch (id e) {
-                    bridge_log("  UIButton/Segmented endTracking failed");
+                    bridge_log("  UIButton endTracking failed");
                 }
             }
         } else {
@@ -1412,9 +1469,11 @@ static void check_and_inject_touch(void) {
     }
 
     /* Also deliver standard touchesBegan:/touchesMoved:/touchesEnded: to the
-     * original hit-test target (even if we found a UIControl ancestor above).
-     * This ensures custom touch handlers still fire. */
-    if (touchSel) {
+     * original hit-test target — BUT ONLY if sendEvent: was not used.
+     * When sendEvent: succeeds, replacement_sendTouchesForEvent already
+     * delivers touchesBegan:/touchesEnded: to the view. Doing it again
+     * would double-fire touch handlers. (Fix #4) */
+    if (!sendEvent_succeeded && touchSel) {
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
             @try {
@@ -1723,17 +1782,31 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
        triggering UIKit's BKSEventFocusManager which needs backboardd) */
     ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
 
-    /* Flush pending CATransaction changes and force layout + display every frame.
+    /* Flush pending CATransaction changes and handle layout/display.
      *
      * Without CARenderServer, there's no display cycle — we must populate backing
-     * stores ourselves. Animated views (HAConstellationView) and timer-driven updates
-     * continuously call setNeedsDisplay, invalidating cached backing stores.
-     * Force-display every frame keeps the output stable.
+     * stores ourselves. The force_display_countdown tracks when we need to
+     * force-populate layer backing stores (startup, after touch, periodic refresh).
      *
-     * The original session 2 "flashing" was caused by:
-     *   1. Duplicate processes writing to the same framebuffer (fixed)
-     *   2. Host displayImage didSet firing on every SwiftUI update (fixed)
-     * With those root causes fixed, per-frame force-display is stable. */
+     * Optimization: when countdown is 0, still flush + layout (needed for timers
+     * and animations), but skip the expensive _force_display_recursive walk. */
+    int need_force_display = 0;
+    if (_force_display_countdown > 0) {
+        _force_display_countdown--;
+        need_force_display = 1;
+    }
+
+    /* Periodic refresh: every ~1s (30 frames), force-display to catch timer-driven
+     * updates (network responses, animations). Use a static counter. */
+    {
+        static int _periodic_counter = 0;
+        _periodic_counter++;
+        if (_periodic_counter >= 30) {
+            _periodic_counter = 0;
+            need_force_display = 1;
+        }
+    }
+
     {
         Class caTransaction = objc_getClass("CATransaction");
         if (caTransaction) {
@@ -1745,7 +1818,9 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         ((void(*)(id, SEL))objc_msgSend)(
             _bridge_root_window, sel_registerName("layoutIfNeeded"));
 
-        _force_display_recursive(layer, 0);
+        if (need_force_display) {
+            _force_display_recursive(layer, 0);
+        }
     }
 
     /* Double-buffer: render into a local buffer first, then memcpy to the
@@ -1983,6 +2058,202 @@ static void fix_bootstrap_port(void) {
 }
 
 /* ================================================================
+ * UIApplication._sendTouchesForEvent: replacement
+ *
+ * The original crashes in gesture recognizer processing because
+ * UIGestureEnvironment and _gestureRecognizersByWindow are never
+ * initialized (UIEventDispatcher was skipped during longjmp recovery).
+ *
+ * This replacement bypasses gesture recognizer processing entirely
+ * and delivers touches directly to views via their touchesBegan:/
+ * touchesMoved:/touchesEnded:/touchesCancelled: methods. UIControl
+ * subclasses handle tracking internally via their overrides.
+ * ================================================================ */
+
+static void replacement_sendTouchesForEvent(id self, SEL _cmd, id event) {
+    if (!event) return;
+
+    /* Check if this is a UITouchesEvent by looking for _touches ivar.
+     * If not, it's a different event type (motion, remote, etc.) — skip it.
+     * This method may be installed as either _sendTouchesForEvent: (receives
+     * only touch events) or sendEvent: (receives all events). */
+    Class teClass = object_getClass(event);
+    Ivar touchesIvar = class_getInstanceVariable(teClass, "_touches");
+    if (!touchesIvar) {
+        /* Not a touches event — nothing to do */
+        return;
+    }
+
+    ptrdiff_t touchesOff = ivar_getOffset(touchesIvar);
+    id touchesSet = *(id *)((uint8_t *)event + touchesOff);
+    if (!touchesSet) return;
+
+    id allTouches = ((id(*)(id, SEL))objc_msgSend)(
+        touchesSet, sel_registerName("allObjects"));
+    long count = ((long(*)(id, SEL))objc_msgSend)(
+        allTouches, sel_registerName("count"));
+
+    for (long i = 0; i < count; i++) {
+        id touch = ((id(*)(id, SEL, long))objc_msgSend)(
+            allTouches, sel_registerName("objectAtIndex:"), i);
+
+        long phase = ((long(*)(id, SEL))objc_msgSend)(
+            touch, sel_registerName("phase"));
+        id view = ((id(*)(id, SEL))objc_msgSend)(
+            touch, sel_registerName("view"));
+        if (!view) continue;
+
+        /* Select touch method based on UITouchPhase:
+         *   0 = UITouchPhaseBegan
+         *   1 = UITouchPhaseMoved
+         *   2 = UITouchPhaseStationary (skip)
+         *   3 = UITouchPhaseEnded
+         *   4 = UITouchPhaseCancelled */
+        SEL touchSel = nil;
+        switch (phase) {
+            case 0: touchSel = sel_registerName("touchesBegan:withEvent:"); break;
+            case 1: touchSel = sel_registerName("touchesMoved:withEvent:"); break;
+            case 3: touchSel = sel_registerName("touchesEnded:withEvent:"); break;
+            case 4: touchSel = sel_registerName("touchesCancelled:withEvent:"); break;
+            default: continue;
+        }
+
+        id touchSet = ((id(*)(id, SEL, id))objc_msgSend)(
+            (id)objc_getClass("NSSet"),
+            sel_registerName("setWithObject:"), touch);
+
+        @try {
+            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                view, touchSel, touchSet, event);
+        } @catch (id e) {
+            bridge_log("  _sendTouchesForEvent: delivery to %s threw exception",
+                       class_getName(object_getClass(view)));
+        }
+    }
+}
+
+/* ================================================================
+ * UITextField.becomeFirstResponder replacement
+ *
+ * The original crashes because UITextInteractionAssistant tries to
+ * set gesture recognizers, which requires UIGestureEnvironment
+ * (not initialized without backboardd).
+ *
+ * This replacement sets the editing state directly, fires delegate
+ * callbacks, and posts notifications — enabling the app's text field
+ * handlers to run. Keyboard input is delivered via the mmap mechanism.
+ * ================================================================ */
+
+static bool replacement_UITextFieldBecomeFirstResponder(id self, SEL _cmd) {
+    bridge_log("  [UITextField becomeFirstResponder] intercepted: %p", (void *)self);
+
+    /* Check delegate's textFieldShouldBeginEditing: */
+    SEL delegateSel = sel_registerName("delegate");
+    id delegate = nil;
+    if (class_respondsToSelector(object_getClass(self), delegateSel)) {
+        delegate = ((id(*)(id, SEL))objc_msgSend)(self, delegateSel);
+    }
+    if (delegate) {
+        SEL shouldBeginSel = sel_registerName("textFieldShouldBeginEditing:");
+        if (class_respondsToSelector(object_getClass(delegate), shouldBeginSel)) {
+            @try {
+                bool should = ((bool(*)(id, SEL, id))objc_msgSend)(
+                    delegate, shouldBeginSel, self);
+                if (!should) {
+                    bridge_log("  textFieldShouldBeginEditing: returned NO");
+                    return false;
+                }
+            } @catch (id e) { /* proceed */ }
+        }
+    }
+
+    /* Set _editing ivar to YES */
+    Class tfClass = objc_getClass("UITextField");
+    if (tfClass) {
+        Ivar editingIvar = class_getInstanceVariable(tfClass, "_traits");
+        /* _editing may be a bitfield inside _traits, or a standalone ivar.
+         * Try the standalone first. */
+        Ivar directEditIvar = class_getInstanceVariable(tfClass, "_editing");
+        if (directEditIvar) {
+            bool *ptr = (bool *)((uint8_t *)self + ivar_getOffset(directEditIvar));
+            *ptr = true;
+        }
+    }
+
+    /* Register as first responder.
+     * The keyboard injection code finds the first responder via multiple paths:
+     *   1. [UIApplication _firstResponder]
+     *   2. [keyWindow firstResponder]
+     * We need to make sure at least one of these returns our text field.
+     * Try multiple approaches to maximize compatibility. */
+    {
+        /* Store a reference the keyboard code can find */
+        /* Approach 1: Set on UIWindow via _setFirstResponder: (private) */
+        if (_bridge_root_window) {
+            SEL setFRSel = sel_registerName("_setFirstResponder:");
+            if (class_respondsToSelector(object_getClass(_bridge_root_window), setFRSel)) {
+                @try {
+                    ((void(*)(id, SEL, id))objc_msgSend)(
+                        _bridge_root_window, setFRSel, self);
+                    bridge_log("  Set first responder via window._setFirstResponder:");
+                } @catch (id e) { /* ignore */ }
+            }
+        }
+
+        /* Approach 2: Call UIResponder's base becomeFirstResponder (which does NOT
+         * touch gesture recognizers — that's UITextField's override that crashes).
+         * UIResponder.becomeFirstResponder calls [UIApplication _setFirstResponder:]. */
+        Class uiResponderClass = objc_getClass("UIResponder");
+        if (uiResponderClass) {
+            SEL bfrSel = sel_registerName("becomeFirstResponder");
+            /* Get UIResponder's implementation (not UITextField's swizzled one) */
+            Method responderMethod = class_getInstanceMethod(uiResponderClass, bfrSel);
+            if (responderMethod) {
+                IMP responderBFR = method_getImplementation(responderMethod);
+                if (responderBFR) {
+                    @try {
+                        ((bool(*)(id, SEL))responderBFR)(self, bfrSel);
+                        bridge_log("  Called UIResponder.becomeFirstResponder (base)");
+                    } @catch (id e) {
+                        bridge_log("  UIResponder.becomeFirstResponder threw exception");
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fire textFieldDidBeginEditing: delegate callback */
+    if (delegate) {
+        SEL didBeginSel = sel_registerName("textFieldDidBeginEditing:");
+        if (class_respondsToSelector(object_getClass(delegate), didBeginSel)) {
+            @try {
+                ((void(*)(id, SEL, id))objc_msgSend)(delegate, didBeginSel, self);
+                bridge_log("  Called textFieldDidBeginEditing:");
+            } @catch (id e) {
+                bridge_log("  textFieldDidBeginEditing: threw exception");
+            }
+        }
+    }
+
+    /* Post UITextFieldTextDidBeginEditingNotification */
+    Class nsCenterClass = objc_getClass("NSNotificationCenter");
+    id center = nsCenterClass ? ((id(*)(id, SEL))objc_msgSend)(
+        (id)nsCenterClass, sel_registerName("defaultCenter")) : nil;
+    if (center) {
+        id notifName = ((id(*)(id, SEL, const char *))objc_msgSend)(
+            (id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"),
+            "UITextFieldTextDidBeginEditingNotification");
+        ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+            center, sel_registerName("postNotificationName:object:userInfo:"),
+            notifName, self, nil);
+        bridge_log("  Posted UITextFieldTextDidBeginEditingNotification");
+    }
+
+    return true;
+}
+
+/* ================================================================
  * BackBoardServices method swizzling
  *
  * With sharedApplication fixed, UIKit activates more code paths that
@@ -2047,10 +2318,37 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
         }
     }
 
-    /* 3. Force layout */
+    /* 3. Register this as the bridge key window.
+       The key window swizzles (isKeyWindow on UIWindow, keyWindow on UIApplication)
+       are installed in swizzle_bks_methods(). They use _bridge_root_window to
+       determine which window is "key". Just ensure that's set here. */
+    _bridge_root_window = self;
+    ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("retain"));
+    bridge_log("  Set _bridge_root_window = %p (isKeyWindow will return YES)", (void *)self);
+
+    /* 4. Set window level to UIWindowLevelNormal (0) to ensure proper ordering */
+    @try {
+        ((void(*)(id, SEL, double))objc_msgSend)(self,
+            sel_registerName("setWindowLevel:"), 0.0);
+    } @catch (id e) { /* ignore */ }
+
+    /* 5. Force layout */
     ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("setNeedsLayout"));
     ((void(*)(id, SEL))objc_msgSend)(self, sel_registerName("layoutIfNeeded"));
+
     bridge_log("  makeKeyAndVisible complete — window visible with rootVC view");
+}
+
+/* Replacement for -[UIWindow isKeyWindow].
+   Returns YES for _bridge_root_window, NO for all others. */
+static bool replacement_isKeyWindow(id self, SEL _cmd) {
+    return (self == _bridge_root_window);
+}
+
+/* Replacement for -[UIApplication keyWindow].
+   Returns _bridge_root_window directly. */
+static id replacement_keyWindow(id self, SEL _cmd) {
+    return _bridge_root_window;
 }
 
 static void swizzle_bks_methods(void) {
@@ -2061,6 +2359,63 @@ static void swizzle_bks_methods(void) {
         Method m = class_getInstanceMethod(windowClass, mkavSel);
         if (m) {
             method_setImplementation(m, (IMP)replacement_makeKeyAndVisible);
+        }
+
+        /* UIWindow.isKeyWindow — return YES for our bridge root window */
+        SEL ikwSel = sel_registerName("isKeyWindow");
+        Method ikwMethod = class_getInstanceMethod(windowClass, ikwSel);
+        if (ikwMethod) {
+            method_setImplementation(ikwMethod, (IMP)replacement_isKeyWindow);
+            bridge_log("  Swizzled UIWindow.isKeyWindow");
+        }
+    }
+
+    /* UIApplication.keyWindow — return _bridge_root_window directly */
+    Class appClass = objc_getClass("UIApplication");
+    if (appClass) {
+        SEL kwSel = sel_registerName("keyWindow");
+        Method kwMethod = class_getInstanceMethod(appClass, kwSel);
+        if (kwMethod) {
+            method_setImplementation(kwMethod, (IMP)replacement_keyWindow);
+            bridge_log("  Swizzled UIApplication.keyWindow");
+        }
+    }
+
+    /* UIApplication.sendEvent: — the original calls _sendTouchesForEvent:
+       which crashes in gesture recognizer processing because UIGestureEnvironment
+       is not initialized. Replace with a version that handles UITouchesEvent
+       directly and passes other event types through. */
+    if (appClass) {
+        /* Try _sendTouchesForEvent: first (internal method) */
+        SEL stfeSel = sel_registerName("_sendTouchesForEvent:");
+        Method m = class_getInstanceMethod(appClass, stfeSel);
+        if (m) {
+            method_setImplementation(m, (IMP)replacement_sendTouchesForEvent);
+            bridge_log("  Swizzled UIApplication._sendTouchesForEvent:");
+        } else {
+            /* _sendTouchesForEvent: not found — swizzle sendEvent: directly.
+               Store original IMP to call for non-touch events. */
+            SEL sendEventSel = sel_registerName("sendEvent:");
+            Method sem = class_getInstanceMethod(appClass, sendEventSel);
+            if (sem) {
+                /* We can't easily chain to original for non-touch events without
+                   storing the original IMP. Instead, just replace with our version
+                   that handles UITouchesEvent and no-ops other event types. */
+                method_setImplementation(sem, (IMP)replacement_sendTouchesForEvent);
+                bridge_log("  Swizzled UIApplication.sendEvent: (fallback)");
+            }
+        }
+    }
+
+    /* UITextField.becomeFirstResponder — crashes in UITextInteractionAssistant
+       gesture recognizer setup */
+    Class textFieldClass = objc_getClass("UITextField");
+    if (textFieldClass) {
+        SEL bfrSel = sel_registerName("becomeFirstResponder");
+        Method m = class_getInstanceMethod(textFieldClass, bfrSel);
+        if (m) {
+            method_setImplementation(m, (IMP)replacement_UITextFieldBecomeFirstResponder);
+            bridge_log("  Swizzled UITextField.becomeFirstResponder");
         }
     }
 
