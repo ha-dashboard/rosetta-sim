@@ -777,28 +777,45 @@ static void check_and_inject_touch(void) {
     double ty = (double)inp->touch_y;
 
     /* Find the subview at the touch point.
-     * Iterate subviews and use tag/class to find interactive views.
-     * (Avoid objc_msgSend_stret for CGRect — crashes under Rosetta 2) */
+     * Use convertPoint:fromView: to transform window coords to each subview's
+     * local coords, then pointInside:withEvent: to check containment.
+     * Iterate back-to-front (highest index = topmost) for correct z-ordering. */
     id targetView = nil;
+    SEL convertSel = sel_registerName("convertPoint:fromView:");
+    SEL pointInsideSel = sel_registerName("pointInside:withEvent:");
+    typedef _RSBridgeCGPoint (*convertPt_fn)(id, SEL, _RSBridgeCGPoint, id);
+    typedef bool (*pointInside_fn)(id, SEL, _RSBridgeCGPoint, id);
+
     id subviews = ((id(*)(id, SEL))objc_msgSend)(
         _bridge_root_window, sel_registerName("subviews"));
     if (subviews) {
+        _RSBridgeCGPoint windowPt = { tx, ty };
         long count = ((long(*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
         for (long i = count - 1; i >= 0; i--) {
             id sv = ((id(*)(id, SEL, long))objc_msgSend)(
                 subviews, sel_registerName("objectAtIndex:"), i);
+
+            /* Convert touch point from window coords to subview local coords */
+            _RSBridgeCGPoint localPt = ((convertPt_fn)objc_msgSend)(
+                sv, convertSel, windowPt, _bridge_root_window);
+
+            /* Check if point is inside this subview */
+            bool inside = ((pointInside_fn)objc_msgSend)(
+                sv, pointInsideSel, localPt, nil);
+            if (!inside) continue;
+
             /* Check userInteractionEnabled */
             bool enabled = ((bool(*)(id, SEL))objc_msgSend)(
                 sv, sel_registerName("isUserInteractionEnabled"));
             if (!enabled) continue;
-            /* Check if view responds to touchesBegan (custom handler) */
+
+            /* Check if view has custom touch handling */
             Class svClass = object_getClass(sv);
             Class uiViewBase = objc_getClass("UIView");
             SEL tSel = sel_registerName("touchesBegan:withEvent:");
             IMP svIMP = class_getMethodImplementation(svClass, tSel);
             IMP baseIMP = class_getMethodImplementation(uiViewBase, tSel);
             if (svIMP != baseIMP) {
-                /* This view has a custom touch handler — use it */
                 targetView = sv;
                 break;
             }

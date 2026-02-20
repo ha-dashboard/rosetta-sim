@@ -357,19 +357,23 @@ class SimulatorDisplayView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override var isFlipped: Bool { true }  // Top-left origin like iOS
-
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let bounds = self.bounds
 
-        // Black background
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fill(bounds)
 
-        // Draw the simulator frame
+        // The bridge writes pixels top-to-bottom (first row = top of screen).
+        // CGImage first row = top of image.
+        // NSView CG context has origin at bottom-left.
+        // So we need to flip: translate up, scale Y by -1, then draw.
         if let image = displayImage {
-            ctx.draw(image, in: bounds)
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: bounds.height)
+            ctx.scaleBy(x: 1.0, y: -1.0)
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
+            ctx.restoreGState()
         }
     }
 
@@ -390,9 +394,11 @@ class SimulatorDisplayView: NSView {
         let b = self.bounds
         guard b.width > 0, b.height > 0 else { return }
 
-        // Convert to iOS points (375x667). isFlipped=true so loc.y is already top-down.
+        // NSView origin is bottom-left. iOS origin is top-left.
+        // loc.y=0 is bottom of view = iOS y=667
+        // loc.y=bounds.height is top of view = iOS y=0
         let x = Float(loc.x / b.width * 375.0)
-        let y = Float(loc.y / b.height * 667.0)
+        let y = Float((1.0 - loc.y / b.height) * 667.0)
 
         let cx = max(0, min(375, x))
         let cy = max(0, min(667, y))
