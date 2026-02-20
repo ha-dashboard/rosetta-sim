@@ -373,8 +373,12 @@ static void replacement_exit(int status) {
          * only THIS thread (the XPC callback thread) using pthread_exit().
          * The main thread continues UIApplicationMain initialization. */
         if (!pthread_main_np()) {
-            bridge_log("  Terminating XPC callback thread via pthread_exit");
-            pthread_exit(NULL);
+            bridge_log("  Blocking XPC callback thread (workspace disconnect expected)");
+            /* Don't kill the thread — pthread_exit can corrupt shared state.
+             * Instead, block it forever. This is safe because it's just the
+             * XPC dispatch queue thread for the dead workspace connection. */
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             /* not reached */
         }
         /* If we're on the main thread, use longjmp if guard is active */
@@ -2544,29 +2548,78 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
      */
     SEL callInitSel = sel_registerName("_callInitializationDelegatesForMainScene:transitionContext:");
     if (class_respondsToSelector(object_getClass(self), callInitSel)) {
-        bridge_log("  Calling _callInitializationDelegatesForMainScene:");
-        @try {
-            ((void(*)(id, SEL, id, id))objc_msgSend)(
-                self, callInitSel, scene, transitionContext);
-            bridge_log("  _callInitializationDelegatesForMainScene: completed");
-        } @catch (id e) {
-            SEL reasonSel = sel_registerName("reason");
-            id reason = ((id(*)(id, SEL))objc_msgSend)(e, reasonSel);
-            const char *str = reason ? ((const char *(*)(id, SEL))objc_msgSend)(
-                reason, sel_registerName("UTF8String")) : "(unknown)";
-            bridge_log("  _callInitializationDelegatesForMainScene threw: %s", str);
-        }
-    } else {
-        bridge_log("  _callInitializationDelegatesForMainScene: not found — calling completion block");
-        /* Fallback: call the completion block directly */
-        if (completionBlock) {
+        /* _callInitializationDelegatesForMainScene: crashes with SIGILL when
+         * scene is nil. Instead, perform the delegate initialization directly.
+         * This is what that method does internally:
+         *   1. Load main storyboard/nib
+         *   2. Call application:didFinishLaunchingWithOptions:
+         *   3. Post notifications
+         *   4. Call applicationDidBecomeActive:
+         */
+        bridge_log("  Performing delegate initialization directly (no FBSScene)...");
+    }
+
+    /* Get the delegate (already set by UIApplicationMain before _run) */
+    id delegate = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("delegate"));
+    if (delegate) {
+        _bridge_delegate = delegate;
+        ((id(*)(id, SEL))objc_msgSend)(delegate, sel_registerName("retain"));
+        bridge_log("  App delegate: %s @ %p",
+                   class_getName(object_getClass(delegate)), (void *)delegate);
+
+        /* Skip _loadMainInterfaceFile — hass-dashboard uses programmatic UI.
+         * Apps that use storyboards will need this enabled later with proper
+         * scene infrastructure. */
+
+        /* Call application:didFinishLaunchingWithOptions: */
+        SEL didFinishSel = sel_registerName("application:didFinishLaunchingWithOptions:");
+        if (class_respondsToSelector(object_getClass(delegate), didFinishSel)) {
+            bridge_log("  Calling application:didFinishLaunchingWithOptions:");
             @try {
-                typedef void (^VoidBlock)(void);
-                ((VoidBlock)completionBlock)();
-                bridge_log("  Completion block executed");
+                ((void(*)(id, SEL, id, id))objc_msgSend)(
+                    delegate, didFinishSel, self, nil);
+                bridge_log("  didFinishLaunchingWithOptions: completed");
             } @catch (id e) {
-                bridge_log("  Completion block threw exception");
+                bridge_log("  didFinishLaunchingWithOptions: threw exception");
             }
+        }
+    }
+
+    /* Post UIApplicationDidFinishLaunchingNotification */
+    {
+        Class nsCenterClass = objc_getClass("NSNotificationCenter");
+        id center = nsCenterClass ? ((id(*)(id, SEL))objc_msgSend)(
+            (id)nsCenterClass, sel_registerName("defaultCenter")) : nil;
+        if (center) {
+            id notifName = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                (id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"),
+                "UIApplicationDidFinishLaunchingNotification");
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+                center, sel_registerName("postNotificationName:object:userInfo:"),
+                notifName, self, nil);
+            bridge_log("  Posted UIApplicationDidFinishLaunchingNotification");
+
+            /* Call applicationDidBecomeActive: */
+            if (delegate) {
+                SEL didBecomeActiveSel = sel_registerName("applicationDidBecomeActive:");
+                if (class_respondsToSelector(object_getClass(delegate), didBecomeActiveSel)) {
+                    @try {
+                        ((void(*)(id, SEL, id))objc_msgSend)(delegate, didBecomeActiveSel, self);
+                        bridge_log("  Called applicationDidBecomeActive:");
+                    } @catch (id e) { /* ignore */ }
+                }
+            }
+
+            /* Post UIApplicationDidBecomeActiveNotification */
+            notifName = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                (id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"),
+                "UIApplicationDidBecomeActiveNotification");
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(
+                center, sel_registerName("postNotificationName:object:userInfo:"),
+                notifName, self, nil);
+            bridge_log("  Posted UIApplicationDidBecomeActiveNotification");
         }
     }
 
