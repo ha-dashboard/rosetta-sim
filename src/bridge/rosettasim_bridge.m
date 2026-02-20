@@ -768,65 +768,70 @@ static void check_and_inject_touch(void) {
     last_touch_counter = current_counter;
 
     uint32_t phase = inp->touch_phase;
+    bridge_log("Touch event #%llu: phase=%u x=%.1f y=%.1f",
+               current_counter, phase, (double)inp->touch_x, (double)inp->touch_y);
     if (phase == ROSETTASIM_TOUCH_NONE) return;
 
-    /* Get touch coordinates in points */
-    _RSBridgeCGPoint location = { inp->touch_x, inp->touch_y };
+    /* Get touch coordinates */
+    double tx = (double)inp->touch_x;
+    double ty = (double)inp->touch_y;
 
-    /* Hit test to find the target view */
-    typedef id (*hitTest_fn)(id, SEL, _RSBridgeCGPoint, id);
-    SEL hitTestSel = sel_registerName("hitTest:withEvent:");
-    id targetView = ((hitTest_fn)objc_msgSend)(_bridge_root_window, hitTestSel, location, nil);
-
-    if (!targetView) {
-        targetView = _bridge_root_window; /* Fallback to root window */
+    /* Find the subview at the touch point.
+     * Iterate subviews and use tag/class to find interactive views.
+     * (Avoid objc_msgSend_stret for CGRect — crashes under Rosetta 2) */
+    id targetView = nil;
+    id subviews = ((id(*)(id, SEL))objc_msgSend)(
+        _bridge_root_window, sel_registerName("subviews"));
+    if (subviews) {
+        long count = ((long(*)(id, SEL))objc_msgSend)(subviews, sel_registerName("count"));
+        for (long i = count - 1; i >= 0; i--) {
+            id sv = ((id(*)(id, SEL, long))objc_msgSend)(
+                subviews, sel_registerName("objectAtIndex:"), i);
+            /* Check userInteractionEnabled */
+            bool enabled = ((bool(*)(id, SEL))objc_msgSend)(
+                sv, sel_registerName("isUserInteractionEnabled"));
+            if (!enabled) continue;
+            /* Check if view responds to touchesBegan (custom handler) */
+            Class svClass = object_getClass(sv);
+            Class uiViewBase = objc_getClass("UIView");
+            SEL tSel = sel_registerName("touchesBegan:withEvent:");
+            IMP svIMP = class_getMethodImplementation(svClass, tSel);
+            IMP baseIMP = class_getMethodImplementation(uiViewBase, tSel);
+            if (svIMP != baseIMP) {
+                /* This view has a custom touch handler — use it */
+                targetView = sv;
+                break;
+            }
+        }
     }
+    if (!targetView) targetView = _bridge_root_window;
 
-    /* Create a fake UITouch object via ObjC runtime.
-     * UITouch is not publicly instantiable, so we'll create a minimal
-     * object that responds to the expected methods. For simplicity,
-     * we'll directly call the view's touch methods with nil touches/event. */
-
-    /* Get UIApplication for event generation */
-    Class appClass = objc_getClass("UIApplication");
-    id app = ((id(*)(id, SEL))objc_msgSend)((id)appClass, sel_registerName("sharedApplication"));
-
-    /* Try to create an NSSet with a single touch placeholder.
-     * Since we can't easily create a UITouch, we'll call the view methods
-     * with minimal data. Many views check event.allTouches.anyObject,
-     * so we need at least a stub. */
-
-    /* Simplified approach: call the view methods directly with nil.
-     * Many simple views (buttons, etc) will still respond. */
-
-    SEL touchSel = 0;
+    /* Determine which touch method to call */
+    SEL touchSel = NULL;
+    const char *phaseName = "";
     if (phase == ROSETTASIM_TOUCH_BEGAN) {
         touchSel = sel_registerName("touchesBegan:withEvent:");
-        bridge_log("Touch injection: BEGAN at (%.1f, %.1f) → view %p",
-                   location.x, location.y, (void *)targetView);
+        phaseName = "BEGAN";
     } else if (phase == ROSETTASIM_TOUCH_MOVED) {
         touchSel = sel_registerName("touchesMoved:withEvent:");
-        bridge_log("Touch injection: MOVED at (%.1f, %.1f) → view %p",
-                   location.x, location.y, (void *)targetView);
+        phaseName = "MOVED";
     } else if (phase == ROSETTASIM_TOUCH_ENDED) {
         touchSel = sel_registerName("touchesEnded:withEvent:");
-        bridge_log("Touch injection: ENDED at (%.1f, %.1f) → view %p",
-                   location.x, location.y, (void *)targetView);
+        phaseName = "ENDED";
     }
 
     if (touchSel) {
-        /* Call the touch method on the target view.
-         * touches: empty NSSet (or nil)
-         * event: nil */
-        Class setClass = objc_getClass("NSSet");
-        id emptySet = ((id(*)(id, SEL))objc_msgSend)((id)setClass, sel_registerName("set"));
+        bridge_log("Touch %s at (%.0f, %.0f) → %s %p",
+                   phaseName, tx, ty,
+                   class_getName(object_getClass(targetView)),
+                   (void *)targetView);
 
-        /* Check if view responds to selector before calling */
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
-            ((void(*)(id, SEL, id, id))objc_msgSend)(targetView, touchSel, emptySet, nil);
-        } else {
-            bridge_log("  View does not respond to touch selector");
+            id emptySet = ((id(*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("NSSet"), sel_registerName("set"));
+            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                targetView, touchSel, emptySet, nil);
         }
     }
 }

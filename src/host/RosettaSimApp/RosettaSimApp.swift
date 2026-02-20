@@ -134,6 +134,7 @@ class SimulatorProcess: ObservableObject {
 // MARK: - Live Frame Loader (mmap-based)
 class FrameLoader: ObservableObject {
     @Published var currentFrame: NSImage?
+    @Published var currentCGImage: CGImage?
     @Published var fps: Double = 0
     @Published var frameCount: UInt64 = 0
     @Published var isConnected = false
@@ -266,6 +267,7 @@ class FrameLoader: ObservableObject {
 
         DispatchQueue.main.async {
             self.currentFrame = image
+            self.currentCGImage = cgImage
             self.frameCount = counter
         }
 
@@ -345,55 +347,74 @@ class FrameLoader: ObservableObject {
 }
 
 // MARK: - Touch-Enabled NSView
-class TouchableView: NSView {
+/// NSView that displays the simulator frame AND captures mouse events for touch injection.
+/// This replaces the SwiftUI Image + overlay approach which blocked mouse events.
+class SimulatorDisplayView: NSView {
     var onTouch: ((UInt32, Float, Float) -> Void)?
-    var screenBounds: CGRect = .zero
+    var displayImage: CGImage? {
+        didSet { needsDisplay = true }
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var isFlipped: Bool { true }  // Top-left origin like iOS
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let bounds = self.bounds
+
+        // Black background
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(bounds)
+
+        // Draw the simulator frame
+        if let image = displayImage {
+            ctx.draw(image, in: bounds)
+        }
+    }
 
     override func mouseDown(with event: NSEvent) {
-        handleMouse(event, phase: kTouchPhaseBegan)
+        sendTouch(event, phase: kTouchPhaseBegan)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        handleMouse(event, phase: kTouchPhaseMoved)
+        sendTouch(event, phase: kTouchPhaseMoved)
     }
 
     override func mouseUp(with event: NSEvent) {
-        handleMouse(event, phase: kTouchPhaseEnded)
+        sendTouch(event, phase: kTouchPhaseEnded)
     }
 
-    private func handleMouse(_ event: NSEvent, phase: UInt32) {
-        let location = convert(event.locationInWindow, from: nil)
+    private func sendTouch(_ event: NSEvent, phase: UInt32) {
+        let loc = convert(event.locationInWindow, from: nil)
+        let b = self.bounds
+        guard b.width > 0, b.height > 0 else { return }
 
-        // Convert to screen coordinates (0..375, 0..667)
-        guard screenBounds.width > 0, screenBounds.height > 0 else { return }
+        // Convert to iOS points (375x667). isFlipped=true so loc.y is already top-down.
+        let x = Float(loc.x / b.width * 375.0)
+        let y = Float(loc.y / b.height * 667.0)
 
-        let x = Float((location.x - screenBounds.minX) / screenBounds.width * 375.0)
-        let y = Float((1.0 - (location.y - screenBounds.minY) / screenBounds.height) * 667.0)
+        let cx = max(0, min(375, x))
+        let cy = max(0, min(667, y))
 
-        // Clamp to screen bounds
-        let clampedX = max(0, min(375, x))
-        let clampedY = max(0, min(667, y))
-
-        onTouch?(phase, clampedX, clampedY)
+        onTouch?(phase, cx, cy)
     }
 }
 
-// MARK: - TouchableViewRepresentable
-struct TouchableViewRepresentable: NSViewRepresentable {
+// MARK: - SimulatorDisplayRepresentable
+struct SimulatorDisplayRepresentable: NSViewRepresentable {
     @ObservedObject var frameLoader: FrameLoader
-    let screenBounds: CGRect
 
-    func makeNSView(context: Context) -> TouchableView {
-        let view = TouchableView()
+    func makeNSView(context: Context) -> SimulatorDisplayView {
+        let view = SimulatorDisplayView()
         view.onTouch = { [frameLoader] phase, x, y in
             frameLoader.sendTouch(phase: phase, x: x, y: y)
         }
-        view.screenBounds = screenBounds
         return view
     }
 
-    func updateNSView(_ nsView: TouchableView, context: Context) {
-        nsView.screenBounds = screenBounds
+    func updateNSView(_ nsView: SimulatorDisplayView, context: Context) {
+        nsView.displayImage = frameLoader.currentCGImage
     }
 }
 
@@ -413,44 +434,13 @@ struct DeviceChromeView: View {
             VStack(spacing: 0) {
                 Spacer().frame(height: 60)
 
-                ZStack {
-                    if let frame = frameLoader.currentFrame {
-                        Image(nsImage: frame)
-                            .resizable()
-                            .interpolation(.high)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(
-                                width: CGFloat(device.width),
-                                height: CGFloat(device.height)
-                            )
-                            .background(Color.black)
-                            .cornerRadius(8)
-                    } else {
-                        Rectangle()
-                            .fill(Color.black)
-                            .frame(
-                                width: CGFloat(device.width),
-                                height: CGFloat(device.height)
-                            )
-                            .cornerRadius(8)
-                            .overlay(
-                                Text("No Frame")
-                                    .foregroundColor(.gray)
-                            )
-                    }
-
-                    // Overlay touchable view for mouse events
-                    GeometryReader { geometry in
-                        TouchableViewRepresentable(
-                            frameLoader: frameLoader,
-                            screenBounds: geometry.frame(in: .local)
-                        )
-                    }
+                // Single NSView handles both display AND mouse events
+                SimulatorDisplayRepresentable(frameLoader: frameLoader)
                     .frame(
                         width: CGFloat(device.width),
                         height: CGFloat(device.height)
                     )
-                }
+                    .cornerRadius(8)
 
                 Spacer().frame(height: 60)
             }
