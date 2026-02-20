@@ -1106,7 +1106,28 @@ static void _noopMethod(id self, SEL _cmd, ...) {
     /* Silently no-op */
 }
 
+/* Replacement for -[UIWindow makeKeyAndVisible].
+   The original triggers BKSEventFocusManager which crashes without backboardd.
+   We just set the layer hidden=NO (for rendering) and skip the event registration. */
+static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
+    bridge_log("  [UIWindow makeKeyAndVisible] intercepted → layer setHidden:NO");
+    id layer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));
+    if (layer) {
+        ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
+    }
+}
+
 static void swizzle_bks_methods(void) {
+    /* UIWindow makeKeyAndVisible — crashes via BKSEventFocusManager */
+    Class windowClass = objc_getClass("UIWindow");
+    if (windowClass) {
+        SEL mkavSel = sel_registerName("makeKeyAndVisible");
+        Method m = class_getInstanceMethod(windowClass, mkavSel);
+        if (m) {
+            method_setImplementation(m, (IMP)replacement_makeKeyAndVisible);
+        }
+    }
+
     /* BKSEventFocusManager - event focus management */
     const char *classesToSwizzle[] = {
         "BKSEventFocusManager",
