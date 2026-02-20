@@ -566,14 +566,62 @@ Host App (ARM64):                Bridge (x86_64):
 - Light gray theme renders instead of dark theme (UIAppearance proxies not yet activated)
 - ~14fps with selective display forcing
 
-**Open problems for next session:**
+### Phase 6c: Flashing Fix, Touch Infrastructure, Keyboard Input (2026-02-20, Session 3)
+**Goal:** Eliminate display flashing, build proper touch event delivery infrastructure, add keyboard input.
 
-| Priority | Problem | Detail |
-|---|---|---|
-| 1 | Dark theme not applied | hass-dashboard renders in default UIKit light gray instead of custom dark theme. UIAppearance proxies may need explicit activation or the view controller lifecycle needs viewDidAppear: |
-| 2 | UIControl touch delivery | UIEvent creation via _initWithEvent:touches: needs verification. UIButton/UITextField may need proper UITouch with HID event backing |
-| 3 | Performance | 14fps with complex apps (force-display is expensive). IOSurface zero-copy would eliminate mmap overhead |
-| 4 | viewDidAppear lifecycle | Only viewWillAppear: is called in makeKeyAndVisible replacement. viewDidAppear: may trigger additional view setup |
+**Display flashing — root cause and fix:**
+
+The display flashed because `CGBitmapContextCreate` clears the pixel buffer to white (#ffffff) before `renderInContext:` draws content. With the bitmap context pointing directly at the shared mmap'd framebuffer, the host caught this transient white state ~13% of the time. Investigation via per-frame pixel sampling confirmed the pattern: binary alternation between rendered content (#f2f2f2) and blank white (#ffffff), correlated with the RENDERING flag state.
+
+**Fix: Double-buffer rendering.** Render to a local `malloc`'d buffer, then `memcpy` the completed frame to the shared framebuffer in one shot. The host only ever sees complete frames. This eliminated all flashing.
+
+Additional display fixes:
+- **`updateNSView` frame counter guard** — Only set `displayImage` (triggering `needsDisplay`) when `frameCount` changes, not on every SwiftUI state update
+- **`_force_display_recursive` improvements:**
+  - Only call `setNeedsDisplay` on layers with nil `contents` (preserves existing backing stores)
+  - Restricted `_` prefix catch-all to private views that actually override `drawRect:` (was creating empty opaque backing stores on container views like `_UIBarBackground`)
+- **RENDERING flag** added to framebuffer header (bridge sets before writing, clears after) — not used as hard gate since bridge spends most time rendering, but available for future optimization
+
+**App lifecycle completeness:**
+- Added `viewDidAppear:` call in `makeKeyAndVisible` replacement
+- Added `applicationDidBecomeActive:` delegate method call
+- Post `UIApplicationDidFinishLaunchingNotification` and `UIApplicationDidBecomeActiveNotification`
+
+**Touch event delivery — multi-layered approach:**
+
+The touch pipeline went through several iterations to handle UIKit's complex event infrastructure:
+
+1. **UITouchesEvent creation**: `[[UITouchesEvent alloc] _init]` creates a bridge-owned event with all internal CFMutableDictionaries properly initialized by `_UITouchesEventCommonInit`. The `[UIApplication _touchesEvent]` singleton is nil because `_eventDispatcher` was never initialized (our longjmp recovery skips that code path).
+
+2. **Dictionary population via ivar manipulation**: `_addTouch:forDelayedDelivery:` crashes in `_addGestureRecognizersForView:toTouch:` because UIScrollView's gesture recognizers reference internal state that doesn't exist without backboardd. Instead, we directly populate `_touches` (NSMutableSet), `_keyedTouches[view]` (CFMutableDictionary), and `_keyedTouchesByWindow[window]` (CFMutableDictionary) using `class_getInstanceVariable` + `ivar_getOffset`. Dictionary keys are raw pointers (NULL key callbacks = pointer equality).
+
+3. **SIGSEGV crash guard**: `sendEvent:` still crashes in `_sendTouchesForEvent:` due to missing `_gestureRecognizersByWindow` population. A `sigsetjmp`/`siglongjmp` handler catches SIGSEGV/SIGBUS and recovers to the direct delivery fallback. Process stays alive.
+
+4. **Direct delivery fallback**: Walks the responder chain to find nearest UIControl ancestor. UIButton/UISegmentedControl: `setHighlighted:` + `beginTrackingWithTouch:` + `endTrackingWithTouch:` + `sendActionsForControlEvents:UIControlEventTouchUpInside`. UITextField: `becomeFirstResponder` crashes (UITextInteractionAssistant's gesture recognizer setup needs backboardd), so touch is delivered but text input uses the keyboard mechanism instead.
+
+**Keyboard input:**
+- Host: `SimulatorDisplayView.keyDown` captures `keyCode`, modifier flags, and character → writes to mmap input region (`key_code`, `key_flags`, `key_char` fields added to `RosettaSimInputRegion`)
+- Bridge: `check_and_inject_keyboard()` reads key events, finds first responder via `[UIApplication _firstResponder]` or `[keyWindow firstResponder]`, delivers via `[responder insertText:]` for regular characters. Special keys: Backspace → `deleteBackward`, Return → `resignFirstResponder` (UITextField) or `insertText:"\n"` (UITextView), Tab → `insertText:"\t"`.
+
+**Known issues for next session:**
+
+| Priority | Problem | Root Cause | Potential Fix |
+|---|---|---|---|
+| 1 | `sendEvent:` crashes in `_sendTouchesForEvent:` | `_gestureRecognizersByWindow` not populated; UIGestureEnvironment not initialized | Initialize UIEventDispatcher + UIGestureEnvironment during manual UIApplicationMain recovery. Or swizzle `_sendTouchesForEvent:` to skip gesture recognizer phase. |
+| 2 | UITextField.becomeFirstResponder crashes | UITextInteractionAssistant.setGestureRecognizers calls removeGestureRecognizer: on nil | Swizzle UITextInteractionAssistant to skip gesture setup, or initialize gesture environment |
+| 3 | Dark theme not applied | UIAppearance proxies not activated despite viewDidAppear/applicationDidBecomeActive calls | May need view removal + re-addition to window to trigger appearance, or explicit UIAppearance application |
+| 4 | ~15fps / 120% CPU | Per-frame renderInContext: is expensive for complex view hierarchies | IOSurface zero-copy rendering; reduce force-display frequency for unchanged views |
+| 5 | 318 colors rendered but mostly white/light gray | Many views' backgroundColors render but custom content needs more force-display coverage | Investigate which views aren't getting their drawRect: called |
+
+**Session 3 commits:**
+```
+3ed358a feat: proper UITouchesEvent infrastructure with crash-safe fallback
+2c3c477 fix: skip sendEvent: (crashes), skip becomeFirstResponder (crashes)
+b514fad fix: revert UITouchesEvent (crashes), add UIControl tracking fallback
+4790787 fix: use UITouchesEvent for proper UIControl touch delivery
+8b329d3 fix: eliminate display flashing with double-buffer rendering
+b2eee66 fix: bridge rendering flag and host frame counter optimization
+```
 
 ### Phase 7: App Management
 **Goal:** Install and launch arbitrary simulator apps.
