@@ -1055,28 +1055,41 @@ static void check_and_inject_touch(void) {
                     sel_registerName("setTimestamp:"), ts);
             } @catch (id e) { /* fall through */ }
 
-            /* Try to send via [UIApplication sendEvent:] with UIEvent containing our touch */
+            /* Set tapCount (required for UIControl tracking) */
+            @try {
+                ((void(*)(id, SEL, long))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setTapCount:"), 1);
+            } @catch (id e) { /* fall through */ }
+
+            /* Set isTap for single clicks */
+            @try {
+                ((void(*)(id, SEL, bool))objc_msgSend)(
+                    _bridge_current_touch,
+                    sel_registerName("setIsTap:"), true);
+            } @catch (id e) { /* fall through */ }
+
+            /* Build touch set for event */
             id touchSet = ((id(*)(id, SEL, id))objc_msgSend)(
                 (id)objc_getClass("NSSet"),
                 sel_registerName("setWithObject:"),
                 _bridge_current_touch);
 
-            /* Try [UIWindow sendEvent:] or direct touch method dispatch */
             SEL sendEventSel = sel_registerName("sendEvent:");
 
-            /* Create UIEvent — try _initWithEvent:touches: (private) */
-            Class eventClass = objc_getClass("UIEvent");
+            /* Create UITouchesEvent (NOT UIEvent — UIApplication.sendEvent: checks
+               event type and routes UITouchesEvent through _sendTouchesForEvent:
+               which invokes UIControl tracking and gesture recognizers). */
+            Class eventClass = objc_getClass("UITouchesEvent");
+            if (!eventClass) eventClass = objc_getClass("UIEvent");
             id event = nil;
             if (eventClass) {
                 SEL eventInitSel = sel_registerName("_initWithEvent:touches:");
-                if (class_respondsToSelector(object_getClass(eventClass), eventInitSel) ||
-                    class_respondsToSelector(eventClass, eventInitSel)) {
-                    @try {
-                        event = ((id(*)(id, SEL, id, id))objc_msgSend)(
-                            ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
-                            eventInitSel, nil, touchSet);
-                    } @catch (id e) { event = nil; }
-                }
+                @try {
+                    event = ((id(*)(id, SEL, id, id))objc_msgSend)(
+                        ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
+                        eventInitSel, nil, touchSet);
+                } @catch (id e) { event = nil; }
             }
 
             /* Deliver: prefer sendEvent: if we have an event, otherwise direct */
