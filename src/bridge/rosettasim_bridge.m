@@ -48,6 +48,9 @@ static void find_root_window(id delegate);
 static void start_frame_capture(void);
 static void _mark_display_dirty(void);
 
+/* Display refresh control — declared early for use by _force_display_recursive */
+static int _force_full_refresh = 1;  /* Start with full refresh */
+
 /* ================================================================
  * Logging
  * ================================================================ */
@@ -1103,12 +1106,17 @@ static void _force_display_recursive(id layer, int depth) {
          * those methods. No additional check is needed. */
 
         if (hasCustomDrawing) {
-            /* Only call setNeedsDisplay if the layer has no content yet.
-             * Calling setNeedsDisplay on a layer with valid content destroys
-             * the existing backing store, causing a flash until displayIfNeeded
-             * repopulates it. */
+            /* Call setNeedsDisplay if:
+             *   - Layer has no content (nil backing store needs population)
+             *   - OR _force_full_refresh is active (content is stale after
+             *     user interaction — text input, button state change, etc.)
+             *
+             * Without _force_full_refresh, layers with existing content are
+             * skipped to avoid flashing. With it, we accept a brief flash
+             * to ensure stale content (e.g. placeholder text after typing)
+             * is repainted with current state. */
             id contents = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("contents"));
-            if (!contents) {
+            if (!contents || _force_full_refresh) {
                 ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
             }
             ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("displayIfNeeded"));
@@ -1717,7 +1725,33 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
              * Instead, directly register the text field as first responder
              * via the window's private API + UIResponder's base impl. */
             if (phase == ROSETTASIM_TOUCH_ENDED) {
-                bridge_log("  UITextField tapped — setting as first responder");
+                bridge_log("  UITextField tapped — setting as first responder + editing mode");
+
+                /* Set _editing = YES on the text field so it accepts insertText:
+                 * and displays typed text instead of placeholder. */
+                @try {
+                    /* Try setting editing via the _editing ivar directly */
+                    Ivar editingIvar = class_getInstanceVariable(
+                        objc_getClass("UITextField"), "_editing");
+                    if (editingIvar) {
+                        bool *editPtr = (bool *)((uint8_t *)controlTarget +
+                                                  ivar_getOffset(editingIvar));
+                        *editPtr = true;
+                        bridge_log("  Set _editing = YES via ivar");
+                    }
+                } @catch (id e) { /* ignore */ }
+
+                /* Also call _startEditing (internal method that switches from
+                 * placeholder display to content display) */
+                @try {
+                    SEL startEditSel = sel_registerName("_startEditing");
+                    if (class_respondsToSelector(object_getClass(controlTarget), startEditSel)) {
+                        ((void(*)(id, SEL))objc_msgSend)(controlTarget, startEditSel);
+                        bridge_log("  Called _startEditing");
+                    }
+                } @catch (id e) {
+                    bridge_log("  _startEditing threw — continuing");
+                }
 
                 /* Set via window._setFirstResponder: (private API) */
                 id targetWindow = _bridge_key_window ? _bridge_key_window : _bridge_root_window;
@@ -2081,7 +2115,35 @@ static void check_and_inject_keyboard(void) {
      *   126 = Up arrow
      */
     if (key_code == 51) {
-        /* Backspace / Delete */
+        /* Backspace / Delete — use setText: with truncation for UITextField
+         * since deleteBackward requires text input system */
+        if (isTextInput) {
+            SEL textSel = sel_registerName("text");
+            SEL setTextSel = sel_registerName("setText:");
+            if (class_respondsToSelector(object_getClass(firstResponder), textSel)) {
+                @try {
+                    id currentText = ((id(*)(id, SEL))objc_msgSend)(firstResponder, textSel);
+                    if (currentText) {
+                        long len = ((long(*)(id, SEL))objc_msgSend)(
+                            currentText, sel_registerName("length"));
+                        if (len > 0) {
+                            typedef struct { long loc; long len; } _NSRange;
+                            _NSRange range = {0, len - 1};
+                            id newText = ((id(*)(id, SEL, _NSRange))objc_msgSend)(
+                                currentText,
+                                sel_registerName("substringWithRange:"), range);
+                            ((void(*)(id, SEL, id))objc_msgSend)(
+                                firstResponder, setTextSel, newText);
+                            bridge_log("  Backspace via setText: (len %ld → %ld)", len, len - 1);
+                        }
+                    }
+                } @catch (id e) {
+                    bridge_log("  Backspace setText: failed");
+                }
+            }
+            _mark_display_dirty();
+            return;
+        }
         SEL deleteBackSel = sel_registerName("deleteBackward");
         if (class_respondsToSelector(object_getClass(firstResponder), deleteBackSel)) {
             @try {
@@ -2091,7 +2153,6 @@ static void check_and_inject_keyboard(void) {
                 bridge_log("  deleteBackward failed");
             }
         } else if (hasInsertText) {
-            /* Some text inputs don't have deleteBackward — try deleteBackward: */
             SEL deleteBackAltSel = sel_registerName("deleteBackward:");
             if (class_respondsToSelector(object_getClass(firstResponder), deleteBackAltSel)) {
                 @try {
@@ -2341,15 +2402,52 @@ static void check_and_inject_keyboard(void) {
         }
 
         if (shouldInsert) {
-            @try {
-                ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, charStr);
-                bridge_log("  Delivered insertText: '%s'", utf8);
-            } @catch (id e) {
-                bridge_log("  insertText failed for char 0x%x", key_char);
-                return;
+            /* For UITextField: set text property directly because insertText:
+             * requires a fully initialized text input system (UIKeyboardImpl +
+             * UIFieldEditor) which doesn't exist without backboardd.
+             * Appending to the text property works reliably. */
+            int used_setText = 0;
+            if (isTextInput) {
+                SEL textSel = sel_registerName("text");
+                SEL setTextSel = sel_registerName("setText:");
+                if (class_respondsToSelector(object_getClass(firstResponder), textSel) &&
+                    class_respondsToSelector(object_getClass(firstResponder), setTextSel)) {
+                    @try {
+                        id currentText = ((id(*)(id, SEL))objc_msgSend)(
+                            firstResponder, textSel);
+                        id newText;
+                        if (currentText) {
+                            newText = ((id(*)(id, SEL, id))objc_msgSend)(
+                                currentText,
+                                sel_registerName("stringByAppendingString:"),
+                                charStr);
+                        } else {
+                            newText = charStr;
+                        }
+                        ((void(*)(id, SEL, id))objc_msgSend)(
+                            firstResponder, setTextSel, newText);
+                        used_setText = 1;
+                        bridge_log("  setText: '%s' → '%s'", utf8,
+                                   ((const char *(*)(id, SEL))objc_msgSend)(
+                                       newText, sel_registerName("UTF8String")));
+                    } @catch (id e) {
+                        bridge_log("  setText: failed, falling back to insertText:");
+                    }
+                }
             }
 
-            /* Post UITextFieldTextDidChangeNotification for UITextField */
+            /* Fallback to insertText: for non-UITextField responders */
+            if (!used_setText) {
+                @try {
+                    ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, charStr);
+                    bridge_log("  Delivered insertText: '%s'", utf8);
+                } @catch (id e) {
+                    bridge_log("  insertText failed for char 0x%x", key_char);
+                    return;
+                }
+            }
+
+            /* Post UITextFieldTextDidChangeNotification */
             if (isTextInput) {
                 Class nsCenterClass = objc_getClass("NSNotificationCenter");
                 id center = nsCenterClass ? ((id(*)(id, SEL))objc_msgSend)(
@@ -2405,9 +2503,10 @@ static void _dump_view_hierarchy(id view, int depth) {
  * Periodic refresh catches timer-driven updates (animations, network responses). */
 static int _force_display_countdown = 60;  /* Force first 60 frames (~2s) */
 
-/* Called after a touch event mutates the UI — schedule a few force-display frames */
+/* Called after a touch or keyboard event mutates the UI */
 static void _mark_display_dirty(void) {
     if (_force_display_countdown < 5) _force_display_countdown = 5;
+    _force_full_refresh = 1;
 }
 
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
@@ -2481,6 +2580,8 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
 
         if (need_force_display) {
             _force_display_recursive(layer, 0);
+            /* Clear full refresh flag after one complete cycle */
+            if (_force_full_refresh) _force_full_refresh = 0;
         }
     }
 
