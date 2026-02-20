@@ -420,6 +420,18 @@ class SimulatorDisplayView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Grab keyboard focus when the view is added to a window
+        window?.makeFirstResponder(self)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Ensure we have keyboard focus when clicked
+        window?.makeFirstResponder(self)
+        sendTouch(event, phase: kTouchPhaseBegan)
+    }
+
     override func keyDown(with event: NSEvent) {
         let keyCode = event.keyCode
         let modifiers = UInt32(event.modifierFlags.rawValue & 0xFFFF0000) >> 16
@@ -453,10 +465,6 @@ class SimulatorDisplayView: NSView {
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height))
             ctx.restoreGState()
         }
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        sendTouch(event, phase: kTouchPhaseBegan)
     }
 
     override func mouseDragged(with event: NSEvent) {

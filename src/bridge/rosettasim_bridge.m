@@ -1755,8 +1755,15 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
                 _sendEvent_guard_active = 1;
                 int crash_sig = sigsetjmp(_sendEvent_recovery, 1);
                 if (crash_sig == 0) {
+                    /* Wrap in @autoreleasepool to isolate any autorelease pool
+                     * corruption during crash recovery. Without this, siglongjmp
+                     * from the SIGSEGV handler can leave the ObjC autorelease pool
+                     * stack inconsistent, causing later crashes in
+                     * _wrapRunLoopWithAutoreleasePoolHandler. */
+                    @autoreleasepool {
                     bridge_log("  Delivering via [UIApplication sendEvent:]");
                     ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, touchesEvent);
+                    }
                     _sendEvent_guard_active = 0;
                     sendEvent_succeeded = 1;
                     _sendEvent_crash_count = 0; /* Reset on success */
