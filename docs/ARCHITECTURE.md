@@ -623,6 +623,61 @@ b514fad fix: revert UITouchesEvent (crashes), add UIControl tracking fallback
 b2eee66 fix: bridge rendering flag and host frame counter optimization
 ```
 
+### Phase 6d: Touch Reliability, UIApplicationMain Natural Completion (2026-02-20, Session 4)
+**Goal:** Fix touch reliability issues, enable proper UIKit event infrastructure.
+
+**Touch reliability fixes (6 bugs found by code-analyzer agent):**
+
+1. **Phantom touch events from keyboard** — host `sendKeyEvent` incremented `touch_counter`, causing bridge to process stale touch_phase data as new touch events. Fix: keyboard events signal via `key_code != 0` (already polled independently), don't touch the counter.
+2. **Race condition in sendTouch** — counter incremented BEFORE fields written. Bridge could read new counter with stale data. Fix: write fields first, `OSMemoryBarrier()`, increment counter last.
+3. **Ghost ENDED without BEGAN** — after touch ENDED cleanup, orphan events (from keyboard counter bump or stale data) created new UITouch objects for ENDED phase. Fix: only create UITouch on BEGAN; drop orphan MOVED/ENDED.
+4. **Double touch delivery** — `sendEvent:` (via replacement) delivered `touchesBegan:` to views, then direct delivery code ALSO delivered `touchesBegan:`. Fix: gate direct `touchesBegan:` on `!sendEvent_succeeded`.
+5. **UITouchesEvent leak** — new event created every BEGAN, previous never released. Fix: reuse event via `_clearTouches`.
+6. **Missing memory barrier on bridge reads** — no barrier between counter read and field reads. Fix: `__sync_synchronize()` after counter.
+
+**UIApplicationMain natural completion progress:**
+
+The fundamental issue: `UIApplicationMain` was interrupted by `longjmp` when `_GSEventInitializeApp` called `abort()`. This skips UIEventDispatcher, UIGestureEnvironment, and the full event pipeline initialization.
+
+Progress toward letting UIApplicationMain complete naturally:
+
+1. **`bootstrap_register2` interposition** — the root cause of the abort was `_GSRegisterPurpleNamedPortInPrivateNamespace` calling `bootstrap_register2` which failed (Purple ports not in bootstrap namespace). Interposing `bootstrap_register2` to return `KERN_SUCCESS` lets `_GSEventInitializeApp` complete without aborting.
+
+2. **`exit()` blocking during init** — after `_GSEventInitializeApp` completes, UIApplicationMain proceeds to FBSWorkspace connection (XPC to SpringBoard). When this fails (no SpringBoard in RosettaSim), it calls `exit(0)`. Blocking `exit()` during init phase prevents termination.
+
+3. **Current block: FBSWorkspace hang** — UIApplicationMain hangs after workspace disconnect, stuck waiting for FBSWorkspace XPC response that will never come.
+
+**UIApplicationMain initialization sequence (from agent analysis):**
+
+```
+_UIApplicationMainPreparations:
+  [1] BKSDisplayServicesStart          → INTERPOSED (succeeds) ✓
+  [2] CARenderServerGetServerPort      → INTERPOSED (MACH_PORT_NULL) ✓
+  [3] BKSHIDEventRegister...           → INTERPOSED (no-op) ✓
+  [4] UIApplication alloc+init         → succeeds (singleton created) ✓
+  [5] _GSEventInitializeApp            → bootstrap_register2 INTERPOSED ✓
+  [6] UIEventDispatcher init           ← SKIPPED (hangs at FBSWorkspace)
+  [7] UIGestureEnvironment init        ← SKIPPED (lazy, needs dispatcher)
+  [8] FBSWorkspace connection          ← HANGS (no SpringBoard)
+  [9] makeKeyAndVisible                ← SKIPPED
+  [10] didFinishLaunchingWithOptions:  ← SKIPPED
+```
+
+**Two paths forward for next session:**
+
+| Path | Approach | Pros | Cons |
+|------|----------|------|------|
+| A | Continue natural completion — handle FBSWorkspace hang, provide minimal workspace service | Proper long-term fix, all UIKit infrastructure initialized by UIKit itself | More services to implement, complex XPC protocol |
+| B | After longjmp recovery, manually create UIEventDispatcher → UIEventEnvironment → UIGestureEnvironment | Fastest to working touches, agent analysis confirmed this would fix ALL touch issues | Still using longjmp recovery, not a natural initialization |
+
+**Recommended**: Try Path B first (manual UIEventDispatcher creation) for quick results, then pursue Path A for proper architecture.
+
+**Session 4 commits:**
+```
+7b7cfff feat: bootstrap_register2 interposition + workspace disconnect handling
+548ee3b feat: sendEvent: swizzle, UITextField editing, touch reliability fixes
+```
+
 ### Phase 7: App Management
 **Goal:** Install and launch arbitrary simulator apps.
 
