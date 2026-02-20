@@ -639,6 +639,7 @@ static id _bridge_root_window = nil;
 static void *(*_cg_CreateColorSpace)(void);
 static void *(*_cg_CreateBitmap)(void *, size_t, size_t, size_t, size_t, void *, uint32_t);
 static void  (*_cg_ScaleCTM)(void *, double, double);
+static void  (*_cg_TranslateCTM)(void *, double, double);
 static void  (*_cg_Release)(void *);
 static void  (*_cg_ReleaseCS)(void *);
 
@@ -646,6 +647,7 @@ static void resolve_cg_functions(void) {
     _cg_CreateColorSpace = dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
     _cg_CreateBitmap     = dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
     _cg_ScaleCTM         = dlsym(RTLD_DEFAULT, "CGContextScaleCTM");
+    _cg_TranslateCTM     = dlsym(RTLD_DEFAULT, "CGContextTranslateCTM");
     _cg_Release          = dlsym(RTLD_DEFAULT, "CGContextRelease");
     _cg_ReleaseCS        = dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
 }
@@ -755,8 +757,13 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     void *ctx = _cg_CreateBitmap(pixels, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
-        /* Scale for Retina (2x device → 750x1334 pixels from 375x667 points) */
-        _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
+        /* Flip Y and scale for Retina.
+           CGBitmapContext origin is bottom-left (first pixel in memory = bottom).
+           We want standard image order (first pixel = top-left) so the host
+           app can display it directly without flipping.
+           Transform: translate to top of pixel buffer, then scale with negative Y. */
+        _cg_TranslateCTM(ctx, 0, (double)px_h);
+        _cg_ScaleCTM(ctx, (double)kScreenScaleX, -(double)kScreenScaleY);
 
         /* Render the layer tree into the bitmap */
         ((void(*)(id, SEL, void *))objc_msgSend)(
