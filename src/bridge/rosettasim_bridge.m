@@ -368,10 +368,24 @@ static volatile int _init_phase = 1;  /* 1 = during startup, 0 = app running */
 static void replacement_exit(int status) {
     if (_init_phase) {
         bridge_log("exit(%d) BLOCKED during init phase (workspace disconnect expected)", status);
-        /* Don't exit — the workspace connection failing is expected in RosettaSim.
-         * Just return and let the caller continue. exit() returning is UB but
-         * works in practice — the caller typically returns after calling exit(). */
-        return;
+        /* The workspace server disconnect calls exit() on an XPC callback thread.
+         * Returning from exit() is UB and causes SIGSEGV. Instead, terminate
+         * only THIS thread (the XPC callback thread) using pthread_exit().
+         * The main thread continues UIApplicationMain initialization. */
+        if (!pthread_main_np()) {
+            bridge_log("  Terminating XPC callback thread via pthread_exit");
+            pthread_exit(NULL);
+            /* not reached */
+        }
+        /* If we're on the main thread, use longjmp if guard is active */
+        if (_abort_guard_active) {
+            bridge_log("  exit() on main thread inside guard → longjmp recovery");
+            longjmp(_abort_recovery, 200 + status);
+            /* not reached */
+        }
+        /* Last resort: block this thread forever (prevent process exit) */
+        bridge_log("  exit() on main thread outside guard → blocking thread");
+        while (1) { sleep(86400); }
     }
     bridge_log("exit(%d) called in running phase → terminating", status);
     _exit(status);
@@ -2443,6 +2457,136 @@ static id replacement_keyWindow(id self, SEL _cmd) {
     return _bridge_root_window;
 }
 
+/* ================================================================
+ * UIApplication._runWithMainScene:transitionContext:completion:
+ *
+ * The original method:
+ *   1. Connects to FBSWorkspace via XPC
+ *   2. Requests scene creation from SpringBoard
+ *   3. Waits on dispatch_semaphore for reply (HANGS without SpringBoard)
+ *   4. Creates UIEventDispatcher
+ *   5. Calls completion block (triggers didFinishLaunching)
+ *   6. Starts CFRunLoopRun
+ *
+ * Our replacement does steps 4-6, skipping the FBSWorkspace connection
+ * (steps 1-3) since there is no SpringBoard in RosettaSim.
+ *
+ * This lets UIApplicationMain complete naturally. UIKit creates
+ * UIEventDispatcher, UIEventEnvironment, and UIGestureEnvironment
+ * itself — no manual object creation needed.
+ * ================================================================ */
+
+static void replacement_runWithMainScene(id self, SEL _cmd,
+                                          id scene,
+                                          id transitionContext,
+                                          id completionBlock) {
+    bridge_log("_runWithMainScene: intercepted — bypassing FBSWorkspace");
+
+    /* Create UIEventDispatcher — normally done by _runWithMainScene before
+     * the completion block fires. This creates:
+     *   - UIEventFetcher (HID event collection)
+     *   - UIEventEnvironment (holds _touchesEvent singleton)
+     *   - Run loop sources for event processing
+     */
+    {
+        Class dispatcherClass = objc_getClass("UIEventDispatcher");
+        if (dispatcherClass) {
+            @try {
+                id dispatcher = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)dispatcherClass, sel_registerName("alloc"));
+                SEL initWithAppSel = sel_registerName("initWithApplication:");
+                if (class_respondsToSelector(dispatcherClass, initWithAppSel)) {
+                    dispatcher = ((id(*)(id, SEL, id))objc_msgSend)(
+                        dispatcher, initWithAppSel, self);
+                } else {
+                    dispatcher = ((id(*)(id, SEL))objc_msgSend)(
+                        dispatcher, sel_registerName("init"));
+                }
+                if (dispatcher) {
+                    Ivar edIvar = class_getInstanceVariable(
+                        object_getClass(self), "_eventDispatcher");
+                    if (edIvar) {
+                        *(id *)((uint8_t *)self + ivar_getOffset(edIvar)) = dispatcher;
+                        ((id(*)(id, SEL))objc_msgSend)(dispatcher, sel_registerName("retain"));
+                        bridge_log("  UIEventDispatcher created: %p", (void *)dispatcher);
+
+                        /* Install event run loop sources on main run loop */
+                        SEL installSel = sel_registerName("_installEventRunLoopSources:");
+                        if (class_respondsToSelector(object_getClass(dispatcher), installSel)) {
+                            @try {
+                                ((void(*)(id, SEL, CFRunLoopRef))objc_msgSend)(
+                                    dispatcher, installSel, CFRunLoopGetMain());
+                                bridge_log("  Installed event run loop sources");
+                            } @catch (id e) {
+                                bridge_log("  _installEventRunLoopSources threw exception");
+                            }
+                        }
+                    } else {
+                        bridge_log("  WARN: _eventDispatcher ivar not found");
+                    }
+                }
+            } @catch (id e) {
+                bridge_log("  UIEventDispatcher creation failed: exception");
+            }
+        } else {
+            bridge_log("  UIEventDispatcher class not found");
+        }
+    }
+
+    /* Call _callInitializationDelegatesForMainScene:transitionContext:
+     * This is the UIKit method that:
+     *   - Loads the main storyboard/nib
+     *   - Creates the delegate
+     *   - Calls application:didFinishLaunchingWithOptions:
+     *   - Calls makeKeyAndVisible (via storyboard loading)
+     *   - Posts UIApplicationDidFinishLaunchingNotification
+     *   - Calls applicationDidBecomeActive:
+     */
+    SEL callInitSel = sel_registerName("_callInitializationDelegatesForMainScene:transitionContext:");
+    if (class_respondsToSelector(object_getClass(self), callInitSel)) {
+        bridge_log("  Calling _callInitializationDelegatesForMainScene:");
+        @try {
+            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                self, callInitSel, scene, transitionContext);
+            bridge_log("  _callInitializationDelegatesForMainScene: completed");
+        } @catch (id e) {
+            SEL reasonSel = sel_registerName("reason");
+            id reason = ((id(*)(id, SEL))objc_msgSend)(e, reasonSel);
+            const char *str = reason ? ((const char *(*)(id, SEL))objc_msgSend)(
+                reason, sel_registerName("UTF8String")) : "(unknown)";
+            bridge_log("  _callInitializationDelegatesForMainScene threw: %s", str);
+        }
+    } else {
+        bridge_log("  _callInitializationDelegatesForMainScene: not found — calling completion block");
+        /* Fallback: call the completion block directly */
+        if (completionBlock) {
+            @try {
+                typedef void (^VoidBlock)(void);
+                ((VoidBlock)completionBlock)();
+                bridge_log("  Completion block executed");
+            } @catch (id e) {
+                bridge_log("  Completion block threw exception");
+            }
+        }
+    }
+
+    /* Set up frame capture (rendering pipeline) */
+    bridge_log("  Setting up frame capture from _runWithMainScene...");
+    find_root_window(_bridge_delegate);
+    start_frame_capture();
+
+    /* Mark init complete — exit() calls are now allowed */
+    _init_phase = 0;
+
+    /* Start the main run loop — this is what _runWithMainScene normally
+     * does at the very end. CFRunLoopRun never returns. */
+    bridge_log("  Starting CFRunLoop from _runWithMainScene replacement...");
+    CFRunLoopRun();
+
+    /* Only reached if CFRunLoopRun returns (app shutting down) */
+    bridge_log("  CFRunLoopRun returned from _runWithMainScene replacement");
+}
+
 static void swizzle_bks_methods(void) {
     /* UIWindow makeKeyAndVisible — crashes via BKSEventFocusManager */
     Class windowClass = objc_getClass("UIWindow");
@@ -2488,6 +2632,80 @@ static void swizzle_bks_methods(void) {
         if (wse2Method) {
             method_setImplementation(wse2Method, (IMP)_noopMethod);
             bridge_log("  Swizzled UIApplication.workspaceShouldExit:withTransitionContext:");
+        }
+    }
+
+    /* UIApplication._runWithMainScene:transitionContext:completion:
+       This is the method that connects to FBSWorkspace, requests scene creation
+       from SpringBoard, and waits on dispatch_semaphore for the reply. Without
+       SpringBoard, the semaphore never signals and UIApplicationMain hangs.
+
+       Our replacement:
+       1. Creates UIEventDispatcher (which UIKit normally creates at this point)
+       2. Calls _callInitializationDelegatesForMainScene: (triggers didFinishLaunching)
+       3. Starts CFRunLoopRun (the main event loop)
+
+       This is NOT a hack — it's what UIApplicationMain would do at this point,
+       minus the FBSWorkspace connection that requires SpringBoard. */
+    if (appClass) {
+        /* Swizzle _runWithMainScene: (called by _run) */
+        SEL runSceneSel = sel_registerName("_runWithMainScene:transitionContext:completion:");
+        Method runSceneMethod = class_getInstanceMethod(appClass, runSceneSel);
+        if (runSceneMethod) {
+            method_setImplementation(runSceneMethod, (IMP)replacement_runWithMainScene);
+            bridge_log("  Swizzled UIApplication._runWithMainScene:transitionContext:completion:");
+        }
+
+        /* Also swizzle _run — this is the method called by UIApplicationMain
+           that initiates the FBSWorkspace connection BEFORE calling
+           _runWithMainScene:. By replacing _run, we skip the workspace
+           connection entirely and jump straight to our replacement. */
+        SEL runSel = sel_registerName("_run");
+        Method runMethod = class_getInstanceMethod(appClass, runSel);
+        if (runMethod) {
+            method_setImplementation(runMethod, (IMP)replacement_runWithMainScene);
+            /* Note: _run has signature void(id,SEL) but replacement_runWithMainScene
+               has extra params (scene, transitionContext, completion). The extra
+               params will be garbage but we don't use them when called via _run
+               because _callInitializationDelegatesForMainScene: is called with
+               nil scene anyway. */
+            bridge_log("  Swizzled UIApplication._run");
+        }
+    }
+
+    /* Prevent FBSWorkspace XPC connection from being initiated.
+       FBSWorkspaceClient connects to SpringBoard via XPC. When the connection
+       fails (no SpringBoard), it calls exit(0) on the XPC callback thread.
+       By preventing the connection, we avoid both the exit and the blocking
+       semaphore wait in scene creation.
+
+       Swizzle FBSWorkspaceClient init methods to return nil. */
+    {
+        Class fbsWsClientClass = objc_getClass("FBSWorkspaceClient");
+        if (fbsWsClientClass) {
+            const char *initSelNames[] = {
+                "initWithServiceName:endpoint:",
+                "initWithDelegate:",
+                NULL
+            };
+            for (int s = 0; initSelNames[s]; s++) {
+                SEL sel = sel_registerName(initSelNames[s]);
+                Method m = class_getInstanceMethod(fbsWsClientClass, sel);
+                if (m) {
+                    method_setImplementation(m, (IMP)_noopMethod);
+                    bridge_log("  Swizzled FBSWorkspaceClient.%s → nil", initSelNames[s]);
+                }
+            }
+        }
+
+        Class fbsWsClass = objc_getClass("FBSWorkspace");
+        if (fbsWsClass) {
+            SEL initSel = sel_registerName("init");
+            Method m = class_getInstanceMethod(fbsWsClass, initSel);
+            if (m) {
+                method_setImplementation(m, (IMP)_noopMethod);
+                bridge_log("  Swizzled FBSWorkspace.init → nil");
+            }
         }
     }
 
