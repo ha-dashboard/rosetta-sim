@@ -173,8 +173,10 @@ if [[ -n "$APP_BUNDLE" ]]; then
     export CFBundleExecutable="$(basename "$TARGET_BIN")"
     export NSBundlePath="$APP_BUNDLE"
     export CFProcessPath="$TARGET_BIN"
-    # Set the working directory inside the bundle for resource loading
     export SIMULATOR_LEGACY_ASSET_SUFFIX=""
+    # Disable CoreText auto-activation — without fontd running, the
+    # bundle-scoped font lookup fails. This forces direct file enumeration.
+    export __CTFontManagerDisableAutoActivation=1
 fi
 
 # ================================================================

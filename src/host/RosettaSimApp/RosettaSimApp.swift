@@ -4,9 +4,18 @@ import AppKit
 // MARK: - Framebuffer Constants (must match rosettasim_framebuffer.h)
 private let kFBMagic: UInt32     = 0x4D495352  // 'RSIM'
 private let kFBHeaderSize        = 64
+private let kFBInputSize         = 64
+private let kFBMetaSize          = 128  // header + input region
 private let kFBFlagFrameReady: UInt32 = 0x01
 private let kFBFlagAppRunning: UInt32 = 0x02
 private let kFBDefaultPath       = "/tmp/rosettasim_framebuffer"
+
+// Touch phase constants (must match rosettasim_framebuffer.h)
+private let kTouchPhaseNone: UInt32      = 0
+private let kTouchPhaseBegan: UInt32     = 1
+private let kTouchPhaseMoved: UInt32     = 2
+private let kTouchPhaseEnded: UInt32     = 3
+private let kTouchPhaseCancelled: UInt32 = 4
 
 // MARK: - Device Configuration
 struct DeviceConfig {
@@ -165,10 +174,10 @@ class FrameLoader: ObservableObject {
         defer { close(fd) }
 
         var st = stat()
-        guard fstat(fd, &st) == 0, st.st_size > kFBHeaderSize else { return false }
+        guard fstat(fd, &st) == 0, st.st_size > kFBMetaSize else { return false }
         mmapSize = Int(st.st_size)
 
-        let ptr = mmap(nil, mmapSize, PROT_READ, MAP_SHARED, fd, 0)
+        let ptr = mmap(nil, mmapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
         guard ptr != MAP_FAILED else { return false }
         mmapPtr = ptr
 
@@ -213,8 +222,8 @@ class FrameLoader: ObservableObject {
 
         guard width > 0, height > 0, stride > 0 else { return }
 
-        // Pixel data starts at offset kFBHeaderSize
-        let pixelPtr = ptr.advanced(by: kFBHeaderSize)
+        // Pixel data starts at offset kFBMetaSize (128 = header + input region)
+        let pixelPtr = ptr.advanced(by: kFBMetaSize)
         let dataSize = height * stride
 
         // Copy pixel data to avoid issues with the mmap being updated mid-read
@@ -272,6 +281,38 @@ class FrameLoader: ObservableObject {
         }
     }
 
+    /// Send a touch event to the shared framebuffer input region
+    func sendTouch(phase: UInt32, x: Float, y: Float) {
+        guard let ptr = mmapPtr else { return }
+
+        // Input region is at offset 64 (kFBHeaderSize)
+        let inputPtr = ptr.advanced(by: kFBHeaderSize)
+
+        // Increment touch counter (offset 0 in input region)
+        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
+        counterPtr.pointee += 1
+
+        // Write touch phase (offset 8)
+        let phasePtr = inputPtr.advanced(by: 8).assumingMemoryBound(to: UInt32.self)
+        phasePtr.pointee = phase
+
+        // Write x coordinate (offset 12)
+        let xPtr = inputPtr.advanced(by: 12).assumingMemoryBound(to: Float.self)
+        xPtr.pointee = x
+
+        // Write y coordinate (offset 16)
+        let yPtr = inputPtr.advanced(by: 16).assumingMemoryBound(to: Float.self)
+        yPtr.pointee = y
+
+        // Write touch ID (offset 20) - always 0 for primary touch
+        let idPtr = inputPtr.advanced(by: 20).assumingMemoryBound(to: UInt32.self)
+        idPtr.pointee = 0
+
+        // Write timestamp (offset 24)
+        let tsPtr = inputPtr.advanced(by: 24).assumingMemoryBound(to: UInt64.self)
+        tsPtr.pointee = mach_absolute_time()
+    }
+
     /// Load a single frame from a PNG file (legacy/fallback)
     func loadStaticFrame() {
         let pngPath = "/tmp/rosettasim_text.png"
@@ -303,6 +344,59 @@ class FrameLoader: ObservableObject {
     }
 }
 
+// MARK: - Touch-Enabled NSView
+class TouchableView: NSView {
+    var onTouch: ((UInt32, Float, Float) -> Void)?
+    var screenBounds: CGRect = .zero
+
+    override func mouseDown(with event: NSEvent) {
+        handleMouse(event, phase: kTouchPhaseBegan)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        handleMouse(event, phase: kTouchPhaseMoved)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        handleMouse(event, phase: kTouchPhaseEnded)
+    }
+
+    private func handleMouse(_ event: NSEvent, phase: UInt32) {
+        let location = convert(event.locationInWindow, from: nil)
+
+        // Convert to screen coordinates (0..375, 0..667)
+        guard screenBounds.width > 0, screenBounds.height > 0 else { return }
+
+        let x = Float((location.x - screenBounds.minX) / screenBounds.width * 375.0)
+        let y = Float((1.0 - (location.y - screenBounds.minY) / screenBounds.height) * 667.0)
+
+        // Clamp to screen bounds
+        let clampedX = max(0, min(375, x))
+        let clampedY = max(0, min(667, y))
+
+        onTouch?(phase, clampedX, clampedY)
+    }
+}
+
+// MARK: - TouchableViewRepresentable
+struct TouchableViewRepresentable: NSViewRepresentable {
+    @ObservedObject var frameLoader: FrameLoader
+    let screenBounds: CGRect
+
+    func makeNSView(context: Context) -> TouchableView {
+        let view = TouchableView()
+        view.onTouch = { [frameLoader] phase, x, y in
+            frameLoader.sendTouch(phase: phase, x: x, y: y)
+        }
+        view.screenBounds = screenBounds
+        return view
+    }
+
+    func updateNSView(_ nsView: TouchableView, context: Context) {
+        nsView.screenBounds = screenBounds
+    }
+}
+
 // MARK: - Device Chrome View
 struct DeviceChromeView: View {
     let device: DeviceConfig
@@ -319,29 +413,43 @@ struct DeviceChromeView: View {
             VStack(spacing: 0) {
                 Spacer().frame(height: 60)
 
-                if let frame = frameLoader.currentFrame {
-                    Image(nsImage: frame)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .frame(
-                            width: CGFloat(device.width),
-                            height: CGFloat(device.height)
+                ZStack {
+                    if let frame = frameLoader.currentFrame {
+                        Image(nsImage: frame)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .frame(
+                                width: CGFloat(device.width),
+                                height: CGFloat(device.height)
+                            )
+                            .background(Color.black)
+                            .cornerRadius(8)
+                    } else {
+                        Rectangle()
+                            .fill(Color.black)
+                            .frame(
+                                width: CGFloat(device.width),
+                                height: CGFloat(device.height)
+                            )
+                            .cornerRadius(8)
+                            .overlay(
+                                Text("No Frame")
+                                    .foregroundColor(.gray)
+                            )
+                    }
+
+                    // Overlay touchable view for mouse events
+                    GeometryReader { geometry in
+                        TouchableViewRepresentable(
+                            frameLoader: frameLoader,
+                            screenBounds: geometry.frame(in: .local)
                         )
-                        .background(Color.black)
-                        .cornerRadius(8)
-                } else {
-                    Rectangle()
-                        .fill(Color.black)
-                        .frame(
-                            width: CGFloat(device.width),
-                            height: CGFloat(device.height)
-                        )
-                        .cornerRadius(8)
-                        .overlay(
-                            Text("No Frame")
-                                .foregroundColor(.gray)
-                        )
+                    }
+                    .frame(
+                        width: CGFloat(device.width),
+                        height: CGFloat(device.height)
+                    )
                 }
 
                 Spacer().frame(height: 60)

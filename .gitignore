@@ -13,6 +13,7 @@ tests/phase4b_retina
 tests/phase4a_bootstrap_test
 tests/phase4a_bootstrap_fix
 tests/phase5_continuous
+tests/phase6_interactive
 
 # Host app build output
 src/host/RosettaSimApp/build/

@@ -694,6 +694,10 @@ static int setup_shared_framebuffer(void) {
     hdr->fps_target    = 30;
     hdr->flags         = ROSETTASIM_FB_FLAG_APP_RUNNING;
 
+    /* Initialize input region */
+    RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
+    memset(inp, 0, ROSETTASIM_FB_INPUT_SIZE);
+
     bridge_log("Shared framebuffer: %dx%d (%zu bytes) at %s", px_w, px_h, _fb_size, path);
     return 0;
 }
@@ -716,12 +720,104 @@ static void _force_display_recursive(id layer, int depth) {
     }
 }
 
+/* ================================================================
+ * Touch injection system
+ *
+ * Reads touch events from the input region (written by host app)
+ * and delivers them directly to UIViews by calling their touch
+ * methods (touchesBegan:withEvent:, etc).
+ * ================================================================ */
+
+typedef struct { double x, y; } _RSBridgeCGPoint;
+
+static void check_and_inject_touch(void) {
+    if (!_fb_mmap || !_bridge_root_window) return;
+
+    /* Read input region */
+    RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
+
+    /* Check if there's a new touch event */
+    static uint64_t last_touch_counter = 0;
+    uint64_t current_counter = inp->touch_counter;
+
+    if (current_counter == last_touch_counter) {
+        return; /* No new touch */
+    }
+    last_touch_counter = current_counter;
+
+    uint32_t phase = inp->touch_phase;
+    if (phase == ROSETTASIM_TOUCH_NONE) return;
+
+    /* Get touch coordinates in points */
+    _RSBridgeCGPoint location = { inp->touch_x, inp->touch_y };
+
+    /* Hit test to find the target view */
+    typedef id (*hitTest_fn)(id, SEL, _RSBridgeCGPoint, id);
+    SEL hitTestSel = sel_registerName("hitTest:withEvent:");
+    id targetView = ((hitTest_fn)objc_msgSend)(_bridge_root_window, hitTestSel, location, nil);
+
+    if (!targetView) {
+        targetView = _bridge_root_window; /* Fallback to root window */
+    }
+
+    /* Create a fake UITouch object via ObjC runtime.
+     * UITouch is not publicly instantiable, so we'll create a minimal
+     * object that responds to the expected methods. For simplicity,
+     * we'll directly call the view's touch methods with nil touches/event. */
+
+    /* Get UIApplication for event generation */
+    Class appClass = objc_getClass("UIApplication");
+    id app = ((id(*)(id, SEL))objc_msgSend)((id)appClass, sel_registerName("sharedApplication"));
+
+    /* Try to create an NSSet with a single touch placeholder.
+     * Since we can't easily create a UITouch, we'll call the view methods
+     * with minimal data. Many views check event.allTouches.anyObject,
+     * so we need at least a stub. */
+
+    /* Simplified approach: call the view methods directly with nil.
+     * Many simple views (buttons, etc) will still respond. */
+
+    SEL touchSel = 0;
+    if (phase == ROSETTASIM_TOUCH_BEGAN) {
+        touchSel = sel_registerName("touchesBegan:withEvent:");
+        bridge_log("Touch injection: BEGAN at (%.1f, %.1f) → view %p",
+                   location.x, location.y, (void *)targetView);
+    } else if (phase == ROSETTASIM_TOUCH_MOVED) {
+        touchSel = sel_registerName("touchesMoved:withEvent:");
+        bridge_log("Touch injection: MOVED at (%.1f, %.1f) → view %p",
+                   location.x, location.y, (void *)targetView);
+    } else if (phase == ROSETTASIM_TOUCH_ENDED) {
+        touchSel = sel_registerName("touchesEnded:withEvent:");
+        bridge_log("Touch injection: ENDED at (%.1f, %.1f) → view %p",
+                   location.x, location.y, (void *)targetView);
+    }
+
+    if (touchSel) {
+        /* Call the touch method on the target view.
+         * touches: empty NSSet (or nil)
+         * event: nil */
+        Class setClass = objc_getClass("NSSet");
+        id emptySet = ((id(*)(id, SEL))objc_msgSend)((id)setClass, sel_registerName("set"));
+
+        /* Check if view responds to selector before calling */
+        Class viewClass = object_getClass(targetView);
+        if (class_respondsToSelector(viewClass, touchSel)) {
+            ((void(*)(id, SEL, id, id))objc_msgSend)(targetView, touchSel, emptySet, nil);
+        } else {
+            bridge_log("  View does not respond to touch selector");
+        }
+    }
+}
+
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     if (!_bridge_root_window || !_fb_mmap) return;
     if (!_cg_CreateColorSpace || !_cg_CreateBitmap) return;
 
+    /* Check for and inject touch events from host */
+    check_and_inject_touch();
+
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
-    void *pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE;
+    void *pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_META_SIZE;
 
     int px_w = hdr->width;
     int px_h = hdr->height;
@@ -1074,6 +1170,48 @@ static void rosettasim_bridge_init(void) {
     bridge_log("Set screen globals: %.0fx%.0f @%.0fx",
                gsWidth ? *gsWidth : 0, gsHeight ? *gsHeight : 0,
                gsScale ? *gsScale : 0);
+
+    /* Register SDK system fonts with CTFontManager so they're available
+       regardless of bundle context. Without this, .app bundles fail to
+       render text because CoreText looks for fontd/font cache instead of
+       direct file enumeration. */
+    {
+        const char *root = getenv("IPHONE_SIMULATOR_ROOT");
+        if (!root) root = getenv("DYLD_ROOT_PATH");
+        if (root) {
+            typedef bool (*CTRegFn)(const void *, uint32_t, void **);
+            CTRegFn regFonts = (CTRegFn)dlsym(RTLD_DEFAULT,
+                "CTFontManagerRegisterFontsForURL");
+            typedef const void *(*CFURLCreateFn)(void *, const uint8_t *, long, bool);
+            CFURLCreateFn createURL = (CFURLCreateFn)dlsym(RTLD_DEFAULT,
+                "CFURLCreateFromFileSystemRepresentation");
+
+            if (regFonts && createURL) {
+                const char *dirs[] = {
+                    "/System/Library/Fonts",
+                    "/System/Library/Fonts/Core",
+                    "/System/Library/Fonts/CoreUI",
+                    "/System/Library/Fonts/CoreAddition",
+                    NULL
+                };
+                int registered = 0;
+                for (int d = 0; dirs[d]; d++) {
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s%s", root, dirs[d]);
+                    const void *url = createURL(NULL, (const uint8_t *)path,
+                        (long)strlen(path), true);
+                    if (url) {
+                        void *err = NULL;
+                        if (regFonts(url, 1 /* kCTFontManagerScopeProcess */, &err)) {
+                            registered++;
+                        }
+                        CFRelease(url);
+                    }
+                }
+                bridge_log("Registered %d font directories for process", registered);
+            }
+        }
+    }
 
     bridge_log("========================================");
 }
