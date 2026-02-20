@@ -1077,19 +1077,24 @@ static void check_and_inject_touch(void) {
 
             SEL sendEventSel = sel_registerName("sendEvent:");
 
-            /* Create UITouchesEvent (NOT UIEvent — UIApplication.sendEvent: checks
-               event type and routes UITouchesEvent through _sendTouchesForEvent:
-               which invokes UIControl tracking and gesture recognizers). */
-            Class eventClass = objc_getClass("UITouchesEvent");
-            if (!eventClass) eventClass = objc_getClass("UIEvent");
+            /* Create UIEvent for sendEvent: delivery.
+             * Note: UITouchesEvent._initWithEvent:touches: crashes in
+             * _sendTouchesForEvent: because internal _keyedTouchesByWindow
+             * isn't properly populated. Use base UIEvent which doesn't crash
+             * but may not route to UIControl tracking. UIControl handling
+             * is done in the direct delivery fallback below. */
+            Class eventClass = objc_getClass("UIEvent");
             id event = nil;
             if (eventClass) {
                 SEL eventInitSel = sel_registerName("_initWithEvent:touches:");
-                @try {
-                    event = ((id(*)(id, SEL, id, id))objc_msgSend)(
-                        ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
-                        eventInitSel, nil, touchSet);
-                } @catch (id e) { event = nil; }
+                if (class_respondsToSelector(object_getClass(eventClass), eventInitSel) ||
+                    class_respondsToSelector(eventClass, eventInitSel)) {
+                    @try {
+                        event = ((id(*)(id, SEL, id, id))objc_msgSend)(
+                            ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
+                            eventInitSel, nil, touchSet);
+                    } @catch (id e) { event = nil; }
+                }
             }
 
             /* Deliver: prefer sendEvent: if we have an event, otherwise direct */
@@ -1122,22 +1127,74 @@ static void check_and_inject_touch(void) {
     }
 
 direct_delivery:
-    /* ---- Approach 2: Direct touch method dispatch (fallback) ---- */
+    /* ---- Approach 2: Direct touch + UIControl tracking (fallback) ---- */
     bridge_log("  Direct delivery to %s", class_getName(object_getClass(targetView)));
+
+    /* Build touch set for delivery */
+    id touchSetForDelivery;
+    if (_bridge_current_touch) {
+        touchSetForDelivery = ((id(*)(id, SEL, id))objc_msgSend)(
+            (id)objc_getClass("NSSet"),
+            sel_registerName("setWithObject:"),
+            _bridge_current_touch);
+    } else {
+        touchSetForDelivery = ((id(*)(id, SEL))objc_msgSend)(
+            (id)objc_getClass("NSSet"), sel_registerName("set"));
+    }
+
+    /* Check if target is a UIControl subclass — needs tracking API */
+    Class uiControlClass = objc_getClass("UIControl");
+    int isControl = 0;
+    if (uiControlClass) {
+        Class check = object_getClass(targetView);
+        while (check) {
+            if (check == uiControlClass) { isControl = 1; break; }
+            check = class_getSuperclass(check);
+        }
+    }
+
+    if (isControl && _bridge_current_touch) {
+        /* UIControl tracking: beginTracking → endTracking → sendActions */
+        if (phase == ROSETTASIM_TOUCH_BEGAN) {
+            @try {
+                typedef bool (*trackFn)(id, SEL, id, id);
+                ((trackFn)objc_msgSend)(targetView,
+                    sel_registerName("beginTrackingWithTouch:withEvent:"),
+                    _bridge_current_touch, nil);
+                bridge_log("  UIControl beginTracking");
+            } @catch (id e) {
+                bridge_log("  UIControl beginTracking failed");
+            }
+        } else if (phase == ROSETTASIM_TOUCH_MOVED) {
+            @try {
+                typedef bool (*trackFn)(id, SEL, id, id);
+                ((trackFn)objc_msgSend)(targetView,
+                    sel_registerName("continueTrackingWithTouch:withEvent:"),
+                    _bridge_current_touch, nil);
+            } @catch (id e) { /* ignore */ }
+        } else if (phase == ROSETTASIM_TOUCH_ENDED) {
+            @try {
+                ((void(*)(id, SEL, id, id))objc_msgSend)(targetView,
+                    sel_registerName("endTrackingWithTouch:withEvent:"),
+                    _bridge_current_touch, nil);
+                bridge_log("  UIControl endTracking");
+            } @catch (id e) { /* ignore */ }
+
+            /* Fire touch-up-inside action (UIControlEventTouchUpInside = 1 << 6 = 64) */
+            @try {
+                ((void(*)(id, SEL, unsigned long))objc_msgSend)(targetView,
+                    sel_registerName("sendActionsForControlEvents:"), 64);
+                bridge_log("  UIControl sendActionsForControlEvents: TouchUpInside");
+            } @catch (id e) {
+                bridge_log("  UIControl sendActions failed");
+            }
+        }
+    }
+
+    /* Also deliver standard touchesBegan:/touchesMoved:/touchesEnded: */
     if (touchSel) {
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
-            /* Build touch set — include UITouch if we have one, otherwise empty */
-            id touchSetForDelivery;
-            if (_bridge_current_touch) {
-                touchSetForDelivery = ((id(*)(id, SEL, id))objc_msgSend)(
-                    (id)objc_getClass("NSSet"),
-                    sel_registerName("setWithObject:"),
-                    _bridge_current_touch);
-            } else {
-                touchSetForDelivery = ((id(*)(id, SEL))objc_msgSend)(
-                    (id)objc_getClass("NSSet"), sel_registerName("set"));
-            }
             @try {
                 ((void(*)(id, SEL, id, id))objc_msgSend)(
                     targetView, touchSel, touchSetForDelivery, nil);
