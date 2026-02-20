@@ -1375,6 +1375,16 @@ static void check_and_inject_touch(void) {
 
 /* direct_delivery: */
     /* ---- Approach 2: Direct touch + UIControl tracking (fallback) ---- */
+    /* Guard the direct delivery with SIGSEGV handler. UIKit internals called
+     * from here (e.g., UITextField.becomeFirstResponder → UIKeyboardImpl) may
+     * crash if keyboard infrastructure stubs are incomplete. */
+    _sendEvent_guard_active = 1;
+    int _direct_crash_sig = sigsetjmp(_sendEvent_recovery, 1);
+    if (_direct_crash_sig != 0) {
+        bridge_log("  Direct delivery CRASHED (signal %d) — continuing", _direct_crash_sig);
+        _sendEvent_guard_active = 0;
+        goto direct_delivery_done;
+    }
     bridge_log("  Direct delivery to %s", class_getName(object_getClass(targetView)));
 
     /* Build touch set for delivery */
@@ -1430,18 +1440,13 @@ static void check_and_inject_touch(void) {
         }
 
         if (isTextField) {
-            /* UITextField: becomeFirstResponder is now swizzled to avoid the
-               UITextInteractionAssistant gesture recognizer crash. Call it
-               to enter editing mode and fire delegate callbacks. */
-            if (phase == ROSETTASIM_TOUCH_BEGAN) {
-                @try {
-                    ((bool(*)(id, SEL))objc_msgSend)(controlTarget,
-                        sel_registerName("becomeFirstResponder"));
-                    bridge_log("  UITextField becomeFirstResponder (swizzled)");
-                } @catch (id e) {
-                    bridge_log("  UITextField becomeFirstResponder failed");
-                }
-            }
+            /* UITextField: do NOT call becomeFirstResponder explicitly.
+             * UIKit's real event pipeline (via sendEvent:) delivers touches
+             * to the UITextField, and its internal tap gesture recognizer
+             * fires becomeFirstResponder after ENDED. Calling it on BEGAN
+             * is premature and triggers keyboard infrastructure that crashes
+             * without backboardd (UIKeyboardImpl → UIInputWindowController). */
+            bridge_log("  UITextField touch — UIKit handles via gesture recognizer");
         } else if (isSegmented) {
             /* UISegmentedControl: needs special handling.
              * 1. Determine which segment was tapped via hit position
@@ -1587,6 +1592,10 @@ static void check_and_inject_touch(void) {
             }
         }
     }
+
+    _sendEvent_guard_active = 0;
+
+direct_delivery_done:
 
     /* Clean up on ENDED */
     if (phase == ROSETTASIM_TOUCH_ENDED) {
@@ -2777,9 +2786,40 @@ static void swizzle_bks_methods(void) {
     bridge_log("  UITextField.becomeFirstResponder NOT swizzled — using native");
 
     /* BKSEventFocusManager - event focus management */
+    /* Stub keyboard infrastructure — UITextField.becomeFirstResponder triggers
+       UIKeyboardImpl which creates UIInputWindowController which calls into
+       backboardd via BKSTextInputSessionManager. Stubbing these entry points
+       lets becomeFirstResponder complete without crashing. The keyboard window
+       is unnecessary — RosettaSim delivers keyboard input via mmap mechanism. */
+    {
+        Class kbImplClass = objc_getClass("UIKeyboardImpl");
+        if (kbImplClass) {
+            /* +[UIKeyboardImpl sharedInstance] — return nil to prevent keyboard init */
+            SEL sharedSel = sel_registerName("sharedInstance");
+            Method m = class_getClassMethod(kbImplClass, sharedSel);
+            if (m) {
+                method_setImplementation(m, (IMP)_noopMethod);
+                bridge_log("  Swizzled +[UIKeyboardImpl sharedInstance] → nil");
+            }
+        }
+
+        Class inputWCClass = objc_getClass("UIInputWindowController");
+        if (inputWCClass) {
+            SEL sharedSel = sel_registerName("sharedInputWindowController");
+            Method m = class_getClassMethod(inputWCClass, sharedSel);
+            if (m) {
+                method_setImplementation(m, (IMP)_noopMethod);
+                bridge_log("  Swizzled +[UIInputWindowController sharedInputWindowController] → nil");
+            }
+        }
+    }
+
+    /* Bulk-swizzle backboardd service classes — replace methods that
+       contact backboardd with no-ops */
     const char *classesToSwizzle[] = {
         "BKSEventFocusManager",
         "BKSAnimationFenceHandle",
+        "BKSTextInputSessionManager",
         NULL
     };
 
