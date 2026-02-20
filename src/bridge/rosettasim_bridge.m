@@ -373,12 +373,14 @@ static void replacement_exit(int status) {
          * only THIS thread (the XPC callback thread) using pthread_exit().
          * The main thread continues UIApplicationMain initialization. */
         if (!pthread_main_np()) {
-            bridge_log("  Blocking XPC callback thread (workspace disconnect expected)");
-            /* Don't kill the thread — pthread_exit can corrupt shared state.
-             * Instead, block it forever. This is safe because it's just the
-             * XPC dispatch queue thread for the dead workspace connection. */
-            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            bridge_log("  Suspending XPC callback thread (workspace disconnect expected)");
+            /* Block this thread using select() on no FDs — this sleeps the thread
+             * without blocking GCD's dispatch queue (dispatch_semaphore_wait causes
+             * GCD to detect a blocked worker and kill the process). */
+            while (1) {
+                struct timeval tv = { .tv_sec = 86400, .tv_usec = 0 };
+                select(0, NULL, NULL, NULL, &tv);
+            }
             /* not reached */
         }
         /* If we're on the main thread, use longjmp if guard is active */
