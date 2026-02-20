@@ -80,9 +80,9 @@ void outf(const char *fmt, ...) {
     self.window = window;
     outf("UIWindow created: %p\n", (__bridge void *)window);
 
-    /* ---- Window visibility (UIWindow defaults to hidden=YES, unlike UIView) ---- */
-    ((void(*)(id, SEL, bool))objc_msgSend)(window, sel_registerName("setHidden:"), false);
-    ((void(*)(id, SEL, bool))objc_msgSend)(window, sel_registerName("setOpaque:"), true);
+    /* NOTE: Do NOT call setHidden:NO on UIWindow here — with sharedApplication
+       fixed, UIKit triggers BKSEventFocusManager which needs backboardd.
+       Instead, the bridge sets hidden=NO on the CALayer directly before rendering. */
 
     /* ---- Dark background ---- */
     id bgColor = ((id(*)(id, SEL, double, double, double, double))objc_msgSend)(

@@ -379,23 +379,69 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
 
             /* Try common UIKit internal globals */
             const char *globals[] = {
-                "_UIApp", "UIApp", "__sharedApplication",
+                "UIApp", "_UIApp", "__sharedApplication",
                 "_sharedApplication", NULL
             };
             for (int i = 0; globals[i]; i++) {
                 id *ptr = (id *)dlsym(RTLD_DEFAULT, globals[i]);
-                if (ptr && *ptr) {
-                    app = *ptr;
-                    bridge_log("  Found via %s: %p", globals[i], (void *)app);
-                    break;
+                if (ptr) {
+                    bridge_log("  dlsym(%s) → %p, value=%p", globals[i], (void *)ptr, (void *)*ptr);
+                    if (*ptr) {
+                        app = *ptr;
+                        bridge_log("  Found app via %s: %p", globals[i], (void *)app);
+                        break;
+                    }
                 }
             }
 
             if (!app) {
-                /* Last resort: scan ObjC runtime for UIApplication instances */
-                bridge_log("  Globals not found, checking if init would work...");
-                bridge_log("  NOTE: UIApplication exists (init asserts 'only one')");
-                bridge_log("  Skipping UIApplication creation - proceeding without app ref");
+                bridge_log("  _UIApp is nil after longjmp — attempting recovery...");
+
+                /* Strategy: [UIApplication alloc] may return the existing singleton
+                   (NSObject's allocWithZone: for singleton classes). If it does,
+                   we can set _UIApp ourselves and fix sharedApplication. */
+
+                /* First try: catch the "only one" exception from alloc+init */
+                @try {
+                    id attempt = ((id(*)(id, SEL))objc_msgSend)(
+                        ((id(*)(id, SEL))objc_msgSend)((id)appClass, sel_registerName("alloc")),
+                        sel_registerName("init"));
+                    if (attempt) {
+                        app = attempt;
+                        bridge_log("  Recovered app via alloc+init: %p", (void *)app);
+                    }
+                } @catch (id exception) {
+                    /* "Only one UIApplication" assertion thrown as NSException.
+                       The alloc succeeded but init failed. The alloc result
+                       IS the existing singleton — grab it from the exception context. */
+                    bridge_log("  Caught 'only one' exception — expected");
+
+                    /* Try: call alloc alone (without init). If alloc returns the
+                       existing instance, we have our pointer. */
+                    id allocResult = ((id(*)(id, SEL))objc_msgSend)(
+                        (id)appClass, sel_registerName("alloc"));
+                    if (allocResult) {
+                        app = allocResult;
+                        bridge_log("  Got app from alloc (post-exception): %p", (void *)app);
+                    }
+                }
+
+                /* If we found the app, set _UIApp so sharedApplication works */
+                if (app) {
+                    id *uiAppPtr = (id *)dlsym(RTLD_DEFAULT, "UIApp");
+                    if (uiAppPtr) {
+                        *uiAppPtr = app;
+                        bridge_log("  Set _UIApp = %p (sharedApplication should work now)", (void *)app);
+
+                        /* Verify */
+                        id verify = ((id(*)(id, SEL))objc_msgSend)(
+                            (id)appClass, sel_registerName("sharedApplication"));
+                        bridge_log("  Verify sharedApplication: %p", (void *)verify);
+                    }
+                } else {
+                    bridge_log("  Could not recover UIApplication instance");
+                    bridge_log("  Proceeding without app ref");
+                }
             }
         } else {
             bridge_log("  UIApplication.sharedApplication: %p", (void *)app);
@@ -445,8 +491,28 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                     if (check == uiAppClass) { isAppClass = 1; break; }
                     check = class_getSuperclass(check);
                 }
-                if (isAppClass) {
-                    bridge_log("  %s is UIApplication or subclass — skipping alloc/init", delName);
+                if (isAppClass && app) {
+                    /* The existing UIApplication IS the principal class (e.g.
+                       PreferencesAppController). Use it as its own delegate —
+                       UIApplication subclasses often conform to UIApplicationDelegate. */
+                    bridge_log("  %s is UIApplication subclass — using existing app as delegate", delName);
+                    _bridge_delegate = app;
+                    ((id(*)(id, SEL))objc_msgSend)(app, sel_registerName("retain"));
+                    ((void(*)(id, SEL, id))objc_msgSend)(app, sel_registerName("setDelegate:"), app);
+                    bridge_log("  App set as its own delegate: %p", (void *)app);
+
+                    /* Call didFinishLaunchingWithOptions: */
+                    SEL didFinishSel = sel_registerName("application:didFinishLaunchingWithOptions:");
+                    Class appObjClass = object_getClass(app);
+                    if (class_respondsToSelector(appObjClass, didFinishSel)) {
+                        bridge_log("  Calling %s application:didFinishLaunchingWithOptions:", delName);
+                        ((void(*)(id, SEL, id, id))objc_msgSend)(app, didFinishSel, app, nil);
+                    } else {
+                        bridge_log("  %s does not respond to didFinishLaunchingWithOptions:", delName);
+                    }
+                    delClass = NULL; /* Skip the normal alloc/init path */
+                } else if (isAppClass) {
+                    bridge_log("  %s is UIApplication subclass but no app ref — skipping", delName);
                     delClass = NULL;
                 }
             }
@@ -663,6 +729,10 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         _bridge_root_window, sel_registerName("layer"));
     if (!layer) return;
 
+    /* Ensure root layer is visible (set on CALayer, not UIView, to avoid
+       triggering UIKit's BKSEventFocusManager which needs backboardd) */
+    ((void(*)(id, SEL, bool))objc_msgSend)(layer, sel_registerName("setHidden:"), false);
+
     /* Flush pending CATransaction changes (no CARenderServer to do this) */
     Class caTransaction = objc_getClass("CATransaction");
     if (caTransaction) {
@@ -721,9 +791,9 @@ static void find_root_window(id delegate) {
             if (window) {
                 /* Retain to prevent deallocation (bridge is MRR) */
                 ((id(*)(id, SEL))objc_msgSend)(window, sel_registerName("retain"));
-                /* UIWindow defaults hidden=YES; ensure visible for rendering */
-                ((void(*)(id, SEL, bool))objc_msgSend)(
-                    window, sel_registerName("setHidden:"), false);
+                /* NOTE: Don't call setHidden:NO on UIWindow — it triggers
+                   BKSEventFocusManager. The bridge sets hidden=NO on the
+                   CALayer in frame_capture_tick instead. */
                 _bridge_root_window = window;
                 bridge_log("  Root window from delegate.window: %p", (void *)window);
                 return;
@@ -763,9 +833,6 @@ static void find_root_window(id delegate) {
                 (id)objc_getClass("UIColor"), sel_registerName("whiteColor"));
             ((void(*)(id, SEL, id))objc_msgSend)(
                 window, sel_registerName("setBackgroundColor:"), white);
-            /* UIWindow defaults hidden=YES; must unhide for rendering */
-            ((void(*)(id, SEL, bool))objc_msgSend)(
-                window, sel_registerName("setHidden:"), false);
             /* No need to retain - we own it from alloc */
             _bridge_root_window = window;
             bridge_log("  Created default root window: %p", (void *)window);
@@ -902,6 +969,62 @@ static void fix_bootstrap_port(void) {
     }
 }
 
+/* ================================================================
+ * BackBoardServices method swizzling
+ *
+ * With sharedApplication fixed, UIKit activates more code paths that
+ * call into BKSEventFocusManager and other BBS classes. These assert
+ * when backboardd is unavailable. Swizzle them to no-ops.
+ * ================================================================ */
+
+static void _noopMethod(id self, SEL _cmd, ...) {
+    /* Silently no-op */
+}
+
+static void swizzle_bks_methods(void) {
+    /* BKSEventFocusManager - event focus management */
+    const char *classesToSwizzle[] = {
+        "BKSEventFocusManager",
+        "BKSAnimationFenceHandle",
+        NULL
+    };
+
+    for (int c = 0; classesToSwizzle[c]; c++) {
+        Class cls = objc_getClass(classesToSwizzle[c]);
+        if (!cls) continue;
+
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        if (!methods) continue;
+
+        for (unsigned int i = 0; i < methodCount; i++) {
+            /* Replace all methods that might call into backboardd */
+            SEL sel = method_getName(methods[i]);
+            const char *name = sel_getName(sel);
+            /* Only swizzle methods that look like they'd contact backboardd */
+            if (strstr(name, "defer") || strstr(name, "Defer") ||
+                strstr(name, "register") || strstr(name, "fence") ||
+                strstr(name, "invalidate") || strstr(name, "client")) {
+                method_setImplementation(methods[i], (IMP)_noopMethod);
+            }
+        }
+        free(methods);
+        bridge_log("  Swizzled %s backboardd-calling methods", classesToSwizzle[c]);
+    }
+}
+
+/* Global exception handler — log and survive non-critical assertions */
+static void _rsim_exception_handler(id exception) {
+    SEL reasonSel = sel_registerName("reason");
+    id reason = ((id(*)(id, SEL))objc_msgSend)(exception, reasonSel);
+    if (reason) {
+        const char *str = ((const char *(*)(id, SEL))objc_msgSend)(
+            reason, sel_registerName("UTF8String"));
+        bridge_log("CAUGHT EXCEPTION: %s", str ? str : "(null)");
+    }
+    /* Don't re-throw — allow the process to continue */
+}
+
 __attribute__((constructor))
 static void rosettasim_bridge_init(void) {
     bridge_log("========================================");
@@ -921,6 +1044,16 @@ static void rosettasim_bridge_init(void) {
 
     /* Fix bootstrap port (old dyld_sim doesn't set global) */
     fix_bootstrap_port();
+
+    /* Swizzle BackBoardServices methods that crash without backboardd */
+    swizzle_bks_methods();
+
+    /* Set global exception handler for non-critical assertion failures */
+    typedef void (*ExHandler)(id);
+    ExHandler (*setHandler)(ExHandler) = dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+    if (setHandler) {
+        setHandler(_rsim_exception_handler);
+    }
 
     /* Set screen dimension globals directly in GraphicsServices.
        These are exported data symbols that UIScreen reads.
