@@ -63,7 +63,8 @@ typedef struct __attribute__((packed)) {
     uint64_t touch_timestamp; /* mach_absolute_time() of the touch */
     uint32_t key_code;        /* Key code (0 = none) */
     uint32_t key_flags;       /* Modifier flags */
-    uint32_t _reserved[4];    /* Pad to 64 bytes */
+    uint32_t key_char;        /* UTF-8 character (first byte, 0 = none) */
+    uint32_t _reserved[3];    /* Pad to 64 bytes */
 } RosettaSimInputRegion;
 
 /* Total mmap size: header + input + pixel data */

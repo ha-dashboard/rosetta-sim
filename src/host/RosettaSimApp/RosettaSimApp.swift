@@ -321,6 +321,34 @@ class FrameLoader: ObservableObject {
         tsPtr.pointee = mach_absolute_time()
     }
 
+    /// Send a key event to the shared framebuffer input region
+    func sendKeyEvent(keyCode: UInt16, modifierFlags: UInt32, character: Character?) {
+        guard let ptr = mmapPtr else { return }
+
+        // Input region is at offset 64 (kFBHeaderSize)
+        let inputPtr = ptr.advanced(by: kFBHeaderSize)
+
+        // Write key_code (offset 32 in input region = after touch fields)
+        let keyCodePtr = inputPtr.advanced(by: 32).assumingMemoryBound(to: UInt32.self)
+        keyCodePtr.pointee = UInt32(keyCode)
+
+        // Write key_flags (offset 36 in input region)
+        let keyFlagsPtr = inputPtr.advanced(by: 36).assumingMemoryBound(to: UInt32.self)
+        keyFlagsPtr.pointee = modifierFlags
+
+        // Write key_char (offset 40 in input region) - first UTF-8 scalar value
+        let keyCharPtr = inputPtr.advanced(by: 40).assumingMemoryBound(to: UInt32.self)
+        if let ch = character {
+            keyCharPtr.pointee = UInt32(ch.unicodeScalars.first?.value ?? 0)
+        } else {
+            keyCharPtr.pointee = 0
+        }
+
+        // Increment touch counter (offset 0 in input region) to signal new event
+        let counterPtr = inputPtr.assumingMemoryBound(to: UInt64.self)
+        counterPtr.pointee += 1
+    }
+
     /// Load a single frame from a PNG file (legacy/fallback)
     func loadStaticFrame() {
         let pngPath = "/tmp/rosettasim_text.png"
@@ -357,6 +385,7 @@ class FrameLoader: ObservableObject {
 /// This replaces the SwiftUI Image + overlay approach which blocked mouse events.
 class SimulatorDisplayView: NSView {
     var onTouch: ((UInt32, Float, Float) -> Void)?
+    var onKeyEvent: ((UInt16, UInt32, Character?) -> Void)?
     var displayFrameCounter: UInt64 = 0
     var displayImage: CGImage? {
         didSet { needsDisplay = true }
@@ -364,6 +393,22 @@ class SimulatorDisplayView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        let keyCode = event.keyCode
+        let modifiers = UInt32(event.modifierFlags.rawValue & 0xFFFF0000) >> 16
+
+        // Get the character from the event
+        let character: Character?
+        if let chars = event.characters, !chars.isEmpty {
+            character = chars.first
+        } else {
+            character = nil
+        }
+
+        onKeyEvent?(keyCode, modifiers, character)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let bounds = self.bounds
@@ -422,6 +467,9 @@ struct SimulatorDisplayRepresentable: NSViewRepresentable {
         let view = SimulatorDisplayView()
         view.onTouch = { [frameLoader] phase, x, y in
             frameLoader.sendTouch(phase: phase, x: x, y: y)
+        }
+        view.onKeyEvent = { [frameLoader] keyCode, modifiers, character in
+            frameLoader.sendKeyEvent(keyCode: keyCode, modifierFlags: modifiers, character: character)
         }
         return view
     }

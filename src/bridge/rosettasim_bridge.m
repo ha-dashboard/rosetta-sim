@@ -1069,46 +1069,14 @@ static void check_and_inject_touch(void) {
                     sel_registerName("setIsTap:"), true);
             } @catch (id e) { /* fall through */ }
 
-            /* Build touch set for event */
-            id touchSet = ((id(*)(id, SEL, id))objc_msgSend)(
-                (id)objc_getClass("NSSet"),
-                sel_registerName("setWithObject:"),
-                _bridge_current_touch);
-
-            SEL sendEventSel = sel_registerName("sendEvent:");
-
-            /* Create UIEvent for sendEvent: delivery.
-             * Note: UITouchesEvent._initWithEvent:touches: crashes in
-             * _sendTouchesForEvent: because internal _keyedTouchesByWindow
-             * isn't properly populated. Use base UIEvent which doesn't crash
-             * but may not route to UIControl tracking. UIControl handling
-             * is done in the direct delivery fallback below. */
-            Class eventClass = objc_getClass("UIEvent");
-            id event = nil;
-            if (eventClass) {
-                SEL eventInitSel = sel_registerName("_initWithEvent:touches:");
-                if (class_respondsToSelector(object_getClass(eventClass), eventInitSel) ||
-                    class_respondsToSelector(eventClass, eventInitSel)) {
-                    @try {
-                        event = ((id(*)(id, SEL, id, id))objc_msgSend)(
-                            ((id(*)(id, SEL))objc_msgSend)((id)eventClass, sel_registerName("alloc")),
-                            eventInitSel, nil, touchSet);
-                    } @catch (id e) { event = nil; }
-                }
-            }
-
-            /* Deliver: prefer sendEvent: if we have an event, otherwise direct */
-            if (event && app) {
-                bridge_log("  Delivering via [UIApplication sendEvent:]");
-                @try {
-                    ((void(*)(id, SEL, id))objc_msgSend)(app, sendEventSel, event);
-                } @catch (id e) {
-                    bridge_log("  sendEvent: failed, falling back to direct delivery");
-                    goto direct_delivery;
-                }
-            } else {
-                goto direct_delivery;
-            }
+            /* NOTE: [UIApplication sendEvent:] with UITouchesEvent crashes with
+             * EXC_BAD_ACCESS in _sendTouchesForEvent: because _keyedTouchesByWindow
+             * is never properly populated without a real HID event source. Both
+             * fresh alloc/init AND singleton _touchesEvent + reinit crash identically
+             * (KERN_INVALID_ADDRESS at 0x8 = NULL deref). Since SIGSEGV is not
+             * catchable with @try/@catch, we go directly to the manual delivery path
+             * which handles UIControl, UITextField, and custom touch views. */
+            goto direct_delivery;
 
             /* Clean up on ENDED */
             if (phase == ROSETTASIM_TOUCH_ENDED) {
@@ -1142,56 +1110,132 @@ direct_delivery:
             (id)objc_getClass("NSSet"), sel_registerName("set"));
     }
 
-    /* Check if target is a UIControl subclass — needs tracking API */
+    /* Walk up the responder chain to find the nearest UIControl ancestor
+     * if the direct target doesn't handle the touch. This handles cases
+     * where the hit test lands on a UILabel/UIImageView inside a UIButton. */
     Class uiControlClass = objc_getClass("UIControl");
-    int isControl = 0;
+    id controlTarget = nil;
     if (uiControlClass) {
-        Class check = object_getClass(targetView);
-        while (check) {
-            if (check == uiControlClass) { isControl = 1; break; }
-            check = class_getSuperclass(check);
+        id walk = targetView;
+        while (walk) {
+            Class walkClass = object_getClass(walk);
+            Class check = walkClass;
+            while (check) {
+                if (check == uiControlClass) { controlTarget = walk; break; }
+                check = class_getSuperclass(check);
+            }
+            if (controlTarget) break;
+            /* Walk up via superview */
+            walk = ((id(*)(id, SEL))objc_msgSend)(walk, sel_registerName("superview"));
         }
     }
 
-    if (isControl && _bridge_current_touch) {
-        /* UIControl tracking: beginTracking → endTracking → sendActions */
-        if (phase == ROSETTASIM_TOUCH_BEGAN) {
-            @try {
-                typedef bool (*trackFn)(id, SEL, id, id);
-                ((trackFn)objc_msgSend)(targetView,
-                    sel_registerName("beginTrackingWithTouch:withEvent:"),
-                    _bridge_current_touch, nil);
-                bridge_log("  UIControl beginTracking");
-            } @catch (id e) {
-                bridge_log("  UIControl beginTracking failed");
-            }
-        } else if (phase == ROSETTASIM_TOUCH_MOVED) {
-            @try {
-                typedef bool (*trackFn)(id, SEL, id, id);
-                ((trackFn)objc_msgSend)(targetView,
-                    sel_registerName("continueTrackingWithTouch:withEvent:"),
-                    _bridge_current_touch, nil);
-            } @catch (id e) { /* ignore */ }
-        } else if (phase == ROSETTASIM_TOUCH_ENDED) {
-            @try {
-                ((void(*)(id, SEL, id, id))objc_msgSend)(targetView,
-                    sel_registerName("endTrackingWithTouch:withEvent:"),
-                    _bridge_current_touch, nil);
-                bridge_log("  UIControl endTracking");
-            } @catch (id e) { /* ignore */ }
+    if (controlTarget && _bridge_current_touch) {
+        const char *ctrlName = class_getName(object_getClass(controlTarget));
+        bridge_log("  UIControl found: %s %p", ctrlName, (void *)controlTarget);
 
-            /* Fire touch-up-inside action (UIControlEventTouchUpInside = 1 << 6 = 64) */
-            @try {
-                ((void(*)(id, SEL, unsigned long))objc_msgSend)(targetView,
-                    sel_registerName("sendActionsForControlEvents:"), 64);
-                bridge_log("  UIControl sendActionsForControlEvents: TouchUpInside");
-            } @catch (id e) {
-                bridge_log("  UIControl sendActions failed");
+        /* Check specific UIControl subclass types for specialized handling */
+        Class uiTextFieldClass = objc_getClass("UITextField");
+        Class uiButtonClass = objc_getClass("UIButton");
+        Class uiSegmentedControlClass = objc_getClass("UISegmentedControl");
+
+        int isTextField = 0, isButton = 0, isSegmented = 0;
+        {
+            Class c = object_getClass(controlTarget);
+            while (c) {
+                if (uiTextFieldClass && c == uiTextFieldClass) isTextField = 1;
+                if (uiButtonClass && c == uiButtonClass) isButton = 1;
+                if (uiSegmentedControlClass && c == uiSegmentedControlClass) isSegmented = 1;
+                c = class_getSuperclass(c);
+            }
+        }
+
+        if (isTextField) {
+            /* UITextField: becomeFirstResponder crashes because
+               UITextInteractionAssistant.setGestureRecognizers tries to
+               removeGestureRecognizer: on nil (gesture environment not initialized
+               without backboardd). Skip becomeFirstResponder for now — just deliver
+               the touch event to the text field. Keyboard input is handled via the
+               mmap key_code/key_char mechanism instead. */
+            bridge_log("  UITextField touched (becomeFirstResponder skipped — crashes without gesture env)");
+        } else if (isButton || isSegmented) {
+            /* UIButton / UISegmentedControl: highlight + tracking API */
+            if (phase == ROSETTASIM_TOUCH_BEGAN) {
+                @try {
+                    ((void(*)(id, SEL, bool))objc_msgSend)(controlTarget,
+                        sel_registerName("setHighlighted:"), true);
+                    typedef bool (*trackFn)(id, SEL, id, id);
+                    ((trackFn)objc_msgSend)(controlTarget,
+                        sel_registerName("beginTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                    bridge_log("  UIButton/Segmented setHighlighted:YES + beginTracking");
+                } @catch (id e) {
+                    bridge_log("  UIButton/Segmented beginTracking failed");
+                }
+            } else if (phase == ROSETTASIM_TOUCH_MOVED) {
+                @try {
+                    typedef bool (*trackFn)(id, SEL, id, id);
+                    ((trackFn)objc_msgSend)(controlTarget,
+                        sel_registerName("continueTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                } @catch (id e) { /* ignore */ }
+            } else if (phase == ROSETTASIM_TOUCH_ENDED) {
+                @try {
+                    ((void(*)(id, SEL, id, id))objc_msgSend)(controlTarget,
+                        sel_registerName("endTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                    /* Fire touch-up-inside (UIControlEventTouchUpInside = 1 << 6 = 64) */
+                    ((void(*)(id, SEL, unsigned long))objc_msgSend)(controlTarget,
+                        sel_registerName("sendActionsForControlEvents:"), 64);
+                    ((void(*)(id, SEL, bool))objc_msgSend)(controlTarget,
+                        sel_registerName("setHighlighted:"), false);
+                    bridge_log("  UIButton/Segmented endTracking + sendActions + setHighlighted:NO");
+                } @catch (id e) {
+                    bridge_log("  UIButton/Segmented endTracking failed");
+                }
+            }
+        } else {
+            /* Generic UIControl: standard tracking API */
+            if (phase == ROSETTASIM_TOUCH_BEGAN) {
+                @try {
+                    typedef bool (*trackFn)(id, SEL, id, id);
+                    ((trackFn)objc_msgSend)(controlTarget,
+                        sel_registerName("beginTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                    bridge_log("  UIControl beginTracking");
+                } @catch (id e) {
+                    bridge_log("  UIControl beginTracking failed");
+                }
+            } else if (phase == ROSETTASIM_TOUCH_MOVED) {
+                @try {
+                    typedef bool (*trackFn)(id, SEL, id, id);
+                    ((trackFn)objc_msgSend)(controlTarget,
+                        sel_registerName("continueTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                } @catch (id e) { /* ignore */ }
+            } else if (phase == ROSETTASIM_TOUCH_ENDED) {
+                @try {
+                    ((void(*)(id, SEL, id, id))objc_msgSend)(controlTarget,
+                        sel_registerName("endTrackingWithTouch:withEvent:"),
+                        _bridge_current_touch, nil);
+                    bridge_log("  UIControl endTracking");
+                } @catch (id e) { /* ignore */ }
+
+                /* Fire touch-up-inside (UIControlEventTouchUpInside = 1 << 6 = 64) */
+                @try {
+                    ((void(*)(id, SEL, unsigned long))objc_msgSend)(controlTarget,
+                        sel_registerName("sendActionsForControlEvents:"), 64);
+                    bridge_log("  UIControl sendActionsForControlEvents: TouchUpInside");
+                } @catch (id e) {
+                    bridge_log("  UIControl sendActions failed");
+                }
             }
         }
     }
 
-    /* Also deliver standard touchesBegan:/touchesMoved:/touchesEnded: */
+    /* Also deliver standard touchesBegan:/touchesMoved:/touchesEnded: to the
+     * original hit-test target (even if we found a UIControl ancestor above).
+     * This ensures custom touch handlers still fire. */
     if (touchSel) {
         Class viewClass = object_getClass(targetView);
         if (class_respondsToSelector(viewClass, touchSel)) {
@@ -1216,6 +1260,216 @@ direct_delivery:
             _bridge_current_event = nil;
         }
         _bridge_touch_target_view = nil;
+    }
+}
+
+/* ================================================================
+ * Keyboard injection system
+ *
+ * Reads key events from the input region (written by host app)
+ * and delivers them to the first responder via insertText: or
+ * specialized methods for special keys (Return, Backspace, Tab).
+ *
+ * The host writes key_code, key_flags, and key_char into the
+ * input region and increments touch_counter to signal a new event.
+ * ================================================================ */
+
+static uint32_t _last_key_code = 0;
+
+static void check_and_inject_keyboard(void) {
+    if (!_fb_mmap || !_bridge_root_window) return;
+
+    RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
+
+    uint32_t key_code = inp->key_code;
+    if (key_code == 0) return; /* No pending key event */
+
+    uint32_t key_flags = inp->key_flags;
+    uint32_t key_char = inp->key_char;
+
+    /* Clear key_code immediately to acknowledge processing */
+    inp->key_code = 0;
+    inp->key_flags = 0;
+    inp->key_char = 0;
+    __sync_synchronize();
+
+    bridge_log("Keyboard event: code=%u flags=0x%x char=0x%x ('%c')",
+               key_code, key_flags, key_char,
+               (key_char >= 32 && key_char < 127) ? (char)key_char : '?');
+
+    /* Schedule force-display after keyboard input to capture UI changes */
+    _mark_display_dirty();
+
+    /* Find the first responder.
+     * Try [UIApplication _firstResponder] first (private API),
+     * then walk from keyWindow. */
+    Class appClass = objc_getClass("UIApplication");
+    id app = appClass ? ((id(*)(id, SEL))objc_msgSend)(
+        (id)appClass, sel_registerName("sharedApplication")) : nil;
+    if (!app) return;
+
+    id firstResponder = nil;
+
+    /* Try _firstResponder (private, may not exist on all versions) */
+    SEL firstRespSel = sel_registerName("_firstResponder");
+    if (class_respondsToSelector(object_getClass(app), firstRespSel)) {
+        @try {
+            firstResponder = ((id(*)(id, SEL))objc_msgSend)(app, firstRespSel);
+        } @catch (id e) { firstResponder = nil; }
+    }
+
+    /* Fallback: get keyWindow's firstResponder via the responder chain */
+    if (!firstResponder) {
+        id keyWindow = _bridge_root_window;
+        if (keyWindow) {
+            SEL frSel = sel_registerName("firstResponder");
+            if (class_respondsToSelector(object_getClass(keyWindow), frSel)) {
+                @try {
+                    firstResponder = ((id(*)(id, SEL))objc_msgSend)(keyWindow, frSel);
+                } @catch (id e) { firstResponder = nil; }
+            }
+        }
+    }
+
+    if (!firstResponder) {
+        bridge_log("  No first responder found for keyboard input");
+        return;
+    }
+
+    bridge_log("  First responder: %s %p",
+               class_getName(object_getClass(firstResponder)),
+               (void *)firstResponder);
+
+    /* Check if first responder is a UITextField or UITextView */
+    Class uiTextFieldClass = objc_getClass("UITextField");
+    Class uiTextViewClass = objc_getClass("UITextView");
+    int isTextInput = 0;
+    {
+        Class c = object_getClass(firstResponder);
+        while (c) {
+            if ((uiTextFieldClass && c == uiTextFieldClass) ||
+                (uiTextViewClass && c == uiTextViewClass)) {
+                isTextInput = 1;
+                break;
+            }
+            c = class_getSuperclass(c);
+        }
+    }
+
+    /* Also check if the responder conforms to UITextInput/UIKeyInput
+     * by checking for insertText: */
+    SEL insertTextSel = sel_registerName("insertText:");
+    int hasInsertText = class_respondsToSelector(
+        object_getClass(firstResponder), insertTextSel);
+
+    /* Handle special keys */
+    /* Common key codes (macOS virtual key codes):
+     *   36 = Return
+     *   51 = Delete (Backspace)
+     *   48 = Tab
+     *   53 = Escape
+     *   123 = Left arrow
+     *   124 = Right arrow
+     *   125 = Down arrow
+     *   126 = Up arrow
+     */
+    if (key_code == 51) {
+        /* Backspace / Delete */
+        SEL deleteBackSel = sel_registerName("deleteBackward");
+        if (class_respondsToSelector(object_getClass(firstResponder), deleteBackSel)) {
+            @try {
+                ((void(*)(id, SEL))objc_msgSend)(firstResponder, deleteBackSel);
+                bridge_log("  Delivered deleteBackward");
+            } @catch (id e) {
+                bridge_log("  deleteBackward failed");
+            }
+        } else if (hasInsertText) {
+            /* Some text inputs don't have deleteBackward — try deleteBackward: */
+            SEL deleteBackAltSel = sel_registerName("deleteBackward:");
+            if (class_respondsToSelector(object_getClass(firstResponder), deleteBackAltSel)) {
+                @try {
+                    ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, deleteBackAltSel, nil);
+                    bridge_log("  Delivered deleteBackward:");
+                } @catch (id e) { /* ignore */ }
+            }
+        }
+        return;
+    }
+
+    if (key_code == 36) {
+        /* Return key */
+        if (isTextInput && hasInsertText) {
+            /* For UITextField, Return typically ends editing.
+             * Check if it's a UITextField and resign first responder. */
+            if (uiTextFieldClass) {
+                Class c = object_getClass(firstResponder);
+                int isTF = 0;
+                while (c) {
+                    if (c == uiTextFieldClass) { isTF = 1; break; }
+                    c = class_getSuperclass(c);
+                }
+                if (isTF) {
+                    @try {
+                        ((bool(*)(id, SEL))objc_msgSend)(firstResponder,
+                            sel_registerName("resignFirstResponder"));
+                        bridge_log("  UITextField resignFirstResponder (Return)");
+                    } @catch (id e) { /* ignore */ }
+                    return;
+                }
+            }
+            /* For UITextView, insert a newline */
+            @try {
+                id newline = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                    (id)objc_getClass("NSString"),
+                    sel_registerName("stringWithUTF8String:"), "\n");
+                ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, newline);
+                bridge_log("  Delivered insertText: newline");
+            } @catch (id e) {
+                bridge_log("  insertText newline failed");
+            }
+        }
+        return;
+    }
+
+    if (key_code == 48) {
+        /* Tab key */
+        if (hasInsertText) {
+            @try {
+                id tab = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                    (id)objc_getClass("NSString"),
+                    sel_registerName("stringWithUTF8String:"), "\t");
+                ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, tab);
+                bridge_log("  Delivered insertText: tab");
+            } @catch (id e) { /* ignore */ }
+        }
+        return;
+    }
+
+    /* Regular character input */
+    if (key_char != 0 && (isTextInput || hasInsertText)) {
+        char utf8[5] = {0};
+        if (key_char < 0x80) {
+            utf8[0] = (char)key_char;
+        } else if (key_char < 0x800) {
+            utf8[0] = (char)(0xC0 | (key_char >> 6));
+            utf8[1] = (char)(0x80 | (key_char & 0x3F));
+        } else {
+            utf8[0] = (char)(0xE0 | (key_char >> 12));
+            utf8[1] = (char)(0x80 | ((key_char >> 6) & 0x3F));
+            utf8[2] = (char)(0x80 | (key_char & 0x3F));
+        }
+
+        @try {
+            id charStr = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                (id)objc_getClass("NSString"),
+                sel_registerName("stringWithUTF8String:"), utf8);
+            if (charStr) {
+                ((void(*)(id, SEL, id))objc_msgSend)(firstResponder, insertTextSel, charStr);
+                bridge_log("  Delivered insertText: '%s'", utf8);
+            }
+        } @catch (id e) {
+            bridge_log("  insertText failed for char 0x%x", key_char);
+        }
     }
 }
 
@@ -1275,6 +1529,9 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
 
     /* Check for and inject touch events from host */
     check_and_inject_touch();
+
+    /* Check for and inject keyboard events from host */
+    check_and_inject_keyboard();
 
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
     void *pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_META_SIZE;
