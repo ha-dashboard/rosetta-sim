@@ -464,8 +464,12 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
     /* If already connected to real CARenderServer, return cached port.
      * Also ensure client port is set on first access. */
     if (g_ca_server_connected) {
+        /* DISABLED — let CoreAnimation handle context creation naturally.
+         * With BKSDisplayServicesStart succeeding and CARenderServerGetServerPort
+         * returning a real port, CA should set up the server connection.
+         * Creating extra contexts might interfere with the default pipeline. */
         static int _early_ctx = 0;
-        if (!_early_ctx) {
+        if (0 && !_early_ctx) {
             _early_ctx = 1;
             mach_port_t cp = MACH_PORT_NULL;
             mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
@@ -4694,15 +4698,15 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
         ((void(*)(id, SEL))_original_makeKeyAndVisible_IMP)(self, _cmd);
         bridge_log("  Original makeKeyAndVisible completed");
 
-        /* Ensure CARenderServer is connected and EARLY context is created */
-        if (!_bridge_pre_created_context) {
-            replacement_CARenderServerGetServerPort(); /* triggers EARLY context creation */
-        }
+        /* DISABLED — let CA handle context creation naturally */
+        /* if (!_bridge_pre_created_context) {
+            replacement_CARenderServerGetServerPort();
+        } */
 
         /* Use the PRE-CREATED remote context from CARenderServerGetServerPort.
          * This context was created BEFORE any views exist, ensuring all layer
          * backing stores go through the server pipeline from the start. */
-        if (_bridge_pre_created_context) {
+        if (0 && _bridge_pre_created_context) { /* DISABLED — let CA handle naturally */
             /* Set the pre-created context as UIWindow's _layerContext */
             Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
             if (lcIvar) {
