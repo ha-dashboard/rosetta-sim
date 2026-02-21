@@ -355,6 +355,7 @@ extern kern_return_t task_get_special_port(mach_port_t, int, mach_port_t *);
 /* CARenderServer connection state — set when real server is available via broker */
 static mach_port_t g_ca_server_port = MACH_PORT_NULL;
 static int g_ca_server_connected = 0;
+static id _bridge_pre_created_context = nil; /* Pre-created REMOTE CAContext */
 
 /* GPU rendering mode — when active, CARenderServer handles display compositing.
  * Set after UIKit init if CADisplay is available from CARenderServer.
@@ -490,6 +491,8 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
                             bridge_log("CARenderServerGetServerPort: GetClientPort(%u)=%u (after early ctx)", g_ca_server_port, rcp);
                         }
                         ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("retain"));
+                        /* Store globally for UIWindow to use later */
+                        _bridge_pre_created_context = ctx;
                         int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
                         if (fd >= 0) { char b[32]; int l = snprintf(b,32,"%u",cid); write(fd,b,l); close(fd); }
                     }
@@ -4661,9 +4664,42 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
         ((void(*)(id, SEL))_original_makeKeyAndVisible_IMP)(self, _cmd);
         bridge_log("  Original makeKeyAndVisible completed");
 
-        /* Create the UIWindow's CAContext NOW, before any views draw.
-         * UIWindow._createContext creates a remote CAContext linked to the
-         * screen's CADisplay. Set _attachable=YES so the context is displayable. */
+        /* Ensure CARenderServer is connected and EARLY context is created */
+        if (!_bridge_pre_created_context) {
+            replacement_CARenderServerGetServerPort(); /* triggers EARLY context creation */
+        }
+
+        /* Use the PRE-CREATED remote context from CARenderServerGetServerPort.
+         * This context was created BEFORE any views exist, ensuring all layer
+         * backing stores go through the server pipeline from the start. */
+        if (_bridge_pre_created_context) {
+            /* Set the pre-created context as UIWindow's _layerContext */
+            Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
+            if (lcIvar) {
+                ((id(*)(id, SEL))objc_msgSend)(_bridge_pre_created_context, sel_registerName("retain"));
+                *(id *)((uint8_t *)self + ivar_getOffset(lcIvar)) = _bridge_pre_created_context;
+
+                /* Set the window's layer as the context's layer */
+                id rootLayer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));
+                if (rootLayer) {
+                    SEL setLayerSel = sel_registerName("setLayer:");
+                    if ([_bridge_pre_created_context respondsToSelector:setLayerSel]) {
+                        ((void(*)(id, SEL, id))objc_msgSend)(
+                            _bridge_pre_created_context, setLayerSel, rootLayer);
+                    }
+                }
+
+                unsigned int cid = 0;
+                if ([_bridge_pre_created_context respondsToSelector:sel_registerName("contextId")])
+                    cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                        _bridge_pre_created_context, sel_registerName("contextId"));
+                bridge_log("  UIWindow: using PRE-CREATED remote context (contextId=%u)", cid);
+            }
+        } else {
+            bridge_log("  UIWindow: no pre-created context — creating fresh");
+        }
+
+        /* Also set _attachable for proper UIKit behavior */
         Ivar attachIvar = class_getInstanceVariable(object_getClass(self), "_attachable");
         if (attachIvar) {
             *(BOOL *)((uint8_t *)self + ivar_getOffset(attachIvar)) = YES;
