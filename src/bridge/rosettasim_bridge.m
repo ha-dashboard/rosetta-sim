@@ -4889,7 +4889,46 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                         }
 
                         if (syntheticScene || fbsDisplay) {
+                            /* Verify FBSDisplay before calling */
+                            @try {
+                                SEL dispIdSel = sel_registerName("displayID");
+                                if ([(id)fbsDisplay respondsToSelector:dispIdSel]) {
+                                    unsigned int did = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                        fbsDisplay, dispIdSel);
+                                    bridge_log("  FBSDisplay.displayID = %u", did);
+                                }
+                                SEL refBoundsSel = sel_registerName("referenceBounds");
+                                if ([(id)fbsDisplay respondsToSelector:refBoundsSel]) {
+                                    typedef struct { double x, y, w, h; } CGRect_d;
+                                    CGRect_d rb;
+                                    /* stret for CGRect on x86_64 */
+                                    typedef void (*StretFn)(CGRect_d *, id, SEL);
+                                    ((StretFn)objc_msgSend_stret)(&rb, fbsDisplay, refBoundsSel);
+                                    bridge_log("  FBSDisplay.referenceBounds = %.0fx%.0f",
+                                               rb.w, rb.h);
+                                }
+                                if (syntheticScene) {
+                                    SEL fbsDispSel = sel_registerName("fbsDisplay");
+                                    if ([(id)syntheticScene respondsToSelector:fbsDispSel]) {
+                                        id sd = ((id(*)(id, SEL))objc_msgSend)(
+                                            syntheticScene, fbsDispSel);
+                                        bridge_log("  FBSScene.fbsDisplay = %p", (void *)sd);
+                                    }
+                                    SEL idSel = sel_registerName("identifier");
+                                    if ([(id)syntheticScene respondsToSelector:idSel]) {
+                                        id sid = ((id(*)(id, SEL))objc_msgSend)(
+                                            syntheticScene, idSel);
+                                        bridge_log("  FBSScene.identifier = %s",
+                                                   [(NSString *)sid UTF8String] ?: "(nil)");
+                                    }
+                                }
+                            } @catch (id ex) {
+                                bridge_log("  FBSDisplay/Scene verification threw: %s",
+                                           [[ex description] UTF8String] ?: "unknown");
+                            }
+
                             /* Connect UIScreen to the display */
+                            bridge_log("  Calling _FBSDisplayDidPossiblyConnect NOW...");
                             @try {
                                 ((void(*)(id, SEL, id, id, BOOL))objc_msgSend)(
                                     (id)uiScreenClass, connectSel,
@@ -5205,10 +5244,178 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
     int _fbs_display_pipeline_active = 0;
 
     if (g_ca_server_connected) {
-        bridge_log("Display Pipeline: CARenderServer connected, attempting FBSScene pipeline...");
+        bridge_log("Display Pipeline: CARenderServer connected — setting up display...");
+
+        /* Wire UIScreen to the CARenderServer display via FBSScene.
+         * This is the proper display pipeline — replaces all CPU rendering. */
         @try {
-            /* Step 1: Get real CADisplay from CARenderServer */
             Class caDisplayClass = objc_getClass("CADisplay");
+            if (caDisplayClass) {
+                id displays = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)caDisplayClass, sel_registerName("displays"));
+                NSUInteger dCount = [(NSArray *)displays count];
+                bridge_log("Display Pipeline: [CADisplay displays] count=%lu", (unsigned long)dCount);
+
+                if (dCount > 0) {
+                    id mainDisplay = [(NSArray *)displays objectAtIndex:0];
+                    bridge_log("Display Pipeline: mainDisplay=%p", (void *)mainDisplay);
+
+                    /* Create FBSDisplay */
+                    Class fbsDisplayClass = objc_getClass("FBSDisplay");
+                    id fbsDisplay = nil;
+                    if (fbsDisplayClass) {
+                        SEL initSel = sel_registerName("initWithCADisplay:isMainDisplay:");
+                        if (class_getInstanceMethod(fbsDisplayClass, initSel)) {
+                            fbsDisplay = ((id(*)(id, SEL, id, BOOL))objc_msgSend)(
+                                ((id(*)(id, SEL))objc_msgSend)((id)fbsDisplayClass, sel_registerName("alloc")),
+                                initSel, mainDisplay, YES);
+                            bridge_log("Display Pipeline: FBSDisplay=%p", (void *)fbsDisplay);
+                        }
+                    }
+
+                    if (fbsDisplay) {
+                        /* Verify FBSDisplay properties */
+                        SEL dispIdSel = sel_registerName("displayID");
+                        if ([(id)fbsDisplay respondsToSelector:dispIdSel]) {
+                            unsigned int did = ((unsigned int(*)(id, SEL))objc_msgSend)(fbsDisplay, dispIdSel);
+                            bridge_log("Display Pipeline: FBSDisplay.displayID=%u", did);
+                        }
+
+                        /* Create FBSScene */
+                        id fbsScene = nil;
+                        Class sceneClass = objc_getClass("FBSScene");
+                        if (sceneClass) {
+                            Class settingsClass = objc_getClass("UIMutableApplicationSceneSettings");
+                            id sceneSettings = settingsClass ?
+                                ((id(*)(id, SEL))objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)((id)settingsClass, sel_registerName("alloc")),
+                                    sel_registerName("init")) : nil;
+
+                            Class clientSettingsClass = objc_getClass("UIMutableApplicationSceneClientSettings");
+                            id clientSettings = clientSettingsClass ?
+                                ((id(*)(id, SEL))objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)((id)clientSettingsClass, sel_registerName("alloc")),
+                                    sel_registerName("init")) : nil;
+
+                            id sceneId = @"com.apple.frontboard.default";
+                            SEL sceneInitSel = sel_registerName("initWithQueue:identifier:display:settings:clientSettings:");
+                            if (class_getInstanceMethod(sceneClass, sceneInitSel)) {
+                                fbsScene = ((id(*)(id, SEL, id, id, id, id, id))objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)((id)sceneClass, sel_registerName("alloc")),
+                                    sceneInitSel, dispatch_get_main_queue(), sceneId,
+                                    fbsDisplay, sceneSettings, clientSettings);
+                                bridge_log("Display Pipeline: FBSScene=%p", (void *)fbsScene);
+                            }
+                        }
+
+                        /* Wire UIScreen directly by setting its ivars.
+                         * _FBSDisplayDidPossiblyConnect crashes because FBSScene
+                         * lifecycle methods access unimplemented workspace state.
+                         * Instead, set the ivars that _FBSDisplayDidPossiblyConnect
+                         * would set: _display, _fbsDisplay, _bounds, _mainSceneReferenceBounds. */
+                        Class uiScreenClass = objc_getClass("UIScreen");
+                        if (uiScreenClass) {
+                            id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
+                                (id)uiScreenClass, sel_registerName("mainScreen"));
+                            bridge_log("Display Pipeline: mainScreen=%p", (void *)mainScreen);
+
+                            if (mainScreen) {
+                                /* Set _display (CADisplay) */
+                                Ivar displayIvar = class_getInstanceVariable(uiScreenClass, "_display");
+                                if (displayIvar) {
+                                    /* Retain the new display */
+                                    ((id(*)(id, SEL))objc_msgSend)(mainDisplay, sel_registerName("retain"));
+                                    object_setIvar(mainScreen, displayIvar, mainDisplay);
+                                    bridge_log("Display Pipeline: set _display=%p", (void *)mainDisplay);
+                                }
+
+                                /* Set _fbsDisplay (FBSDisplay) */
+                                Ivar fbsDisplayIvar = class_getInstanceVariable(uiScreenClass, "_fbsDisplay");
+                                if (fbsDisplayIvar) {
+                                    ((id(*)(id, SEL))objc_msgSend)(fbsDisplay, sel_registerName("retain"));
+                                    object_setIvar(mainScreen, fbsDisplayIvar, fbsDisplay);
+                                    bridge_log("Display Pipeline: set _fbsDisplay=%p", (void *)fbsDisplay);
+                                }
+
+                                /* Set _bounds to screen size (in points) */
+                                Ivar boundsIvar = class_getInstanceVariable(uiScreenClass, "_bounds");
+                                if (boundsIvar) {
+                                    typedef struct { double x, y, w, h; } CGRect_d;
+                                    CGRect_d *boundsPtr = (CGRect_d *)((uint8_t *)mainScreen + ivar_getOffset(boundsIvar));
+                                    boundsPtr->x = 0;
+                                    boundsPtr->y = 0;
+                                    boundsPtr->w = 375.0;  /* iPhone 6s width in points */
+                                    boundsPtr->h = 667.0;  /* iPhone 6s height in points */
+                                    bridge_log("Display Pipeline: set _bounds={0,0,375,667}");
+                                }
+
+                                /* Set _mainSceneReferenceBounds */
+                                Ivar refBoundsIvar = class_getInstanceVariable(uiScreenClass, "_mainSceneReferenceBounds");
+                                if (refBoundsIvar) {
+                                    typedef struct { double x, y, w, h; } CGRect_d;
+                                    CGRect_d *rbPtr = (CGRect_d *)((uint8_t *)mainScreen + ivar_getOffset(refBoundsIvar));
+                                    rbPtr->x = 0;
+                                    rbPtr->y = 0;
+                                    rbPtr->w = 375.0;
+                                    rbPtr->h = 667.0;
+                                    bridge_log("Display Pipeline: set _mainSceneReferenceBounds={0,0,375,667}");
+                                }
+
+                                _fbs_display_pipeline_active = 1;
+                                bridge_log("Display Pipeline: UIScreen wired to CARenderServer display");
+                            }
+                        }
+                    }
+                }
+            }
+        } @catch (id ex) {
+            bridge_log("Display Pipeline: Exception: %s", [[ex description] UTF8String] ?: "unknown");
+        }
+
+        /* Map the GPU framebuffer for relay to app framebuffer */
+        {
+            const char *gpu_fb_path = ROSETTASIM_FB_GPU_PATH;
+            int gpu_fd = open(gpu_fb_path, O_RDONLY);
+            if (gpu_fd >= 0) {
+                struct stat st;
+                if (fstat(gpu_fd, &st) == 0 && st.st_size > 0) {
+                    _backboardd_fb_size = (size_t)st.st_size;
+                    _backboardd_fb_mmap = mmap(NULL, _backboardd_fb_size,
+                                                PROT_READ, MAP_SHARED, gpu_fd, 0);
+                    if (_backboardd_fb_mmap != MAP_FAILED) {
+                        g_gpu_rendering_active = 1;
+                        _fbs_display_pipeline_active = 1;
+                        bridge_log("Display Pipeline: Mapped GPU framebuffer at %s "
+                                   "(%zu bytes) — GPU compositing ACTIVE",
+                                   gpu_fb_path, _backboardd_fb_size);
+                    } else {
+                        _backboardd_fb_mmap = NULL;
+                        bridge_log("Display Pipeline: mmap of %s failed: %s",
+                                   gpu_fb_path, strerror(errno));
+                    }
+                } else {
+                    bridge_log("Display Pipeline: %s empty or stat failed", gpu_fb_path);
+                }
+                close(gpu_fd);
+            } else {
+                bridge_log("Display Pipeline: %s not found", gpu_fb_path);
+            }
+
+            /* Set up the app's framebuffer and start frame capture.
+             * In GPU mode, frame_capture_tick copies from GPU framebuffer
+             * instead of doing renderInContext. */
+            find_root_window(_bridge_delegate);
+            start_frame_capture();
+
+            bridge_log("Display Pipeline: Setup complete");
+        }
+    } else {
+        bridge_log("Display Pipeline: CARenderServer not connected — using CPU rendering");
+    }
+    /* Old duplicate GPU display pipeline code was here (280+ lines).
+     * Removed — _FBSDisplayDidPossiblyConnect is called in replacement_runWithMainScene. */
+#if 0 /* BEGIN REMOVED DUPLICATE CODE */
+    { Class caDisplayClass = objc_getClass("CADisplay");
             id mainDisplay = nil;
             unsigned long displayCount = 0;
 
@@ -5396,16 +5603,14 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                         }
                     }
 
-                    /* Step 6: Wire UIScreen to the display via _FBSDisplayDidPossiblyConnect */
-                    Class uiScreenClass = objc_getClass("UIScreen");
-                    if (uiScreenClass && fbsDisplay) {
+                    /* Step 6: SKIPPED — _FBSDisplayDidPossiblyConnect is called in
+                     * replacement_runWithMainScene. Calling it again here crashes. */
+                    bridge_log("Display Pipeline: Skipping duplicate _FBSDisplayDidPossiblyConnect (done in init)");
+#if 0 /* disabled — was crashing the app */
+                        Class uiScreenClass = objc_getClass("UIScreen");
                         SEL connectSel = sel_registerName("_FBSDisplayDidPossiblyConnect:withScene:andPost:");
-
-                        if (class_respondsToSelector(object_getClass((id)uiScreenClass), connectSel)) {
+                        if (uiScreenClass && fbsDisplay && class_respondsToSelector(object_getClass((id)uiScreenClass), connectSel)) {
                             @try {
-                                bridge_log("Display Pipeline: Calling [UIScreen _FBSDisplayDidPossiblyConnect:%p withScene:%p andPost:YES]",
-                                           (void *)fbsDisplay, (void *)fbsScene);
-
                                 ((void(*)(id, SEL, id, id, BOOL))objc_msgSend)(
                                     (id)uiScreenClass, connectSel,
                                     fbsDisplay, fbsScene, (BOOL)YES);
@@ -5463,7 +5668,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                 bridge_log("Display Pipeline: UIScreen has no _FBSDisplayDidPossiblyConnect variant");
                             }
                         }
-                    }
+#endif /* disabled _FBSDisplayDidPossiblyConnect */
 
                     /* Step 7: If FBSScene pipeline is active, map the GPU framebuffer
                      * for monitoring. CARenderServer composites to PurpleDisplay surface,
@@ -5537,9 +5742,8 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
             bridge_log("Display Pipeline: Exception during setup: %s",
                        [[ex description] UTF8String] ?: "unknown");
         }
-    } else {
-        bridge_log("Display Pipeline: CARenderServer not connected — using CPU rendering");
     }
+#endif /* END REMOVED DUPLICATE CODE */
 
     /* Fallback: CPU rendering if FBSScene pipeline didn't activate */
     if (!_fbs_display_pipeline_active) {
