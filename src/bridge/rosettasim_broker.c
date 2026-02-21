@@ -638,6 +638,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_bundle_exec[256] = "", env_bundle_path[1280] = "", env_proc_path[1280] = "";
+    char env_ca_mode[64] = "";
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     if (bridge_path && bridge_path[0]) {
@@ -658,6 +659,12 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
         snprintf(env_bundle_exec, sizeof(env_bundle_exec), "CFBundleExecutable=%s", exec_name);
         snprintf(env_bundle_path, sizeof(env_bundle_path), "NSBundlePath=%s", bundle_path);
         snprintf(env_proc_path, sizeof(env_proc_path), "CFProcessPath=%s", exec_path);
+    }
+
+    /* Pass through ROSETTASIM_CA_MODE from parent environment */
+    const char *ca_mode = getenv("ROSETTASIM_CA_MODE");
+    if (ca_mode) {
+        snprintf(env_ca_mode, sizeof(env_ca_mode), "ROSETTASIM_CA_MODE=%s", ca_mode);
     }
 
     char *env[32];
@@ -684,6 +691,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
     if (env_proc_path[0]) env[ei++] = env_proc_path;
+    if (env_ca_mode[0]) env[ei++] = env_ca_mode;
     env[ei] = NULL;
 
     posix_spawnattr_t attr;

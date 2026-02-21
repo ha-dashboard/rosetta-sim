@@ -74,6 +74,7 @@ clang -arch x86_64 -dynamiclib \
     -framework GraphicsServices \
     -framework QuartzCore \
     -framework UIKit \
+    -framework SystemConfiguration \
     -install_name @rpath/rosettasim_bridge.dylib \
     -o "$BRIDGE_OUT" \
     "$BRIDGE_SRC"

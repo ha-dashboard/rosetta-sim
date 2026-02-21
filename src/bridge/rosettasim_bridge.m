@@ -38,7 +38,14 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <mach/mach_time.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <sys/select.h>
+#import <netdb.h>
+#import <errno.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <Foundation/Foundation.h>
 
 #include "../shared/rosettasim_framebuffer.h"
 
@@ -116,6 +123,58 @@ extern void BKSHIDEventRegisterEventCallbackOnRunLoop(void *callback,
 
 /* QuartzCore */
 extern mach_port_t CARenderServerGetServerPort(void);
+
+/* SystemConfiguration — needed to stub network reachability.
+ * Without configd_sim, SCNetworkReachability functions hang, blocking
+ * NSURLSession from making any HTTP requests. We stub these to always
+ * report "reachable" since the host macOS networking stack works. */
+typedef const void *SCNetworkReachabilityRef;
+typedef uint32_t SCNetworkReachabilityFlags;
+typedef void (*SCNetworkReachabilityCallBack)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags, void *);
+typedef struct {
+    int version;
+    void *info;
+    const void *(*retain)(const void *);
+    void (*release)(const void *);
+    void *(*copyDescription)(const void *);
+} SCNetworkReachabilityContext;
+enum {
+    kSCNetworkReachabilityFlagsReachable = 1 << 1,
+    kSCNetworkReachabilityFlagsIsDirect = 1 << 17
+};
+extern SCNetworkReachabilityRef SCNetworkReachabilityCreateWithAddress(
+    CFAllocatorRef allocator, const struct sockaddr *address);
+extern SCNetworkReachabilityRef SCNetworkReachabilityCreateWithName(
+    CFAllocatorRef allocator, const char *nodename);
+extern bool SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target,
+                                           SCNetworkReachabilityFlags *flags);
+extern bool SCNetworkReachabilitySetCallback(SCNetworkReachabilityRef target,
+                                              SCNetworkReachabilityCallBack callback,
+                                              SCNetworkReachabilityContext *context);
+extern bool SCNetworkReachabilityScheduleWithRunLoop(SCNetworkReachabilityRef target,
+                                                       CFRunLoopRef runLoop,
+                                                       CFStringRef runLoopMode);
+extern bool SCNetworkReachabilityUnscheduleFromRunLoop(SCNetworkReachabilityRef target,
+                                                         CFRunLoopRef runLoop,
+                                                         CFStringRef runLoopMode);
+
+/* SCDynamicStore — needed for proxy configuration.
+ * NSURLSession queries proxy config via SCDynamicStoreCopyProxies.
+ * Without configd_sim, this returns NULL and NSURLSession won't make requests. */
+typedef const void *SCDynamicStoreRef;
+typedef void (*SCDynamicStoreCallBack)(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info);
+typedef struct {
+    int version;
+    void *info;
+    const void *(*retain)(const void *);
+    void (*release)(const void *);
+    void *(*copyDescription)(const void *);
+} SCDynamicStoreContext;
+extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef allocator,
+                                               CFStringRef name,
+                                               SCDynamicStoreCallBack callout,
+                                               SCDynamicStoreContext *context);
+extern CFDictionaryRef SCDynamicStoreCopyProxies(SCDynamicStoreRef store);
 
 /* ================================================================
  * Simulated device configuration
@@ -258,6 +317,14 @@ extern kern_return_t task_get_special_port(mach_port_t, int, mach_port_t *);
 /* CARenderServer connection state — set when real server is available via broker */
 static mach_port_t g_ca_server_port = MACH_PORT_NULL;
 static int g_ca_server_connected = 0;
+
+/* GPU rendering mode — when active, CARenderServer handles display compositing.
+ * Set after UIKit init if CADisplay is available from CARenderServer.
+ * In this mode, frame_capture_tick skips CPU rendering and copies from
+ * the backboardd framebuffer (where CARenderServer renders). */
+static int g_gpu_rendering_active = 0;
+static void *_backboardd_fb_mmap = NULL;
+static size_t _backboardd_fb_size = 0;
 
 /* Broker port — obtained from TASK_BOOTSTRAP_PORT when running under broker */
 static mach_port_t g_bridge_broker_port = MACH_PORT_NULL;
@@ -1013,6 +1080,672 @@ static void replacement_BKSHIDEventRegisterEventCallbackOnRunLoop(
 {
     bridge_log("BKSHIDEventRegisterEventCallbackOnRunLoop() intercepted → no-op");
     bridge_log("  (Touch input delivered via mmap polling + UITouchesEvent injection)");
+}
+
+/* ================================================================
+ * SCNetworkReachability stubs
+ *
+ * Without configd_sim, SystemConfiguration's SCNetworkReachability
+ * functions hang waiting for a Mach IPC response that never comes.
+ * This blocks NSURLSession from making any HTTP requests.
+ *
+ * We stub these to always report "network is reachable" since the
+ * host macOS networking stack handles actual connectivity.
+ * ================================================================ */
+
+/* Fake SCNetworkReachabilityRef — uses a CFData as a valid CF object
+ * so callers can safely CFRetain/CFRelease it. */
+static SCNetworkReachabilityRef _get_fake_sc_ref(void) {
+    static void *fakeRef = NULL;
+    if (!fakeRef) {
+        fakeRef = (void *)CFDataCreate(NULL, (const uint8_t *)"\xAB\xCD", 2);
+        /* Extra retain so it's never deallocated */
+        CFRetain((CFTypeRef)fakeRef);
+    }
+    CFRetain((CFTypeRef)fakeRef);
+    return (SCNetworkReachabilityRef)fakeRef;
+}
+
+static SCNetworkReachabilityRef replacement_SCNetworkReachabilityCreateWithAddress(
+    CFAllocatorRef allocator, const struct sockaddr *address)
+{
+    bridge_log("SCNetworkReachabilityCreateWithAddress → fake ref (always reachable)");
+    return _get_fake_sc_ref();
+}
+
+static SCNetworkReachabilityRef replacement_SCNetworkReachabilityCreateWithName(
+    CFAllocatorRef allocator, const char *nodename)
+{
+    bridge_log("SCNetworkReachabilityCreateWithName('%s') → fake ref (always reachable)",
+               nodename ? nodename : "NULL");
+    return _get_fake_sc_ref();
+}
+
+static bool replacement_SCNetworkReachabilityGetFlags(
+    SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags)
+{
+    if (flags) {
+        *flags = kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsIsDirect;
+    }
+    return true;
+}
+
+/* SCDynamicStore stubs — proxy configuration */
+static SCDynamicStoreRef replacement_SCDynamicStoreCreate(
+    CFAllocatorRef allocator, CFStringRef name,
+    SCDynamicStoreCallBack callout, SCDynamicStoreContext *context)
+{
+    bridge_log("SCDynamicStoreCreate → fake store (no proxy)");
+    return _get_fake_sc_ref();  /* reuse same fake CF ref */
+}
+
+static CFDictionaryRef replacement_SCDynamicStoreCopyProxies(SCDynamicStoreRef store)
+{
+    bridge_log("SCDynamicStoreCopyProxies → empty dict (direct connection, no proxy)");
+    return CFDictionaryCreate(NULL, NULL, NULL, 0,
+                               &kCFTypeDictionaryKeyCallBacks,
+                               &kCFTypeDictionaryValueCallBacks);
+}
+
+static bool replacement_SCNetworkReachabilitySetCallback(
+    SCNetworkReachabilityRef target, SCNetworkReachabilityCallBack callback,
+    SCNetworkReachabilityContext *context)
+{
+    /* Accept the callback but don't actually monitor — network is always reachable */
+    return true;
+}
+
+static bool replacement_SCNetworkReachabilityScheduleWithRunLoop(
+    SCNetworkReachabilityRef target, CFRunLoopRef runLoop, CFStringRef runLoopMode)
+{
+    return true;
+}
+
+static bool replacement_SCNetworkReachabilityUnscheduleFromRunLoop(
+    SCNetworkReachabilityRef target, CFRunLoopRef runLoop, CFStringRef runLoopMode)
+{
+    return true;
+}
+
+/* ================================================================
+ * NSURLProtocol bypass — routes HTTP requests through BSD sockets.
+ *
+ * CFNetwork/NSURLSession requires configd_sim for DNS resolution,
+ * proxy configuration, and network interface enumeration. Without it,
+ * NSURLSession data tasks never complete. But raw BSD sockets work
+ * because they go through the host kernel directly.
+ *
+ * This NSURLProtocol subclass intercepts HTTP requests and handles
+ * them via raw sockets, bypassing CFNetwork entirely.
+ * ================================================================ */
+
+@interface RosettaSimURLProtocol : NSURLProtocol
+@end
+
+@implementation RosettaSimURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    bridge_log("RosettaSimURLProtocol canInitWithRequest: %s %s",
+               request.HTTPMethod.UTF8String ?: "?",
+               request.URL.absoluteString.UTF8String ?: "?");
+    /* Only handle HTTP (not HTTPS — would need TLS). */
+    NSString *scheme = request.URL.scheme;
+    if (!scheme) return NO;
+    if ([NSURLProtocol propertyForKey:@"RosettaSimHandled" inRequest:request]) {
+        return NO;  /* Already handled — prevent recursion */
+    }
+    return [scheme caseInsensitiveCompare:@"http"] == NSOrderedSame;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSURLRequest *request = self.request;
+    NSURL *url = request.URL;
+
+    bridge_log("RosettaSimURLProtocol: %s %s",
+               request.HTTPMethod.UTF8String ?: "GET",
+               url.absoluteString.UTF8String ?: "?");
+
+    /* Resolve host to IP via getaddrinfo (uses host DNS) */
+    NSString *host = url.host;
+    int port = url.port ? url.port.intValue : 80;
+    if (!host) {
+        [self _failWithCode:-1 message:@"No host in URL"];
+        return;
+    }
+
+    /* Perform HTTP on a background thread. Store the calling thread's run loop
+     * so we can schedule client callbacks there. */
+    NSThread *callingThread = [NSThread currentThread];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self _performRequestWithHost:host port:port url:url request:request];
+    });
+}
+
+- (void)_performRequestWithHost:(NSString *)host port:(int)port
+                             url:(NSURL *)url request:(NSURLRequest *)request {
+    /* DNS resolution — getaddrinfo + .local fallback.
+     *
+     * mDNS (.local) names fail with getaddrinfo in the simulated process
+     * because mDNSResponder isn't available. We handle this with:
+     *   1. Check ROSETTASIM_DNS_MAP env var (format: "host1=1.2.3.4,host2=5.6.7.8")
+     *   2. If .local hostname, try getaddrinfo on the bare hostname without ".local"
+     *   3. Fall back to getaddrinfo with AI_NUMERICHOST if it looks like an IP
+     */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%d", port);
+    const char *hostCStr = host.UTF8String;
+
+    int gai = getaddrinfo(hostCStr, portStr, &hints, &res);
+
+    /* .local fallback: check DNS map env var, then try without .local suffix */
+    if (gai != 0) {
+        bridge_log("RosettaSimURLProtocol: getaddrinfo failed for %s: %s — trying fallbacks", hostCStr, gai_strerror(gai));
+
+        /* Check ROSETTASIM_DNS_MAP environment variable */
+        const char *dnsMap = getenv("ROSETTASIM_DNS_MAP");
+        if (dnsMap) {
+            /* Parse "host1=ip1,host2=ip2" */
+            char mapCopy[2048];
+            strncpy(mapCopy, dnsMap, sizeof(mapCopy) - 1);
+            mapCopy[sizeof(mapCopy) - 1] = 0;
+            char *saveptr = NULL;
+            char *entry = strtok_r(mapCopy, ",", &saveptr);
+            while (entry) {
+                char *eq = strchr(entry, '=');
+                if (eq) {
+                    *eq = 0;
+                    /* Trim whitespace */
+                    char *name = entry;
+                    while (*name == ' ') name++;
+                    char *ip = eq + 1;
+                    while (*ip == ' ') ip++;
+                    char *end = ip + strlen(ip) - 1;
+                    while (end > ip && *end == ' ') { *end = 0; end--; }
+
+                    if (strcasecmp(name, hostCStr) == 0) {
+                        bridge_log("RosettaSimURLProtocol: DNS map override %s → %s", hostCStr, ip);
+                        struct addrinfo numhints;
+                        memset(&numhints, 0, sizeof(numhints));
+                        numhints.ai_family = AF_INET;
+                        numhints.ai_socktype = SOCK_STREAM;
+                        numhints.ai_flags = AI_NUMERICHOST;
+                        gai = getaddrinfo(ip, portStr, &numhints, &res);
+                        break;
+                    }
+                }
+                entry = strtok_r(NULL, ",", &saveptr);
+            }
+        }
+
+        /* If still unresolved and hostname ends in .local, try without suffix */
+        if (gai != 0) {
+            size_t hlen = strlen(hostCStr);
+            if (hlen > 6 && strcasecmp(hostCStr + hlen - 6, ".local") == 0) {
+                char stripped[256];
+                size_t slen = hlen - 6;
+                if (slen < sizeof(stripped)) {
+                    memcpy(stripped, hostCStr, slen);
+                    stripped[slen] = 0;
+                    bridge_log("RosettaSimURLProtocol: trying stripped hostname: %s", stripped);
+                    gai = getaddrinfo(stripped, portStr, &hints, &res);
+                }
+            }
+        }
+    }
+
+    if (gai != 0) {
+        bridge_log("RosettaSimURLProtocol: DNS failed for %s: %s (all fallbacks exhausted)", hostCStr, gai_strerror(gai));
+        [self _failWithCode:-1003 message:@"Cannot resolve host"];
+        return;
+    }
+    bridge_log("RosettaSimURLProtocol: DNS resolved %s", hostCStr);
+
+    /* Connect via TCP */
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        [self _failWithCode:-1004 message:@"Cannot create socket"];
+        return;
+    }
+
+    /* 15 second connect timeout */
+    struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int result = connect(sock, res->ai_addr, (socklen_t)res->ai_addrlen);
+    freeaddrinfo(res);
+
+    if (result < 0) {
+        close(sock);
+        bridge_log("RosettaSimURLProtocol: connect failed: %d", errno);
+        [self _failWithCode:-1004 message:@"Cannot connect to host"];
+        return;
+    }
+
+    /* Build HTTP request */
+    NSString *method = request.HTTPMethod ?: @"GET";
+    NSString *path = url.path.length > 0 ? url.path : @"/";
+    if (url.query) path = [NSString stringWithFormat:@"%@?%@", path, url.query];
+
+    NSMutableString *httpReq = [NSMutableString stringWithFormat:
+        @"%@ %@ HTTP/1.1\r\nHost: %@:%d\r\nConnection: close\r\n",
+        method, path, host, port];
+
+    /* Add request headers (skip Content-Length — we compute it from body) */
+    NSDictionary *headers = request.allHTTPHeaderFields;
+    for (NSString *key in headers) {
+        if ([key caseInsensitiveCompare:@"Content-Length"] == NSOrderedSame) continue;
+        [httpReq appendFormat:@"%@: %@\r\n", key, headers[key]];
+    }
+
+    /* Add body — NSURLSession strips HTTPBody when intercepted by NSURLProtocol,
+     * so also check HTTPBodyStream as a fallback. */
+    NSData *body = request.HTTPBody;
+    if (!body || body.length == 0) {
+        NSInputStream *bodyStream = request.HTTPBodyStream;
+        if (bodyStream) {
+            NSMutableData *streamData = [NSMutableData data];
+            [bodyStream open];
+            uint8_t streamBuf[4096];
+            NSInteger bytesRead;
+            while ((bytesRead = [bodyStream read:streamBuf maxLength:sizeof(streamBuf)]) > 0) {
+                [streamData appendBytes:streamBuf length:bytesRead];
+            }
+            [bodyStream close];
+            if (streamData.length > 0) {
+                body = streamData;
+                bridge_log("RosettaSimURLProtocol: recovered %lu bytes from HTTPBodyStream",
+                    (unsigned long)body.length);
+            }
+        }
+    }
+    if (body.length > 0) {
+        [httpReq appendFormat:@"Content-Length: %lu\r\n", (unsigned long)body.length];
+        bridge_log("RosettaSimURLProtocol: sending body (%lu bytes)", (unsigned long)body.length);
+    } else if ([method isEqualToString:@"POST"]) {
+        bridge_log("RosettaSimURLProtocol: WARNING — POST with no body");
+        [httpReq appendFormat:@"Content-Length: 0\r\n"];
+    }
+    [httpReq appendString:@"\r\n"];
+
+    /* Log the full request for debugging */
+    if ([method isEqualToString:@"POST"]) {
+        bridge_log("RosettaSimURLProtocol: full request:\n%s", httpReq.UTF8String);
+        if (body.length > 0 && body.length < 1024) {
+            NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+            bridge_log("RosettaSimURLProtocol: body: %s", bodyStr ? bodyStr.UTF8String : "(binary)");
+        }
+    }
+
+    /* Send */
+    const char *reqBytes = httpReq.UTF8String;
+    send(sock, reqBytes, strlen(reqBytes), 0);
+    if (body.length > 0) {
+        send(sock, body.bytes, body.length, 0);
+    }
+
+    /* Receive response */
+    NSMutableData *responseData = [NSMutableData data];
+    char buf[8192];
+    ssize_t n;
+    while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        [responseData appendBytes:buf length:n];
+    }
+    close(sock);
+
+    if (responseData.length == 0) {
+        bridge_log("RosettaSimURLProtocol: empty response");
+        [self _failWithCode:-1005 message:@"Empty response from server"];
+        return;
+    }
+
+    /* Parse HTTP response — find header/body boundary */
+    NSRange headerEnd = [responseData rangeOfData:
+        [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]
+        options:0 range:NSMakeRange(0, MIN(responseData.length, 16384))];
+
+    if (headerEnd.location == NSNotFound) {
+        bridge_log("RosettaSimURLProtocol: malformed response (no header boundary)");
+        [self _failWithCode:-1011 message:@"Malformed response"];
+        return;
+    }
+
+    NSString *headerStr = [[NSString alloc] initWithData:
+        [responseData subdataWithRange:NSMakeRange(0, headerEnd.location)]
+        encoding:NSUTF8StringEncoding];
+    NSData *bodyData = [responseData subdataWithRange:
+        NSMakeRange(headerEnd.location + 4,
+                    responseData.length - headerEnd.location - 4)];
+
+    /* Parse status line: "HTTP/1.1 200 OK" */
+    NSArray *headerLines = [headerStr componentsSeparatedByString:@"\r\n"];
+    NSString *statusLine = headerLines.count > 0 ? headerLines[0] : @"HTTP/1.1 200 OK";
+    int statusCode = 200;
+    NSRange statusRange = [statusLine rangeOfString:@" "];
+    if (statusRange.location != NSNotFound && statusRange.location + 1 < statusLine.length) {
+        statusCode = [[statusLine substringFromIndex:statusRange.location + 1] intValue];
+    }
+
+    /* Parse response headers */
+    NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 1; i < headerLines.count; i++) {
+        NSRange colonRange = [headerLines[i] rangeOfString:@": "];
+        if (colonRange.location != NSNotFound) {
+            NSString *key = [headerLines[i] substringToIndex:colonRange.location];
+            NSString *val = [headerLines[i] substringFromIndex:colonRange.location + 2];
+            respHeaders[key] = val;
+        }
+    }
+
+    bridge_log("RosettaSimURLProtocol: HTTP %d (%lu bytes body)",
+               statusCode, (unsigned long)bodyData.length);
+
+    /* Log error response bodies for debugging */
+    if (statusCode >= 400 && bodyData.length > 0 && bodyData.length < 2048) {
+        NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (bodyStr) {
+            bridge_log("RosettaSimURLProtocol: error body: %s", bodyStr.UTF8String);
+        }
+    }
+
+    /* Create NSHTTPURLResponse */
+    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+        initWithURL:url statusCode:statusCode HTTPVersion:@"HTTP/1.1"
+        headerFields:respHeaders];
+
+    /* Deliver to client. NSURLProtocol client callbacks must happen on the
+     * thread/runloop where startLoading was called. For NSURLSession, this is
+     * typically an internal session work queue. Use performSelector on the
+     * main thread as a reliable delivery mechanism, then also try direct
+     * delivery in case the main thread approach is deferred. */
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            [self.client URLProtocol:self didReceiveResponse:response
+                cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            if (bodyData.length > 0) {
+                [self.client URLProtocol:self didLoadData:bodyData];
+            }
+            [self.client URLProtocolDidFinishLoading:self];
+            bridge_log("RosettaSimURLProtocol: delivered response to client (main queue)");
+        } @catch (id ex) {
+            bridge_log("RosettaSimURLProtocol: client callback exception: %s",
+                [[ex description] UTF8String]);
+        }
+        dispatch_semaphore_signal(sem);
+    });
+    /* Wait up to 5 seconds for delivery — this blocks the background thread
+     * which is fine since we're done with the HTTP work. */
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+}
+
+- (void)_failWithCode:(NSInteger)code message:(NSString *)message {
+    /* Deliver error directly on the current thread (protocol thread) */
+    @try {
+        NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:code
+            userInfo:@{NSLocalizedDescriptionKey: message ?: @"Unknown error"}];
+        [self.client URLProtocol:self didFailWithError:error];
+    } @catch (id ex) { /* ignore */ }
+}
+
+- (void)stopLoading {
+    /* Socket is already closed in startLoading */
+}
+
+@end
+
+/* Register the URL protocol with NSURLSession by swizzling
+ * NSURLSessionConfiguration's protocolClasses getter. */
+static NSArray *_orig_protocolClasses_IMP = nil;
+
+static void _register_url_protocol(void) {
+    Class protocolClass = [RosettaSimURLProtocol class];
+
+    /* Register globally for old-style NSURLConnection */
+    [NSURLProtocol registerClass:protocolClass];
+    bridge_log("Registered RosettaSimURLProtocol globally");
+
+    /* Swizzle NSURLSessionConfiguration.protocolClasses getter to include our protocol.
+     * Try both the public class and the private concrete class used by CFNetwork. */
+    const char *classNames[] = {
+        "NSURLSessionConfiguration",
+        "__NSCFURLSessionConfiguration",
+        NULL
+    };
+    BOOL swizzled = NO;
+    for (int ci = 0; classNames[ci] && !swizzled; ci++) {
+        Class configClass = objc_getClass(classNames[ci]);
+        if (!configClass) {
+            bridge_log("RosettaSimURLProtocol: class %s not found", classNames[ci]);
+            continue;
+        }
+        bridge_log("RosettaSimURLProtocol: found class %s", classNames[ci]);
+
+        SEL protSel = sel_registerName("protocolClasses");
+        Method m = class_getInstanceMethod(configClass, protSel);
+        if (!m) {
+            bridge_log("RosettaSimURLProtocol: no -protocolClasses method on %s", classNames[ci]);
+            continue;
+        }
+
+        typedef id (*ProtClassesIMP)(id, SEL);
+        ProtClassesIMP origIMP = (ProtClassesIMP)method_getImplementation(m);
+
+        /* imp_implementationWithBlock blocks take (id self) as first arg — NO SEL */
+        id (^newBlock)(id) = ^id(id self_config) {
+            NSArray *orig = origIMP(self_config, protSel);
+            NSMutableArray *updated = [NSMutableArray arrayWithObject:protocolClass];
+            if (orig) [updated addObjectsFromArray:orig];
+            return [updated copy];
+        };
+
+        IMP newIMP = imp_implementationWithBlock(newBlock);
+        method_setImplementation(m, newIMP);
+        bridge_log("Swizzled %s.protocolClasses to include RosettaSimURLProtocol", classNames[ci]);
+        swizzled = YES;
+    }
+
+    if (!swizzled) {
+        bridge_log("WARNING: Could not swizzle protocolClasses — NSURLSession requests won't be intercepted");
+    }
+
+    /* Also swizzle NSURLSession's dataTaskWithRequest:completionHandler: to
+     * bypass the broken NSURLProtocol/NSURLSession integration.
+     * This performs HTTP requests directly and invokes the completion handler. */
+    Class sessionClass = objc_getClass("NSURLSession");
+    if (sessionClass) {
+        SEL dtSel = sel_registerName("dataTaskWithRequest:completionHandler:");
+        Method dtMethod = class_getInstanceMethod(sessionClass, dtSel);
+        if (dtMethod) {
+            typedef id (*orig_dt_fn)(id, SEL, id, id);
+            orig_dt_fn origDT = (orig_dt_fn)method_getImplementation(dtMethod);
+
+            id (^dtBlock)(id, id, id) = ^id(id self_session, id request, id completionBlock) {
+                NSURL *url = ((NSURL *(*)(id, SEL))objc_msgSend)(request, sel_registerName("URL"));
+                NSString *scheme = url ? ((NSString *(*)(id, SEL))objc_msgSend)(url, sel_registerName("scheme")) : nil;
+                BOOL isHTTP = scheme && [scheme caseInsensitiveCompare:@"http"] == NSOrderedSame;
+
+                if (!isHTTP || !completionBlock) {
+                    return origDT(self_session, dtSel, request, completionBlock);
+                }
+
+                bridge_log("NSURLSession swizzle: intercepting %s %s",
+                    ((NSString *(*)(id, SEL))objc_msgSend)(request, sel_registerName("HTTPMethod")).UTF8String ?: "?",
+                    ((NSString *(*)(id, SEL))objc_msgSend)(url, sel_registerName("absoluteString")).UTF8String ?: "?");
+
+                void (^handler)(NSData *, NSURLResponse *, NSError *) = [completionBlock copy];
+                id capturedReq = request;
+                NSURL *capturedURL = url;
+
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    @autoreleasepool {
+                        NSString *host = capturedURL.host;
+                        int port = capturedURL.port ? capturedURL.port.intValue : 80;
+                        NSString *resolvedHost = host;
+
+                        /* DNS map override */
+                        char *dnsMap = getenv("ROSETTASIM_DNS_MAP");
+                        if (dnsMap) {
+                            NSString *mapStr = [NSString stringWithUTF8String:dnsMap];
+                            for (NSString *entry in [mapStr componentsSeparatedByString:@","]) {
+                                NSArray *kv = [entry componentsSeparatedByString:@"="];
+                                if (kv.count == 2 && [kv[0] isEqualToString:host]) {
+                                    resolvedHost = kv[1];
+                                    bridge_log("NSURLSession swizzle: DNS override %s -> %s", host.UTF8String, resolvedHost.UTF8String);
+                                    break;
+                                }
+                            }
+                        }
+
+                        struct addrinfo hints = {0}, *res = NULL;
+                        hints.ai_family = AF_INET;
+                        hints.ai_socktype = SOCK_STREAM;
+                        char portStr[8];
+                        snprintf(portStr, sizeof(portStr), "%d", port);
+                        int gai = getaddrinfo(resolvedHost.UTF8String, portStr, &hints, &res);
+                        if (gai != 0) {
+                            bridge_log("NSURLSession swizzle: DNS resolve failed for %s", resolvedHost.UTF8String);
+                            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:-1003
+                                userInfo:@{NSLocalizedDescriptionKey: @"Cannot resolve host"}];
+                            dispatch_async(dispatch_get_main_queue(), ^{ handler(nil, nil, err); });
+                            return;
+                        }
+
+                        int sock = socket(AF_INET, SOCK_STREAM, 0);
+                        struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+                        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                        if (connect(sock, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
+                            close(sock); freeaddrinfo(res);
+                            bridge_log("NSURLSession swizzle: connect failed");
+                            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:-1004
+                                userInfo:@{NSLocalizedDescriptionKey: @"Cannot connect"}];
+                            dispatch_async(dispatch_get_main_queue(), ^{ handler(nil, nil, err); });
+                            return;
+                        }
+                        freeaddrinfo(res);
+
+                        NSString *method = ((NSString *(*)(id, SEL))objc_msgSend)(capturedReq, sel_registerName("HTTPMethod")) ?: @"GET";
+                        NSString *path = capturedURL.path.length > 0 ? capturedURL.path : @"/";
+                        if (capturedURL.query) path = [NSString stringWithFormat:@"%@?%@", path, capturedURL.query];
+
+                        NSMutableString *httpReq = [NSMutableString stringWithFormat:
+                            @"%@ %@ HTTP/1.1\r\nHost: %@:%d\r\nConnection: close\r\n",
+                            method, path, host, port];
+
+                        NSDictionary *headers = ((NSDictionary *(*)(id, SEL))objc_msgSend)(capturedReq, sel_registerName("allHTTPHeaderFields"));
+                        for (NSString *key in headers) {
+                            if ([key caseInsensitiveCompare:@"Content-Length"] == NSOrderedSame) continue;
+                            [httpReq appendFormat:@"%@: %@\r\n", key, headers[key]];
+                        }
+
+                        NSData *body = ((NSData *(*)(id, SEL))objc_msgSend)(capturedReq, sel_registerName("HTTPBody"));
+                        if (!body || body.length == 0) {
+                            NSInputStream *bs = ((NSInputStream *(*)(id, SEL))objc_msgSend)(capturedReq, sel_registerName("HTTPBodyStream"));
+                            if (bs) {
+                                NSMutableData *sd = [NSMutableData data];
+                                [bs open];
+                                uint8_t sbuf[4096]; NSInteger br;
+                                while ((br = [bs read:sbuf maxLength:sizeof(sbuf)]) > 0)
+                                    [sd appendBytes:sbuf length:br];
+                                [bs close];
+                                body = sd;
+                            }
+                        }
+
+                        if (body.length > 0)
+                            [httpReq appendFormat:@"Content-Length: %lu\r\n", (unsigned long)body.length];
+                        [httpReq appendString:@"\r\n"];
+
+                        send(sock, httpReq.UTF8String, strlen(httpReq.UTF8String), 0);
+                        if (body.length > 0)
+                            send(sock, body.bytes, body.length, 0);
+
+                        NSMutableData *responseData = [NSMutableData data];
+                        char rbuf[8192]; ssize_t n;
+                        while ((n = recv(sock, rbuf, sizeof(rbuf), 0)) > 0)
+                            [responseData appendBytes:rbuf length:n];
+                        close(sock);
+
+                        if (responseData.length == 0) {
+                            bridge_log("NSURLSession swizzle: empty response");
+                            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:-1005
+                                userInfo:@{NSLocalizedDescriptionKey: @"Empty response"}];
+                            dispatch_async(dispatch_get_main_queue(), ^{ handler(nil, nil, err); });
+                            return;
+                        }
+
+                        NSRange hdrEnd = [responseData rangeOfData:
+                            [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]
+                            options:0 range:NSMakeRange(0, MIN(responseData.length, 16384))];
+
+                        if (hdrEnd.location == NSNotFound) {
+                            NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:-1011
+                                userInfo:@{NSLocalizedDescriptionKey: @"Malformed response"}];
+                            dispatch_async(dispatch_get_main_queue(), ^{ handler(nil, nil, err); });
+                            return;
+                        }
+
+                        NSString *hdrStr = [[NSString alloc] initWithData:
+                            [responseData subdataWithRange:NSMakeRange(0, hdrEnd.location)]
+                            encoding:NSUTF8StringEncoding];
+                        NSData *bodyData = [responseData subdataWithRange:
+                            NSMakeRange(hdrEnd.location + 4, responseData.length - hdrEnd.location - 4)];
+
+                        NSArray *lines = [hdrStr componentsSeparatedByString:@"\r\n"];
+                        int statusCode = 200;
+                        if (lines.count > 0) {
+                            NSRange sp = [lines[0] rangeOfString:@" "];
+                            if (sp.location != NSNotFound)
+                                statusCode = [[lines[0] substringFromIndex:sp.location+1] intValue];
+                        }
+
+                        /* Parse response headers */
+                        NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
+                        for (NSUInteger i = 1; i < lines.count; i++) {
+                            NSRange colon = [lines[i] rangeOfString:@": "];
+                            if (colon.location != NSNotFound) {
+                                respHeaders[[lines[i] substringToIndex:colon.location]] =
+                                    [lines[i] substringFromIndex:colon.location + 2];
+                            }
+                        }
+
+                        bridge_log("NSURLSession swizzle: HTTP %d (%lu bytes body)",
+                            statusCode, (unsigned long)bodyData.length);
+
+                        NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc]
+                            initWithURL:capturedURL statusCode:statusCode HTTPVersion:@"HTTP/1.1"
+                            headerFields:respHeaders];
+
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            handler(bodyData, response, nil);
+                            bridge_log("NSURLSession swizzle: completion handler invoked on main queue");
+                        });
+                    }
+                });
+
+                /* Return nil — we handle everything directly and call the completion
+                 * handler ourselves. The caller shouldn't need the task object since
+                 * the work is already in progress. */
+                return nil;
+            };
+
+            IMP dtIMP = imp_implementationWithBlock(dtBlock);
+            method_setImplementation(dtMethod, dtIMP);
+            bridge_log("Swizzled NSURLSession.dataTaskWithRequest:completionHandler:");
+        }
+    }
 }
 
 /* ================================================================
@@ -2307,6 +3040,37 @@ static void _inject_single_touch(uint32_t phase, double tx, double ty) {
         }
     }
 
+    /* Fallback: fire UIControl actions when gesture delivery "succeeded" but
+     * UIKit's internal gesture recognizer pipeline may not have actually
+     * triggered the UIButton/UIControl action. This happens because UIKit's
+     * _UIButtonGestureRecognizer requires a fully functional IOHIDEvent
+     * environment that may not be present in RosettaSim's bridged context.
+     *
+     * We fire sendActionsForControlEvents: as a safety net. If the gesture
+     * pipeline already fired the action, this may cause a double-fire — but
+     * that's safer than missing the action entirely. */
+    if (controlTarget && gesture_delivery_succeeded && phase == ROSETTASIM_TOUCH_ENDED) {
+        Class uiButtonClass_fb = objc_getClass("UIButton");
+        int isButtonTarget = 0;
+        if (uiButtonClass_fb) {
+            Class c = object_getClass(controlTarget);
+            while (c) {
+                if (c == uiButtonClass_fb) { isButtonTarget = 1; break; }
+                c = class_getSuperclass(c);
+            }
+        }
+        if (isButtonTarget) {
+            @try {
+                /* UIControlEventTouchUpInside = 1 << 6 = 64 */
+                ((void(*)(id, SEL, unsigned long))objc_msgSend)(controlTarget,
+                    sel_registerName("sendActionsForControlEvents:"), 64);
+                bridge_log("  Fallback: UIButton sendActionsForControlEvents: TouchUpInside");
+            } @catch (id e) {
+                bridge_log("  Fallback: UIButton sendActions failed");
+            }
+        }
+    }
+
     /* Also deliver standard touchesBegan:/touchesMoved:/touchesEnded: to the
      * original hit-test target — BUT ONLY if sendEvent: was not used.
      * When sendEvent: succeeds, replacement_sendTouchesForEvent already
@@ -2509,8 +3273,9 @@ static void check_and_inject_keyboard(void) {
     if (key_code == 36) {
         /* Return key */
         if (isTextInput && hasInsertText) {
-            /* For UITextField, Return typically ends editing.
-             * Check if it's a UITextField and resign first responder. */
+            /* For UITextField, call the delegate's textFieldShouldReturn: first,
+             * which lets the app handle Return (e.g. trigger connect, move to next
+             * field). Then resign first responder only if the delegate didn't. */
             if (uiTextFieldClass) {
                 Class c = object_getClass(firstResponder);
                 int isTF = 0;
@@ -2519,11 +3284,41 @@ static void check_and_inject_keyboard(void) {
                     c = class_getSuperclass(c);
                 }
                 if (isTF) {
+                    /* Call textFieldShouldReturn: on the delegate. This may trigger
+                     * network operations (connectTapped -> loginWithTrustedNetwork).
+                     * The call is deferred to the next run loop iteration via a
+                     * zero-delay timer so NSURLSession tasks are properly scheduled. */
+                    id __strong capturedTextField = firstResponder;
                     @try {
-                        ((bool(*)(id, SEL))objc_msgSend)(firstResponder,
-                            sel_registerName("resignFirstResponder"));
-                        bridge_log("  UITextField resignFirstResponder (Return)");
-                    } @catch (id e) { /* ignore */ }
+                        SEL delegateSel = sel_registerName("delegate");
+                        id delegate = ((id(*)(id, SEL))objc_msgSend)(capturedTextField, delegateSel);
+                        if (delegate) {
+                            SEL shouldReturnSel = sel_registerName("textFieldShouldReturn:");
+                            if (class_respondsToSelector(object_getClass(delegate), shouldReturnSel)) {
+                                bridge_log("  Calling textFieldShouldReturn: on delegate %s",
+                                    class_getName(object_getClass(delegate)));
+                                /* Use performSelector:afterDelay:0 which schedules on the
+                                 * current run loop — safer for NSURLSession operations */
+                                ((void(*)(id, SEL, SEL, id, double))objc_msgSend)(
+                                    delegate,
+                                    sel_registerName("performSelector:withObject:afterDelay:"),
+                                    shouldReturnSel,
+                                    capturedTextField,
+                                    0.0);
+                                bridge_log("  textFieldShouldReturn: scheduled via performSelector:afterDelay:");
+                            } else {
+                                ((bool(*)(id, SEL))objc_msgSend)(capturedTextField,
+                                    sel_registerName("resignFirstResponder"));
+                                bridge_log("  UITextField resignFirstResponder (Return, no delegate)");
+                            }
+                        } else {
+                            ((bool(*)(id, SEL))objc_msgSend)(capturedTextField,
+                                sel_registerName("resignFirstResponder"));
+                            bridge_log("  UITextField resignFirstResponder (Return, nil delegate)");
+                        }
+                    } @catch (id e) {
+                        bridge_log("  Return key handling threw exception");
+                    }
                     return;
                 }
             }
@@ -2878,15 +3673,98 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     /* Check for and inject keyboard events from host */
     check_and_inject_keyboard();
 
-    /* When CARenderServer is active, skip CPU rendering entirely.
-     * PurpleFBServer (in backboardd) handles framebuffer rendering.
-     * We only need to process touch/keyboard input and flush CA transactions. */
-    /* Note: Even with CARenderServer connected (g_ca_server_connected=1), we still
-     * do CPU rendering for the framebuffer. CARenderServer handles CA internals
-     * (animations, effects, compositor) but the app's window layer tree isn't
-     * committed to the display surface because UIScreen lacks a proper CADisplay
-     * from CARenderServer. CPU rendering via renderInContext captures the final
-     * composited state and writes to the shared framebuffer for the host app.
+    /* GPU Rendering mode: Hybrid approach.
+     *
+     * PHASE 1: Populate layer backing stores (CPU) — same as standalone mode.
+     *   _force_display_recursive triggers drawRect: on layers that need content.
+     *   This creates CGImage/IOSurface backing stores for text, backgrounds, etc.
+     *
+     * PHASE 2: Commit to CARenderServer (GPU) — server composites with proper
+     *   tintColor, animations, blur, and display cycle.
+     *
+     * PHASE 3: Copy from backboardd framebuffer — CARenderServer renders to
+     *   PurpleDisplay surface, we relay to the app framebuffer for the host. */
+    if (g_gpu_rendering_active && _backboardd_fb_mmap && _fb_mmap) {
+        RosettaSimFramebufferHeader *dst_hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
+        void *dst_pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_META_SIZE;
+
+        /* Get root layer */
+        id layer = NULL;
+        if (_bridge_root_window) {
+            layer = ((id(*)(id, SEL))objc_msgSend)(
+                _bridge_root_window, sel_registerName("layer"));
+        }
+        if (!layer) goto gpu_copy;
+
+        /* Ensure root layer is visible */
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(layer, sel_registerName("setHidden:"), (BOOL)false);
+
+        /* PHASE 1+2: Layout + force display + commit to server.
+         * Wrapped in @try because UIScrollView layout can crash. */
+        @try {
+            /* Flush pending CA changes */
+            Class catClass = objc_getClass("CATransaction");
+            if (catClass) {
+                ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+            }
+
+            /* Layout */
+            ((void(*)(id, SEL))objc_msgSend)(
+                _bridge_root_window, sel_registerName("setNeedsLayout"));
+            ((void(*)(id, SEL))objc_msgSend)(
+                _bridge_root_window, sel_registerName("layoutIfNeeded"));
+
+            /* Force-display to populate layer backing stores.
+             * Same countdown logic as CPU mode. */
+            int need_force = 0;
+            if (_force_display_countdown > 0) {
+                _force_display_countdown--;
+                need_force = 1;
+            }
+            {
+                static int _gpu_periodic = 0;
+                _gpu_periodic++;
+                if (_gpu_periodic >= 30) { _gpu_periodic = 0; need_force = 1; }
+            }
+            if (need_force) {
+                _force_display_recursive(layer, 0);
+                if (_force_full_refresh) _force_full_refresh = 0;
+            }
+
+            /* Commit populated layers to CARenderServer */
+            if (catClass) {
+                ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+            }
+        } @catch (id ex) {
+            /* Layout/display crashed — skip this frame's population */
+        }
+
+    gpu_copy:
+        /* PHASE 3: Copy from backboardd framebuffer (CARenderServer output).
+         * 1-frame latency: content populated this tick is composited by the
+         * server asynchronously and visible next tick (~33ms at 30fps). */
+        {
+            RosettaSimFramebufferHeader *src_hdr = (RosettaSimFramebufferHeader *)_backboardd_fb_mmap;
+            void *src_pixels = (uint8_t *)_backboardd_fb_mmap + ROSETTASIM_FB_META_SIZE;
+
+            if (src_hdr->magic == ROSETTASIM_FB_MAGIC &&
+                src_hdr->width == dst_hdr->width &&
+                src_hdr->height == dst_hdr->height) {
+                size_t pixel_bytes = (size_t)dst_hdr->width * dst_hdr->height * 4;
+                memcpy(dst_pixels, src_pixels, pixel_bytes);
+                dst_hdr->frame_counter++;
+            }
+        }
+
+        return;  /* Skip CPU renderInContext */
+    }
+
+    /* CPU Rendering mode: When CARenderServer is not available or display
+     * association failed, we use renderInContext to capture the layer tree.
+     *
+     * Note: Even with CARenderServer connected (g_ca_server_connected=1), if
+     * g_gpu_rendering_active is 0, we still do CPU rendering because the app's
+     * window layer tree isn't committed to a CADisplay on CARenderServer.
      *
      * The CARenderServer connection DOES improve rendering quality by enabling:
      * - CABasicAnimation / CAKeyframeAnimation (real animations instead of static)
@@ -3213,18 +4091,27 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
         NULL
     };
 
-    /* CARenderServer connection can be enabled via ROSETTASIM_CA_MODE=server.
-     * Default is CPU rendering which is proven to render the full UI.
-     * CARenderServer mode currently only renders animated layers (spinner)
-     * because the app's layer tree isn't committed to a CADisplay. */
+    /* CARenderServer connection can be controlled via ROSETTASIM_CA_MODE:
+     *   "server" — always enable CARenderServer routing (default when broker present)
+     *   "cpu"    — force CPU-only rendering even under broker
+     * When running under the broker (g_bridge_broker_port != NULL), server mode
+     * is enabled by default to leverage GPU rendering via backboardd's CARenderServer. */
     static int _ca_mode_checked = 0;
     static int _ca_mode_server = 0;
     if (!_ca_mode_checked) {
         const char *mode = getenv("ROSETTASIM_CA_MODE");
-        _ca_mode_server = (mode && strcmp(mode, "server") == 0);
+        if (mode && strcmp(mode, "cpu") == 0) {
+            _ca_mode_server = 0;
+        } else if (mode && strcmp(mode, "server") == 0) {
+            _ca_mode_server = 1;
+        } else {
+            /* Auto-detect: enable server mode when running under broker */
+            _ca_mode_server = (g_bridge_broker_port != MACH_PORT_NULL) ? 1 : 0;
+        }
         _ca_mode_checked = 1;
         if (_ca_mode_server) {
-            bridge_log("CARenderServer mode enabled via ROSETTASIM_CA_MODE=server");
+            bridge_log("CARenderServer mode enabled (broker_port=0x%x)",
+                       g_bridge_broker_port);
         }
     }
 
@@ -3245,6 +4132,33 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
                 }
                 /* Broker lookup failed — fall through to real bootstrap_look_up */
                 break;
+            }
+        }
+    }
+
+    /* Fast-fail services that would hang in the iOS SDK's mach_msg2/XPC path.
+     * The real bootstrap_look_up (iOS SDK) uses mach_msg2 which can hang when
+     * the service doesn't exist and there's no proper launchd_sim. Return
+     * BOOTSTRAP_UNKNOWN_SERVICE (1102) immediately for known-missing services. */
+    if (name) {
+        static const char *fast_fail_services[] = {
+            "com.apple.SystemConfiguration.configd_sim",
+            "com.apple.springboard.backgroundappservices",
+            "com.apple.backboard.hid.services",
+            "com.apple.backboard.display.services",
+            "com.apple.analyticsd",
+            "com.apple.coreservices.lsuseractivityd.simulatorsupport",
+            NULL
+        };
+        for (int i = 0; fast_fail_services[i]; i++) {
+            if (strcmp(name, fast_fail_services[i]) == 0) {
+                static int _ff_log_count = 0;
+                if (_ff_log_count < 20) {
+                    bridge_log("bootstrap_look_up('%s') → FAST_FAIL (service not available)", name);
+                    _ff_log_count++;
+                }
+                if (sp) *sp = MACH_PORT_NULL;
+                return 1102;  /* BOOTSTRAP_UNKNOWN_SERVICE */
             }
         }
     }
@@ -3340,6 +4254,28 @@ __attribute__((section("__DATA,__interpose"))) = {
      * bootstrap_look_up() which IS a cross-library call to libSystem. */
     { (const void *)replacement_bootstrap_look_up,
       (const void *)bootstrap_look_up },
+
+    /* SCNetworkReachability - stub to bypass configd_sim dependency.
+     * Without configd_sim, NSURLSession hangs waiting for reachability. */
+    { (const void *)replacement_SCNetworkReachabilityCreateWithAddress,
+      (const void *)SCNetworkReachabilityCreateWithAddress },
+    { (const void *)replacement_SCNetworkReachabilityCreateWithName,
+      (const void *)SCNetworkReachabilityCreateWithName },
+    { (const void *)replacement_SCNetworkReachabilityGetFlags,
+      (const void *)SCNetworkReachabilityGetFlags },
+    { (const void *)replacement_SCNetworkReachabilitySetCallback,
+      (const void *)SCNetworkReachabilitySetCallback },
+    { (const void *)replacement_SCNetworkReachabilityScheduleWithRunLoop,
+      (const void *)SCNetworkReachabilityScheduleWithRunLoop },
+    { (const void *)replacement_SCNetworkReachabilityUnscheduleFromRunLoop,
+      (const void *)SCNetworkReachabilityUnscheduleFromRunLoop },
+
+    /* SCDynamicStore - stub for proxy configuration.
+     * NSURLSession queries proxy settings via SCDynamicStoreCopyProxies. */
+    { (const void *)replacement_SCDynamicStoreCreate,
+      (const void *)SCDynamicStoreCreate },
+    { (const void *)replacement_SCDynamicStoreCopyProxies,
+      (const void *)SCDynamicStoreCopyProxies },
 };
 
 /* ================================================================
@@ -4012,6 +4948,284 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
 
     start_frame_capture();
 
+    /* ================================================================
+     * GPU Rendering: Check if CARenderServer has a display we can use.
+     *
+     * When CARenderServer is connected (via broker), query it for displays.
+     * If a main display exists, try to associate UIScreen with it and
+     * enable GPU rendering mode (CARenderServer composites to PurpleDisplay
+     * framebuffer instead of CPU renderInContext).
+     * ================================================================ */
+    if (g_ca_server_connected) {
+        bridge_log("GPU Rendering: Checking CARenderServer display availability...");
+        @try {
+            Class caDisplayClass = objc_getClass("CADisplay");
+            if (caDisplayClass) {
+                /* Query CARenderServer for displays via _CASGetDisplays MIG call */
+                id displays = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)caDisplayClass, sel_registerName("displays"));
+                id mainDisplay = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)caDisplayClass, sel_registerName("mainDisplay"));
+
+                unsigned long displayCount = 0;
+                if (displays) {
+                    displayCount = ((unsigned long(*)(id, SEL))objc_msgSend)(
+                        displays, sel_registerName("count"));
+                }
+
+                bridge_log("GPU Rendering: [CADisplay displays] count=%lu", displayCount);
+                if (displays && displayCount > 0) {
+                    for (unsigned long di = 0; di < displayCount; di++) {
+                        id d = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                            displays, sel_registerName("objectAtIndex:"), di);
+                        id dName = ((id(*)(id, SEL))objc_msgSend)(d, sel_registerName("name"));
+                        id dUid = ((id(*)(id, SEL))objc_msgSend)(d, sel_registerName("uniqueId"));
+                        bridge_log("GPU Rendering:   display[%lu]: name=%s uid=%s ptr=%p",
+                                   di,
+                                   dName ? ((const char *(*)(id, SEL))objc_msgSend)(dName, sel_registerName("UTF8String")) : "nil",
+                                   dUid ? ((const char *(*)(id, SEL))objc_msgSend)(dUid, sel_registerName("UTF8String")) : "nil",
+                                   (void *)d);
+                    }
+                }
+                bridge_log("GPU Rendering: [CADisplay mainDisplay] = %p", (void *)mainDisplay);
+
+                /* Dump UIScreen ivars to understand display association */
+                Class uiScreenClass = objc_getClass("UIScreen");
+                if (uiScreenClass) {
+                    unsigned int ivarCount = 0;
+                    Ivar *ivars = class_copyIvarList(uiScreenClass, &ivarCount);
+                    bridge_log("GPU Rendering: UIScreen has %u ivars:", ivarCount);
+                    for (unsigned int i = 0; i < ivarCount; i++) {
+                        bridge_log("GPU Rendering:   ivar[%u]: %s (type=%s offset=%ld)",
+                                   i, ivar_getName(ivars[i]),
+                                   ivar_getTypeEncoding(ivars[i]) ?: "?",
+                                   ivar_getOffset(ivars[i]));
+                    }
+                    free(ivars);
+
+                    id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
+                        (id)uiScreenClass, sel_registerName("mainScreen"));
+                    bridge_log("GPU Rendering: [UIScreen mainScreen] = %p", (void *)mainScreen);
+
+                    if (mainDisplay && mainScreen) {
+                        /* Try to associate UIScreen with CADisplay.
+                         * Look for _display or _caDisplay ivar. */
+                        const char *display_ivar_names[] = {
+                            "_display", "_caDisplay", "_displayConfiguration",
+                            "_displayId", NULL
+                        };
+                        for (int ni = 0; display_ivar_names[ni]; ni++) {
+                            Ivar dIvar = class_getInstanceVariable(uiScreenClass,
+                                                                    display_ivar_names[ni]);
+                            if (dIvar) {
+                                id currentVal = *(id *)((uint8_t *)mainScreen + ivar_getOffset(dIvar));
+                                bridge_log("GPU Rendering: UIScreen.%s = %p (attempting to set to %p)",
+                                           display_ivar_names[ni], (void *)currentVal, (void *)mainDisplay);
+                                if (!currentVal || currentVal != mainDisplay) {
+                                    *(id *)((uint8_t *)mainScreen + ivar_getOffset(dIvar)) = mainDisplay;
+                                    bridge_log("GPU Rendering: Set UIScreen.%s = %p (CADisplay mainDisplay)",
+                                               display_ivar_names[ni], (void *)mainDisplay);
+                                }
+                                break;
+                            }
+                        }
+
+                        /* === CAContext diagnostic: check if window has a render context === */
+                        if (_bridge_root_window) {
+                            id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
+                                _bridge_root_window, sel_registerName("layer"));
+                            bridge_log("GPU Rendering: root window layer = %p", (void *)rootLayer);
+
+                            /* Check CAContext class methods */
+                            Class caContextClass = objc_getClass("CAContext");
+                            if (caContextClass) {
+                                /* List class methods to find remote context creation */
+                                unsigned int cmCount = 0;
+                                Method *cmethods = class_copyMethodList(object_getClass((id)caContextClass), &cmCount);
+                                bridge_log("GPU Rendering: CAContext has %u class methods:", cmCount);
+                                for (unsigned int ci = 0; ci < cmCount && ci < 15; ci++) {
+                                    bridge_log("GPU Rendering:   +%s", sel_getName(method_getName(cmethods[ci])));
+                                }
+                                free(cmethods);
+
+                                /* List instance methods */
+                                unsigned int imCount = 0;
+                                Method *imethods = class_copyMethodList(caContextClass, &imCount);
+                                bridge_log("GPU Rendering: CAContext has %u instance methods:", imCount);
+                                for (unsigned int ci = 0; ci < imCount && ci < 20; ci++) {
+                                    bridge_log("GPU Rendering:   -%s", sel_getName(method_getName(imethods[ci])));
+                                }
+                                free(imethods);
+
+                                /* Try to create a remote context with the display.
+                                 * Extract displayId from CADisplay._impl C++ object.
+                                 * Layout: vtable(8) + objcBackPtr(8) + name(8) + deviceName(8) + displayId(4) */
+                                Ivar implIvar = class_getInstanceVariable(object_getClass(mainDisplay), "_impl");
+                                if (implIvar) {
+                                    void *impl = *(void **)((uint8_t *)mainDisplay + ivar_getOffset(implIvar));
+                                    if (impl) {
+                                        unsigned int displayId = *(unsigned int *)((uint8_t *)impl + 32);
+                                        bridge_log("GPU Rendering: CADisplay._impl = %p, displayId = %u", impl, displayId);
+
+                                        /* Try remoteContextWithOptions: */
+                                        SEL remoteCtxSel = sel_registerName("remoteContextWithOptions:");
+                                        if (class_respondsToSelector(object_getClass((id)caContextClass), remoteCtxSel)) {
+                                            bridge_log("GPU Rendering: Found +[CAContext remoteContextWithOptions:]");
+                                            @try {
+                                                /* Build options dictionary: {kCAContextDisplayId: displayId} */
+                                                Class nsDictClass = objc_getClass("NSDictionary");
+                                                Class nsNumClass = objc_getClass("NSNumber");
+                                                id displayIdNum = ((id(*)(id, SEL, unsigned int))objc_msgSend)(
+                                                    (id)nsNumClass, sel_registerName("numberWithUnsignedInt:"), displayId);
+                                                id keys[] = { ((id(*)(id, SEL, const char *))objc_msgSend)(
+                                                    (id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"),
+                                                    "displayId") };
+                                                id vals[] = { displayIdNum };
+                                                id opts = ((id(*)(id, SEL, id *, id *, unsigned long))objc_msgSend)(
+                                                    (id)nsDictClass, sel_registerName("dictionaryWithObjects:forKeys:count:"),
+                                                    vals, keys, 1);
+
+                                                id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
+                                                    (id)caContextClass, remoteCtxSel, opts);
+                                                bridge_log("GPU Rendering: remoteContext = %p", (void *)remoteCtx);
+
+                                                if (remoteCtx) {
+                                                    /* Set the window's root layer as the context's layer */
+                                                    SEL setLayerSel = sel_registerName("setLayer:");
+                                                    if (class_respondsToSelector(caContextClass, setLayerSel)) {
+                                                        ((void(*)(id, SEL, id))objc_msgSend)(
+                                                            remoteCtx, setLayerSel, rootLayer);
+                                                        bridge_log("GPU Rendering: Set remote context layer = root window layer");
+
+                                                        /* Get context ID */
+                                                        SEL ctxIdSel = sel_registerName("contextId");
+                                                        if (class_respondsToSelector(caContextClass, ctxIdSel)) {
+                                                            unsigned int ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                                                remoteCtx, ctxIdSel);
+                                                            bridge_log("GPU Rendering: remote context ID = %u", ctxId);
+                                                        }
+                                                    }
+
+                                                    /* Retain the context so it doesn't get deallocated */
+                                                    ((id(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("retain"));
+                                                }
+                                            } @catch (id ex) {
+                                                bridge_log("GPU Rendering: remoteContext creation failed: %s",
+                                                           ((const char *(*)(id, SEL))objc_msgSend)(
+                                                               ex, sel_registerName("UTF8String")) ?: "unknown");
+                                            }
+                                        } else {
+                                            /* Try localContextWithOptions: as fallback */
+                                            SEL localCtxSel = sel_registerName("localContextWithOptions:");
+                                            if (class_respondsToSelector(object_getClass((id)caContextClass), localCtxSel)) {
+                                                bridge_log("GPU Rendering: Found +[CAContext localContextWithOptions:] (no remote)");
+                                            } else {
+                                                bridge_log("GPU Rendering: No remote or local context creation method found");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            /* Force a full commit of the layer tree to CARenderServer */
+                            @try {
+                                Class catClass = objc_getClass("CATransaction");
+                                if (catClass) {
+                                    ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+                                    bridge_log("GPU Rendering: Flushed CATransaction after context setup");
+                                }
+                            } @catch (id ex) { /* ignore */ }
+                        }
+
+                        /* GPU framebuffer relay: disabled for now.
+                         * CARenderServer doesn't composite unregistered client content.
+                         * The app needs to register via display services (BKSDisplayServices)
+                         * before CARenderServer will composite its layers.
+                         *
+                         * For now, we keep CARenderServer CONNECTED (helps with animation
+                         * quality, tintColor, CADisplayLink) but use CPU rendering
+                         * (renderInContext) for framebuffer capture.
+                         *
+                         * TODO: Build HID System Manager bundle that triggers proper
+                         * display registration in backboardd, enabling full GPU compositing. */
+                        bridge_log("GPU Rendering: CARenderServer connected but display client "
+                                   "registration not available — using CPU rendering with server-assisted quality");
+                        bridge_log("GPU Rendering: CARenderServer improves: animations, tintColor, CADisplayLink");
+                        /* g_gpu_rendering_active stays 0 — CPU rendering used */
+                    } else {
+                        bridge_log("GPU Rendering: No CADisplay mainDisplay — staying in CPU mode");
+                    }
+                }
+            }
+        } @catch (id ex) {
+            bridge_log("GPU Rendering: Exception during setup: %s",
+                       ((const char *(*)(id, SEL))objc_msgSend)(ex, sel_registerName("UTF8String")) ?: "unknown");
+        }
+    }
+
+    /* ================================================================
+     * Network connectivity test — verify raw TCP works in the simulator.
+     * NSURLSession/CFNetwork may be broken due to missing configd_sim,
+     * but BSD sockets should work since they go through the host kernel. */
+    {
+        bridge_log("Network test: attempting raw TCP to HA server...");
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(8123);
+            addr.sin_addr.s_addr = htonl(0xC0A801A2); /* 192.168.1.162 */
+
+            /* Non-blocking connect with 5s timeout */
+            int flags = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+            int result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+            if (result < 0 && errno == EINPROGRESS) {
+                fd_set wset;
+                FD_ZERO(&wset);
+                FD_SET(sock, &wset);
+                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                int sel = select(sock + 1, NULL, &wset, NULL, &tv);
+                if (sel > 0) {
+                    int so_error = 0;
+                    socklen_t len = sizeof(so_error);
+                    getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
+                    result = so_error == 0 ? 0 : -1;
+                    if (result < 0) errno = so_error;
+                } else {
+                    result = -1;
+                    errno = ETIMEDOUT;
+                }
+            }
+            fcntl(sock, F_SETFL, flags); /* restore blocking */
+
+            bridge_log("Network test: TCP connect → %s (errno=%d)",
+                       result == 0 ? "CONNECTED" : "FAILED", result != 0 ? errno : 0);
+            if (result == 0) {
+                const char *req = "GET /auth/providers HTTP/1.1\r\n"
+                                  "Host: homeassistant.local:8123\r\n"
+                                  "Connection: close\r\n\r\n";
+                send(sock, req, strlen(req), 0);
+
+                /* Read response with 5s timeout */
+                struct timeval rtv = { .tv_sec = 5, .tv_usec = 0 };
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+                char buf[4096];
+                int n = (int)recv(sock, buf, sizeof(buf) - 1, 0);
+                if (n > 0) {
+                    buf[n] = 0;
+                    bridge_log("Network test: HTTP response (%d bytes): %.300s", n, buf);
+                } else {
+                    bridge_log("Network test: No HTTP response (recv=%d errno=%d)", n, errno);
+                }
+            }
+            close(sock);
+        } else {
+            bridge_log("Network test: socket() failed (errno=%d)", errno);
+        }
+    }
+
     /* Mark init complete — exit() calls are now allowed */
     _init_phase = 0;
 
@@ -4315,6 +5529,87 @@ static void swizzle_bks_methods(void) {
             bridge_log("  BKSTextInputSessionManager: ALL methods → no-op");
         }
     }
+
+    /* UIViewController.presentViewController:animated:completion:
+     *
+     * UIAlertController presentation requires the full UIKit windowing stack.
+     * In our environment, alert windows may not render correctly. For
+     * UIAlertController specifically, we auto-invoke the first action's
+     * handler (auto-selecting the first option in picker dialogs). */
+    {
+        Class vcClass = objc_getClass("UIViewController");
+        if (vcClass) {
+            SEL presentSel = sel_registerName("presentViewController:animated:completion:");
+            Method presentMethod = class_getInstanceMethod(vcClass, presentSel);
+            if (presentMethod) {
+                typedef void (*PresentIMP)(id, SEL, id, BOOL, id);
+                __block PresentIMP origPresentIMP = (PresentIMP)method_getImplementation(presentMethod);
+
+                id newBlock = ^(id self_vc, id presented, BOOL animated, id completion) {
+                    Class alertClass = objc_getClass("UIAlertController");
+                    if (alertClass && [presented isKindOfClass:alertClass]) {
+                        bridge_log("presentViewController: UIAlertController detected — auto-selecting first action");
+
+                        /* Get the alert's actions array */
+                        NSArray *actions = ((id(*)(id, SEL))objc_msgSend)(
+                            presented, sel_registerName("actions"));
+
+                        if (actions && actions.count > 0) {
+                            id firstAction = actions[0];
+                            bridge_log("  Auto-selecting action: %s",
+                                       ((const char *(*)(id, SEL))objc_msgSend)(
+                                           ((id(*)(id, SEL))objc_msgSend)(firstAction, sel_registerName("title")),
+                                           sel_registerName("UTF8String")) ?: "nil");
+
+                            /* Extract the handler block from UIAlertAction's private ivar.
+                             * The handler is stored as _handler (type @? = block). */
+                            Ivar handlerIvar = class_getInstanceVariable(object_getClass(firstAction), "_handler");
+                            if (handlerIvar) {
+                                void (^handler)(id) = *(void (^__strong *)(id))(
+                                    (uint8_t *)firstAction + ivar_getOffset(handlerIvar));
+                                if (handler) {
+                                    bridge_log("  Invoking action handler on main queue");
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        @try {
+                                            handler(firstAction);
+                                        } @catch (id ex) {
+                                            bridge_log("  Action handler threw exception");
+                                        }
+                                    });
+                                } else {
+                                    bridge_log("  Action has no handler block");
+                                }
+                            } else {
+                                bridge_log("  Could not find _handler ivar on UIAlertAction");
+                            }
+                        } else {
+                            bridge_log("  UIAlertController has no actions");
+                        }
+
+                        /* Also call the completion block if provided */
+                        if (completion) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                ((void(^)(void))completion)();
+                            });
+                        }
+                        return;  /* Don't actually present — it would fail */
+                    }
+
+                    /* For non-UIAlertController presentations, try the original */
+                    @try {
+                        origPresentIMP(self_vc, presentSel, presented, animated, completion);
+                    } @catch (id ex) {
+                        bridge_log("presentViewController: failed for %s",
+                                   class_getName(object_getClass(presented)));
+                    }
+                };
+
+                method_setImplementation(presentMethod,
+                    imp_implementationWithBlock(newBlock));
+                bridge_log("  UIViewController.presentViewController: swizzled for UIAlertController auto-select");
+            }
+        }
+    }
 }
 
 /* Global exception handler — log with full context, re-throw unknown exceptions.
@@ -4459,6 +5754,10 @@ static void rosettasim_bridge_init(void) {
 
     /* Swizzle BackBoardServices methods that crash without backboardd */
     swizzle_bks_methods();
+
+    /* Register NSURLProtocol bypass — routes HTTP requests through BSD sockets
+     * instead of CFNetwork, which requires configd_sim. */
+    _register_url_protocol();
 
     /* Set global exception handler — configurable via ROSETTASIM_EXCEPTION_MODE */
     {
