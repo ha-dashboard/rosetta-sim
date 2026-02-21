@@ -1031,6 +1031,36 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                         }
                     }
 
+                    /* Ensure pre-created context exists BEFORE views are created */
+                    if (g_ca_server_connected && !_bridge_pre_created_context) {
+                        bridge_log("  Forcing pre-created context NOW (before didFinishLaunching)...");
+                        /* Trigger the early context creation */
+                        Class caCtxCls = objc_getClass("CAContext");
+                        if (caCtxCls) {
+                            mach_port_t cp = MACH_PORT_NULL;
+                            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
+                            mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
+                            ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                                (id)caCtxCls, sel_registerName("setClientPort:"), cp);
+                            @try {
+                                NSDictionary *opts = @{@"displayable": @YES, @"display": @(1), @"clientPortNumber": @(cp)};
+                                id ctx = ((id(*)(id, SEL, id))objc_msgSend)(
+                                    (id)caCtxCls, sel_registerName("remoteContextWithOptions:"), opts);
+                                if (ctx) {
+                                    ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("retain"));
+                                    _bridge_pre_created_context = ctx;
+                                    unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                        ctx, sel_registerName("contextId"));
+                                    bridge_log("  Pre-created REMOTE context: ID=%u (before didFinishLaunching)", cid);
+                                    int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                                    if (fd >= 0) { char b[32]; int l = snprintf(b,32,"%u",cid); write(fd,b,l); close(fd); }
+                                }
+                            } @catch (id ex) {
+                                bridge_log("  Pre-create context threw: %s", [[ex description] UTF8String] ?: "?");
+                            }
+                        }
+                    }
+
                     /* Call didFinishLaunchingWithOptions: */
                     SEL didFinishSel = sel_registerName("application:didFinishLaunchingWithOptions:");
                     Class appObjClass = object_getClass(app);
@@ -6670,7 +6700,42 @@ static void swizzle_bks_methods(void) {
             method_setImplementation(m, (IMP)replacement_makeKeyAndVisible);
         }
 
-        /* UIWindow.isKeyWindow — let UIKit manage natively.
+        /* Swizzle UIWindow.initWithFrame: to set the pre-created remote context
+         * immediately when the window is created (before any views are added). */
+        SEL initFrameSel = sel_registerName("initWithFrame:");
+        Method initFrameM = class_getInstanceMethod(windowClass, initFrameSel);
+        if (initFrameM) {
+            typedef struct { double x, y, w, h; } _CGRect;
+            typedef id (*orig_initFrame_fn)(id, SEL, _CGRect);
+            __block orig_initFrame_fn origInitFrame = (orig_initFrame_fn)method_getImplementation(initFrameM);
+            id (^initFrameBlock)(id, _CGRect) = ^id(id _self, _CGRect frame) {
+                bridge_log("  [UIWindow initWithFrame:] SWIZZLE FIRED (pre_ctx=%p)", (void *)_bridge_pre_created_context);
+                id result = origInitFrame(_self, initFrameSel, frame);
+                if (result && _bridge_pre_created_context) {
+                    Ivar lcIvar = class_getInstanceVariable(object_getClass(result), "_layerContext");
+                    if (lcIvar) {
+                        id existing = *(id *)((uint8_t *)result + ivar_getOffset(lcIvar));
+                        if (!existing) {
+                            ((id(*)(id, SEL))objc_msgSend)(_bridge_pre_created_context, sel_registerName("retain"));
+                            *(id *)((uint8_t *)result + ivar_getOffset(lcIvar)) = _bridge_pre_created_context;
+                            /* Set the window's layer as context's layer */
+                            id rootL = ((id(*)(id, SEL))objc_msgSend)(result, sel_registerName("layer"));
+                            if (rootL && [_bridge_pre_created_context respondsToSelector:sel_registerName("setLayer:")]) {
+                                ((void(*)(id, SEL, id))objc_msgSend)(
+                                    _bridge_pre_created_context, sel_registerName("setLayer:"), rootL);
+                            }
+                            bridge_log("  [UIWindow initWithFrame:] set PRE-CREATED context on window %p", (void *)result);
+                        }
+                    }
+                }
+                return result;
+            };
+            IMP initFrameIMP = imp_implementationWithBlock(initFrameBlock);
+            method_setImplementation(initFrameM, initFrameIMP);
+            bridge_log("  Swizzled UIWindow.initWithFrame: for early context injection");
+        }
+
+    /* UIWindow.isKeyWindow — let UIKit manage natively.
          * With the real makeKeyAndVisible running, UIKit tracks key window
          * state internally. Our replacement_isKeyWindow is kept as fallback
          * but UIKit's native impl should work. */
