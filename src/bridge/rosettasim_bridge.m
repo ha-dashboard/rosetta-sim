@@ -4441,6 +4441,23 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
         }
     }
 
+    /* For display services, retry with wait since backboardd may still be registering */
+    if (name && strcmp(name, "com.apple.backboard.display.services") == 0) {
+        bridge_log("bootstrap_look_up('%s') — waiting for service...", name);
+        for (int r = 0; r < 30; r++) { /* 30 × 200ms = 6 seconds max */
+            mach_port_t dsPort = bridge_broker_lookup(name);
+            if (dsPort != MACH_PORT_NULL) {
+                if (sp) *sp = dsPort;
+                bridge_log("bootstrap_look_up('%s') → %u (broker, after %d retries)", name, dsPort, r);
+                return KERN_SUCCESS;
+            }
+            usleep(200000);
+        }
+        bridge_log("bootstrap_look_up('%s') → FAILED after 30 retries", name);
+        if (sp) *sp = MACH_PORT_NULL;
+        return 1102; /* BOOTSTRAP_UNKNOWN_SERVICE */
+    }
+
     /* Pass through to real bootstrap_look_up for all other services */
     kern_return_t kr = bootstrap_look_up(bp, name, sp);
     if (name) {

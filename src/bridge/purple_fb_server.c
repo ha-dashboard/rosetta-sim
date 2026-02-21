@@ -1324,20 +1324,22 @@ static void *pfb_display_services_thread(void *arg) {
             reply.header.msgh_id = 6001005 + 100; /* Reply ID = request + 100 */
             reply.ndr = NDR_record;
             reply.retcode = 0; /* success */
-            reply.width = PFB_PIXEL_WIDTH;   /* 750 */
-            reply.height = PFB_PIXEL_HEIGHT; /* 1334 */
-            /* Scale is 2.0 for iPhone 6s, represented as...
-             * Need to check if these are float or int.
-             * From the BKS code, they're stored as uint32 via movl */
-            float scale = 2.0f;
-            memcpy(&reply.scaleX, &scale, 4);
-            memcpy(&reply.scaleY, &scale, 4);
+            /* All four values are FLOATS stored as raw uint32 bits.
+             * Width and height are in points. */
+            float fw = (float)PFB_POINT_WIDTH;  /* 375.0 */
+            float fh = (float)PFB_POINT_HEIGHT; /* 667.0 */
+            float sx = 2.0f;  /* scale X */
+            float sy = 2.0f;  /* scale Y */
+            memcpy(&reply.width, &fw, 4);
+            memcpy(&reply.height, &fh, 4);
+            memcpy(&reply.scaleX, &sx, 4);
+            memcpy(&reply.scaleY, &sy, 4);
 
             kr = mach_msg(&reply.header, MACH_SEND_MSG, reply.header.msgh_size,
                          0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
             if (kr == KERN_SUCCESS) {
-                pfb_log("[DisplayServices] Replied to GetMainScreenInfo: %ux%u @%.0fx",
-                        PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, scale);
+                pfb_log("[DisplayServices] Replied to GetMainScreenInfo: %ux%u @2x",
+                        PFB_POINT_WIDTH, PFB_POINT_HEIGHT);
             } else {
                 pfb_log("[DisplayServices] Reply failed: %d", kr);
             }
