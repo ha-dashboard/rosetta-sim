@@ -767,6 +767,13 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
         snprintf(env_ca_mode, sizeof(env_ca_mode), "ROSETTASIM_CA_MODE=%s", ca_mode);
     }
 
+    /* Pass through ROSETTASIM_DNS_MAP for hostname resolution */
+    char env_dns_map[1024] = "";
+    const char *dns_map = getenv("ROSETTASIM_DNS_MAP");
+    if (dns_map) {
+        snprintf(env_dns_map, sizeof(env_dns_map), "ROSETTASIM_DNS_MAP=%s", dns_map);
+    }
+
     char *env[32];
     int ei = 0;
     env[ei++] = env_dyld_root;
@@ -792,6 +799,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
     if (env_proc_path[0]) env[ei++] = env_proc_path;
     if (env_ca_mode[0]) env[ei++] = env_ca_mode;
+    if (env_dns_map[0]) env[ei++] = env_dns_map;
     env[ei] = NULL;
 
     posix_spawnattr_t attr;

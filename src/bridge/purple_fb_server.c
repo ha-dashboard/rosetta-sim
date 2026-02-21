@@ -44,6 +44,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dlfcn.h>
+#include <dispatch/dispatch.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
 
 /* Forward declarations for APIs not in the iOS simulator SDK headers */
 extern mach_port_t bootstrap_port;
@@ -216,8 +220,9 @@ static kern_return_t pfb_create_surface(void) {
 static void pfb_setup_shared_framebuffer(void) {
     uint32_t total_size = ROSETTASIM_FB_TOTAL_SIZE(PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT);
 
-    /* Create/open the shared file */
-    g_shared_fd = open(ROSETTASIM_FB_PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    /* Create/open the shared file — use GPU path to avoid conflict with bridge's
+     * CPU framebuffer. The bridge reads from this file in GPU rendering mode. */
+    g_shared_fd = open(ROSETTASIM_FB_GPU_PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (g_shared_fd < 0) {
         pfb_log("WARNING: Cannot create %s: %s", ROSETTASIM_FB_PATH, strerror(errno));
         return;
@@ -251,7 +256,7 @@ static void pfb_setup_shared_framebuffer(void) {
     hdr->flags = ROSETTASIM_FB_FLAG_APP_RUNNING;
     hdr->fps_target = 60;
 
-    pfb_log("Shared framebuffer at %s (%u bytes)", ROSETTASIM_FB_PATH, total_size);
+    pfb_log("Shared framebuffer at %s (%u bytes)", ROSETTASIM_FB_GPU_PATH, total_size);
 }
 
 /* Copy rendered pixels from backboardd's surface to the shared framebuffer.
@@ -445,6 +450,217 @@ static void *pfb_server_thread(void *arg) {
 }
 
 /* ================================================================
+ * CALayerHost — hosts app's remote CAContext on the display
+ *
+ * When the app creates a remote CAContext and writes the contextId
+ * to ROSETTASIM_FB_CONTEXT_PATH, we create a CALayerHost in backboardd
+ * and add it to the CAWindowServer's display layer tree. This makes
+ * CARenderServer composite the app's content onto the PurpleDisplay.
+ * ================================================================ */
+
+static volatile int g_layer_host_created = 0;
+static volatile uint32_t g_pending_context_id = 0;
+
+/* Called on the main thread to create CALayerHost and add to display */
+static void pfb_create_layer_host(void *ctx_id_ptr) {
+    uint32_t ctx_id = (uint32_t)(uintptr_t)ctx_id_ptr;
+    if (ctx_id == 0 || g_layer_host_created) return;
+
+    pfb_log("Creating CALayerHost for context ID %u", ctx_id);
+
+    /* Get CALayerHost class */
+    Class layerHostClass = (Class)objc_getClass("CALayerHost");
+    if (!layerHostClass) {
+        pfb_log("ERROR: CALayerHost class not found");
+        return;
+    }
+
+    /* Create CALayerHost instance */
+    id layerHost = ((id (*)(id, SEL))objc_msgSend)(
+        (id)layerHostClass, sel_registerName("alloc"));
+    layerHost = ((id (*)(id, SEL))objc_msgSend)(layerHost, sel_registerName("init"));
+    if (!layerHost) {
+        pfb_log("ERROR: CALayerHost alloc/init failed");
+        return;
+    }
+
+    /* Set the contextId on the layer host */
+    SEL setCtxIdSel = sel_registerName("setContextId:");
+    if (class_respondsToSelector(layerHostClass, setCtxIdSel)) {
+        ((void (*)(id, SEL, uint32_t))objc_msgSend)(layerHost, setCtxIdSel, ctx_id);
+        pfb_log("CALayerHost contextId set to %u", ctx_id);
+    } else {
+        pfb_log("WARNING: CALayerHost does not respond to setContextId:");
+        /* Try setting the ivar directly */
+        Ivar ctxIvar = class_getInstanceVariable(layerHostClass, "_contextId");
+        if (ctxIvar) {
+            *(uint32_t *)((uint8_t *)layerHost + ivar_getOffset(ctxIvar)) = ctx_id;
+            pfb_log("CALayerHost._contextId set directly via ivar");
+        } else {
+            pfb_log("ERROR: Cannot set contextId on CALayerHost");
+            return;
+        }
+    }
+
+    /* Get CAWindowServer singleton */
+    Class wsClass = (Class)objc_getClass("CAWindowServer");
+    if (!wsClass) {
+        pfb_log("ERROR: CAWindowServer class not found");
+        return;
+    }
+
+    id windowServer = ((id (*)(id, SEL))objc_msgSend)(
+        (id)wsClass, sel_registerName("server"));
+    if (!windowServer) {
+        /* Try serverIfExists */
+        windowServer = ((id (*)(id, SEL))objc_msgSend)(
+            (id)wsClass, sel_registerName("serverIfExists"));
+    }
+    if (!windowServer) {
+        pfb_log("ERROR: CAWindowServer.server returned nil");
+        return;
+    }
+    pfb_log("CAWindowServer = %p", (void *)windowServer);
+
+    /* Get displays from window server */
+    id displays = ((id (*)(id, SEL))objc_msgSend)(
+        windowServer, sel_registerName("displays"));
+    if (!displays) {
+        pfb_log("ERROR: CAWindowServer.displays returned nil");
+        return;
+    }
+
+    unsigned long displayCount = ((unsigned long (*)(id, SEL))objc_msgSend)(
+        displays, sel_registerName("count"));
+    pfb_log("CAWindowServer has %lu displays", displayCount);
+
+    if (displayCount == 0) {
+        pfb_log("ERROR: No displays available in CAWindowServer");
+        return;
+    }
+
+    /* Get the first display */
+    id display = ((id (*)(id, SEL, unsigned long))objc_msgSend)(
+        displays, sel_registerName("objectAtIndex:"), (unsigned long)0);
+    pfb_log("Display[0] = %p", (void *)display);
+
+    /* Get the display's layer (the root layer of the compositing tree).
+     * CAWindowServerDisplay has a 'layer' property that is the root of
+     * the layer tree composited onto that display by CARenderServer. */
+    SEL layerSel = sel_registerName("layer");
+    id displayLayer = NULL;
+
+    if (class_respondsToSelector(object_getClass(display), layerSel) ||
+        class_getInstanceMethod(object_getClass(display), layerSel)) {
+        displayLayer = ((id (*)(id, SEL))objc_msgSend)(display, layerSel);
+    }
+
+    if (!displayLayer) {
+        /* Try getting layer from the display's context or other means */
+        pfb_log("Display has no 'layer' — trying alternatives...");
+
+        /* List instance methods to find layer-related methods */
+        unsigned int mCount = 0;
+        Method *methods = class_copyMethodList(object_getClass(display), &mCount);
+        pfb_log("Display class %s has %u instance methods:",
+                class_getName(object_getClass(display)), mCount);
+        for (unsigned int i = 0; i < mCount && i < 30; i++) {
+            pfb_log("  -%s", sel_getName(method_getName(methods[i])));
+        }
+        free(methods);
+
+        /* Try rootLayer */
+        SEL rootLayerSel = sel_registerName("rootLayer");
+        if (class_respondsToSelector(object_getClass(display), rootLayerSel)) {
+            displayLayer = ((id (*)(id, SEL))objc_msgSend)(display, rootLayerSel);
+            pfb_log("Display rootLayer = %p", (void *)displayLayer);
+        }
+    }
+
+    if (displayLayer) {
+        pfb_log("Display layer = %p (class=%s)", (void *)displayLayer,
+                class_getName(object_getClass(displayLayer)));
+
+        /* Set the layer host's frame to match the display dimensions */
+        /* Use bounds of the display layer */
+        /* Set frame on layer host to cover entire display.
+         * Use known display dimensions instead of bounds (avoids objc_msgSend_stret issues). */
+        typedef struct { double x, y, w, h; } CGRect_t;
+        CGRect_t frame = { 0, 0, (double)PFB_POINT_WIDTH, (double)PFB_POINT_HEIGHT };
+        pfb_log("Setting CALayerHost frame: %.0fx%.0f", frame.w, frame.h);
+
+        /* setFrame: takes CGRect by value — on x86_64 this goes through objc_msgSend
+         * (not stret) because CGRect is passed, not returned */
+        typedef void (*SetFrameFn)(id, SEL, CGRect_t);
+        ((SetFrameFn)objc_msgSend)(layerHost, sel_registerName("setFrame:"), frame);
+
+        /* Add layer host as sublayer of display layer */
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            displayLayer, sel_registerName("addSublayer:"), layerHost);
+        pfb_log("CALayerHost added as sublayer of display layer");
+
+        /* Retain the layer host */
+        ((id (*)(id, SEL))objc_msgSend)(layerHost, sel_registerName("retain"));
+
+        /* Flush the transaction to commit immediately */
+        Class catClass = (Class)objc_getClass("CATransaction");
+        if (catClass) {
+            ((void (*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+            pfb_log("CATransaction flushed after adding CALayerHost");
+        }
+
+        g_layer_host_created = 1;
+        pfb_log("CALayerHost setup COMPLETE — app content should now composite on display");
+    } else {
+        pfb_log("ERROR: Could not find display layer to add CALayerHost to");
+
+        /* Fallback: try adding directly to CAWindowServer's layer */
+        SEL wsLayerSel = sel_registerName("layer");
+        if (class_respondsToSelector(object_getClass(windowServer), wsLayerSel)) {
+            id wsLayer = ((id (*)(id, SEL))objc_msgSend)(windowServer, wsLayerSel);
+            if (wsLayer) {
+                pfb_log("Fallback: adding CALayerHost to CAWindowServer.layer (%p)", (void *)wsLayer);
+                ((void (*)(id, SEL, id))objc_msgSend)(
+                    wsLayer, sel_registerName("addSublayer:"), layerHost);
+                ((id (*)(id, SEL))objc_msgSend)(layerHost, sel_registerName("retain"));
+
+                Class catClass = (Class)objc_getClass("CATransaction");
+                if (catClass) {
+                    ((void (*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+                }
+
+                g_layer_host_created = 1;
+                pfb_log("CALayerHost added to CAWindowServer.layer (fallback)");
+            }
+        }
+    }
+}
+
+/* Check for context ID file and schedule CALayerHost creation on main thread */
+static void pfb_check_context_id(void) {
+    if (g_layer_host_created) return;
+
+    int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_RDONLY);
+    if (fd < 0) return;
+
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0) return;
+
+    uint32_t ctx_id = (uint32_t)strtoul(buf, NULL, 10);
+    if (ctx_id == 0) return;
+
+    pfb_log("Found context ID %u in %s", ctx_id, ROSETTASIM_FB_CONTEXT_PATH);
+
+    /* Call directly — we're on the sync thread but dispatch_async to main queue
+     * doesn't work reliably in the simulator environment because backboardd's
+     * run loop may not drain GCD blocks from our dispatch target. */
+    pfb_create_layer_host((void *)(uintptr_t)ctx_id);
+}
+
+/* ================================================================
  * Periodic sync thread — copies rendered pixels to shared framebuffer
  * ================================================================ */
 
@@ -456,6 +672,10 @@ static void *pfb_sync_thread(void *arg) {
 
     while (g_running) {
         pfb_sync_to_shared();
+
+        /* Check for app's context ID to create CALayerHost */
+        pfb_check_context_id();
+
         usleep(16667);  /* ~60 Hz */
     }
 
@@ -729,8 +949,6 @@ void pfb_objc_exception_throw(void *exception) {
 }
 
 /* Better approach: interpose the assertion handler to skip the assertion */
-#include <objc/runtime.h>
-#include <objc/message.h>
 
 /* Original assertion handler IMP */
 static void (*orig_handleFailure)(id, SEL, id, id, long, id) = NULL;
@@ -1209,7 +1427,8 @@ static void pfb_cleanup(void) {
     }
     if (g_shared_fd >= 0) {
         close(g_shared_fd);
-        unlink(ROSETTASIM_FB_PATH);
+        unlink(ROSETTASIM_FB_GPU_PATH);
+        unlink(ROSETTASIM_FB_CONTEXT_PATH);
     }
     if (g_server_port != MACH_PORT_NULL) {
         mach_port_deallocate(mach_task_self(), g_server_port);

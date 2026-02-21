@@ -1827,6 +1827,32 @@ static void _register_url_protocol(void) {
             IMP dtIMP = imp_implementationWithBlock(dtBlock);
             method_setImplementation(dtMethod, dtIMP);
             bridge_log("Swizzled NSURLSession.dataTaskWithRequest:completionHandler:");
+
+            /* Also swizzle the private implementation classes that may override
+             * the base NSURLSession method. On iOS 10.3, __NSCFURLSession and
+             * __NSURLSessionLocal are the real session classes. If they have their
+             * own dataTaskWithRequest:completionHandler:, our base class swizzle
+             * won't catch calls to them. */
+            const char *subclassNames[] = {
+                "__NSCFURLSession", "__NSURLSessionLocal",
+                "__NSCFLocalSessionTask", NULL
+            };
+            for (int si = 0; subclassNames[si]; si++) {
+                Class subCls = objc_getClass(subclassNames[si]);
+                if (!subCls) continue;
+                Method subMethod = class_getInstanceMethod(subCls, dtSel);
+                if (!subMethod) continue;
+                /* Only swizzle if this class has its OWN implementation (not inherited) */
+                IMP subIMP = method_getImplementation(subMethod);
+                IMP baseIMP = method_getImplementation(class_getInstanceMethod(sessionClass, dtSel));
+                if (subIMP != baseIMP) {
+                    /* This class overrides the method — swizzle it too */
+                    IMP subDtIMP = imp_implementationWithBlock(dtBlock);
+                    method_setImplementation(subMethod, subDtIMP);
+                    bridge_log("Swizzled %s.dataTaskWithRequest:completionHandler: (override)",
+                               subclassNames[si]);
+                }
+            }
         }
     }
 }
@@ -5172,20 +5198,71 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 bridge_log("GPU Rendering: remoteContext = %p", (void *)remoteCtx);
 
                                                 if (remoteCtx) {
-                                                    /* Set the window's root layer as the context's layer */
+                                                    /* Set the window's root layer as the context's layer.
+                                                     * Use [remoteCtx setLayer:rootLayer] — this is an INSTANCE method.
+                                                     * Must check instance, not class. */
                                                     SEL setLayerSel = sel_registerName("setLayer:");
-                                                    if (class_respondsToSelector(caContextClass, setLayerSel)) {
+                                                    Class remoteCtxClass = object_getClass(remoteCtx);
+
+                                                    /* List instance methods to find layer-related ones */
+                                                    unsigned int rmCount = 0;
+                                                    Method *rmethods = class_copyMethodList(remoteCtxClass, &rmCount);
+                                                    bridge_log("GPU Rendering: remoteCtx instance has %u methods:", rmCount);
+                                                    for (unsigned int ri = 0; ri < rmCount && ri < 30; ri++) {
+                                                        bridge_log("GPU Rendering:   -%s",
+                                                                   sel_getName(method_getName(rmethods[ri])));
+                                                    }
+                                                    if (rmethods) free(rmethods);
+
+                                                    /* Try setLayer: on the INSTANCE (not class) */
+                                                    if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
                                                         ((void(*)(id, SEL, id))objc_msgSend)(
                                                             remoteCtx, setLayerSel, rootLayer);
                                                         bridge_log("GPU Rendering: Set remote context layer = root window layer");
-
-                                                        /* Get context ID */
-                                                        SEL ctxIdSel = sel_registerName("contextId");
-                                                        if (class_respondsToSelector(caContextClass, ctxIdSel)) {
-                                                            unsigned int ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                                                                remoteCtx, ctxIdSel);
-                                                            bridge_log("GPU Rendering: remote context ID = %u", ctxId);
+                                                    } else {
+                                                        bridge_log("GPU Rendering: remoteCtx does NOT respond to setLayer:");
+                                                        /* Try alternative: layer property via KVC */
+                                                        @try {
+                                                            [(id)remoteCtx setValue:rootLayer forKey:@"layer"];
+                                                            bridge_log("GPU Rendering: Set layer via KVC");
+                                                        } @catch (id kvcEx) {
+                                                            bridge_log("GPU Rendering: KVC setLayer failed: %s",
+                                                                       [[kvcEx description] UTF8String] ?: "unknown");
                                                         }
+                                                    }
+
+                                                    /* Get context ID — check INSTANCE, not class */
+                                                    SEL ctxIdSel = sel_registerName("contextId");
+                                                    unsigned int ctxId = 0;
+                                                    if ([(id)remoteCtx respondsToSelector:ctxIdSel]) {
+                                                        ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                                            remoteCtx, ctxIdSel);
+                                                        bridge_log("GPU Rendering: remote context ID = %u", ctxId);
+                                                    } else {
+                                                        bridge_log("GPU Rendering: remoteCtx does NOT respond to contextId");
+                                                        /* Try _contextId ivar */
+                                                        Ivar ctxIvar = class_getInstanceVariable(remoteCtxClass, "_contextId");
+                                                        if (ctxIvar) {
+                                                            ctxId = *(unsigned int *)((uint8_t *)(void *)remoteCtx + ivar_getOffset(ctxIvar));
+                                                            bridge_log("GPU Rendering: context ID from ivar = %u", ctxId);
+                                                        }
+                                                    }
+
+                                                    /* Write contextId to IPC file so purple_fb_server
+                                                     * can create a CALayerHost in backboardd's display tree */
+                                                    if (ctxId != 0) {
+                                                        int ctx_fd = open(ROSETTASIM_FB_CONTEXT_PATH,
+                                                                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                                        if (ctx_fd >= 0) {
+                                                            char ctx_buf[32];
+                                                            int ctx_len = snprintf(ctx_buf, sizeof(ctx_buf), "%u", ctxId);
+                                                            write(ctx_fd, ctx_buf, ctx_len);
+                                                            close(ctx_fd);
+                                                            bridge_log("GPU Rendering: wrote context ID %u to %s",
+                                                                       ctxId, ROSETTASIM_FB_CONTEXT_PATH);
+                                                        }
+                                                    } else {
+                                                        bridge_log("GPU Rendering: WARNING context ID is 0, cannot share with backboardd");
                                                     }
 
                                                     /* Retain the context so it doesn't get deallocated */
@@ -5219,21 +5296,49 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                             } @catch (id ex) { /* ignore */ }
                         }
 
-                        /* GPU framebuffer relay: disabled for now.
-                         * CARenderServer doesn't composite unregistered client content.
-                         * The app needs to register via display services (BKSDisplayServices)
-                         * before CARenderServer will composite its layers.
+                        /* GPU rendering via CALayerHost pipeline:
+                         * 1. Remote CAContext published app's layer tree (above)
+                         * 2. ContextId written to IPC file for purple_fb_server
+                         * 3. purple_fb_server creates CALayerHost in backboardd
+                         * 4. CARenderServer composites onto PurpleDisplay surface
+                         * 5. purple_fb_server syncs to GPU framebuffer file
+                         * 6. We map the GPU framebuffer and copy to app framebuffer
                          *
-                         * For now, we keep CARenderServer CONNECTED (helps with animation
-                         * quality, tintColor, CADisplayLink) but use CPU rendering
-                         * (renderInContext) for framebuffer capture.
-                         *
-                         * TODO: Build HID System Manager bundle that triggers proper
-                         * display registration in backboardd, enabling full GPU compositing. */
-                        bridge_log("GPU Rendering: CARenderServer connected but display client "
-                                   "registration not available — using CPU rendering with server-assisted quality");
-                        bridge_log("GPU Rendering: CARenderServer improves: animations, tintColor, CADisplayLink");
-                        /* g_gpu_rendering_active stays 0 — CPU rendering used */
+                         * Try to map the GPU framebuffer for reading. */
+                        {
+                            const char *gpu_fb_path = ROSETTASIM_FB_GPU_PATH;
+                            int gpu_fd = open(gpu_fb_path, O_RDONLY);
+                            if (gpu_fd >= 0) {
+                                struct stat st;
+                                if (fstat(gpu_fd, &st) == 0 && st.st_size > 0) {
+                                    _backboardd_fb_size = (size_t)st.st_size;
+                                    _backboardd_fb_mmap = mmap(NULL, _backboardd_fb_size,
+                                                                PROT_READ, MAP_SHARED, gpu_fd, 0);
+                                    if (_backboardd_fb_mmap != MAP_FAILED) {
+                                        g_gpu_rendering_active = 1;
+                                        bridge_log("GPU Rendering: Mapped backboardd framebuffer at %s "
+                                                   "(%zu bytes) — GPU compositing ACTIVE",
+                                                   gpu_fb_path, _backboardd_fb_size);
+                                    } else {
+                                        _backboardd_fb_mmap = NULL;
+                                        bridge_log("GPU Rendering: mmap of %s failed — staying in CPU mode",
+                                                   gpu_fb_path);
+                                    }
+                                } else {
+                                    bridge_log("GPU Rendering: %s empty or stat failed — staying in CPU mode",
+                                               gpu_fb_path);
+                                }
+                                close(gpu_fd);
+                            } else {
+                                bridge_log("GPU Rendering: %s not found — staying in CPU mode "
+                                           "(backboardd may not be running)", gpu_fb_path);
+                            }
+                        }
+
+                        if (!g_gpu_rendering_active) {
+                            bridge_log("GPU Rendering: CARenderServer connected — "
+                                       "server-assisted quality active, CPU rendering as fallback");
+                        }
                     } else {
                         bridge_log("GPU Rendering: No CADisplay mainDisplay — staying in CPU mode");
                     }
@@ -5310,6 +5415,121 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
 
     /* Mark init complete — exit() calls are now allowed */
     _init_phase = 0;
+
+    /* Auto-connect: After a delay (to let mDNS discover the server and populate
+     * the UI), search for HAConnectionFormView and call connectTapped. This
+     * triggers the auth/providers request and subsequent authentication flow. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        bridge_log("Auto-connect: Triggered after startup delay");
+        Class formClass = objc_getClass("HAConnectionFormView");
+        if (!formClass || !_bridge_root_window) {
+            bridge_log("Auto-connect: HAConnectionFormView class=%p root_window=%p",
+                       (void *)formClass, (void *)_bridge_root_window);
+            return;
+        }
+        id formView = nil;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:_bridge_root_window];
+        while (stack.count > 0) {
+            id view = stack.lastObject;
+            [stack removeLastObject];
+            if ([view isKindOfClass:formClass]) {
+                formView = view;
+                break;
+            }
+            NSArray *subviews = ((id(*)(id, SEL))objc_msgSend)(
+                view, sel_registerName("subviews"));
+            if (subviews) [stack addObjectsFromArray:subviews];
+        }
+        if (formView) {
+            bridge_log("Auto-connect: Found HAConnectionFormView %p", (void *)formView);
+
+            /* Step 1: Find discovered servers and set the URL field.
+             * HAConnectionFormView has a discoveryService property with discoveredServers.
+             * We need to get the first server's baseURL and set it in serverURLField. */
+            @try {
+                /* Get discoveryService.discoveredServers */
+                id discoveryService = ((id(*)(id, SEL))objc_msgSend)(
+                    formView, sel_registerName("discoveryService"));
+                id servers = nil;
+                if (discoveryService) {
+                    servers = ((id(*)(id, SEL))objc_msgSend)(
+                        discoveryService, sel_registerName("discoveredServers"));
+                }
+                NSUInteger count = servers ? ((NSUInteger(*)(id, SEL))objc_msgSend)(
+                    servers, sel_registerName("count")) : 0;
+                bridge_log("Auto-connect: discoveredServers count=%lu", (unsigned long)count);
+
+                if (count > 0) {
+                    /* Get first server's baseURL */
+                    id server = ((id(*)(id, SEL, NSUInteger))objc_msgSend)(
+                        servers, sel_registerName("objectAtIndex:"), (NSUInteger)0);
+                    NSString *baseURL = ((id(*)(id, SEL))objc_msgSend)(
+                        server, sel_registerName("baseURL"));
+                    bridge_log("Auto-connect: server baseURL = %s",
+                               baseURL ? [baseURL UTF8String] : "nil");
+
+                    if (baseURL) {
+                        /* Set the URL field text */
+                        id urlField = ((id(*)(id, SEL))objc_msgSend)(
+                            formView, sel_registerName("serverURLField"));
+                        if (urlField) {
+                            ((void(*)(id, SEL, id))objc_msgSend)(
+                                urlField, sel_registerName("setText:"), baseURL);
+                            bridge_log("Auto-connect: set serverURLField.text = %s",
+                                       [baseURL UTF8String]);
+                        }
+                    }
+                } else {
+                    /* No discovered servers — use DNS map IP directly */
+                    const char *dns_map = getenv("ROSETTASIM_DNS_MAP");
+                    if (dns_map) {
+                        /* Parse "hostname=ip" format */
+                        char *eq = strchr(dns_map, '=');
+                        if (eq) {
+                            char ip[64];
+                            strncpy(ip, eq + 1, sizeof(ip) - 1);
+                            ip[sizeof(ip) - 1] = '\0';
+                            NSString *url = [NSString stringWithFormat:@"http://%s:8123", ip];
+                            id urlField = ((id(*)(id, SEL))objc_msgSend)(
+                                formView, sel_registerName("serverURLField"));
+                            if (urlField) {
+                                ((void(*)(id, SEL, id))objc_msgSend)(
+                                    urlField, sel_registerName("setText:"), url);
+                                bridge_log("Auto-connect: set serverURLField.text = %s (from DNS_MAP)",
+                                           [url UTF8String]);
+                            }
+                        }
+                    }
+                }
+
+                /* Step 2: Simulate tapping the first discovered server row.
+                 * This calls discoveredServerTapped: which sets the URL field
+                 * AND probes auth providers, triggering the full connection flow. */
+                SEL discTapSel = sel_registerName("discoveredServerTapped:");
+                if ([(id)formView respondsToSelector:discTapSel]) {
+                    /* Create a fake UIButton with tag=0 (first server) */
+                    Class btnCls = objc_getClass("UIButton");
+                    id fakeBtn = ((id(*)(id, SEL, long))objc_msgSend)(
+                        (id)btnCls, sel_registerName("buttonWithType:"), 0);
+                    ((void(*)(id, SEL, NSInteger))objc_msgSend)(
+                        fakeBtn, sel_registerName("setTag:"), 0);
+                    ((void(*)(id, SEL, id))objc_msgSend)(
+                        formView, discTapSel, fakeBtn);
+                    bridge_log("Auto-connect: discoveredServerTapped: invoked (server 0)");
+                } else {
+                    /* Fallback: call connectTapped directly */
+                    ((void(*)(id, SEL))objc_msgSend)(formView, sel_registerName("connectTapped"));
+                    bridge_log("Auto-connect: connectTapped invoked (fallback)");
+                }
+            } @catch (id ex) {
+                bridge_log("Auto-connect: threw: %s",
+                           [[ex description] UTF8String] ?: "unknown");
+            }
+        } else {
+            bridge_log("Auto-connect: HAConnectionFormView not found in view hierarchy");
+        }
+    });
 
     /* Start the main run loop — this is what _runWithMainScene normally
      * does at the very end. CFRunLoopRun never returns. */

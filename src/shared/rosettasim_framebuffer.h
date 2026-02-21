@@ -28,8 +28,10 @@
 #define ROSETTASIM_FB_MAGIC       0x4D495352  /* 'RSIM' little-endian */
 #define ROSETTASIM_FB_VERSION     3
 #define ROSETTASIM_FB_FORMAT_BGRA 0x42475241  /* 'BGRA' */
-#define ROSETTASIM_FB_PATH        "/tmp/rosettasim_framebuffer"
-#define ROSETTASIM_FB_HEADER_SIZE 64
+#define ROSETTASIM_FB_PATH          "/tmp/rosettasim_framebuffer"
+#define ROSETTASIM_FB_GPU_PATH      "/tmp/rosettasim_framebuffer_gpu"
+#define ROSETTASIM_FB_CONTEXT_PATH  "/tmp/rosettasim_context_id"
+#define ROSETTASIM_FB_HEADER_SIZE   64
 
 /* Flags */
 #define ROSETTASIM_FB_FLAG_FRAME_READY  0x01
