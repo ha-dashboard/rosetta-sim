@@ -248,15 +248,15 @@ static void _configure_device_profile(void) {
  */
 static bool replacement_BKSDisplayServicesStart(void) {
     bridge_log("BKSDisplayServicesStart() intercepted");
-    bridge_log("  Setting screen info: %.0fx%.0f @%.0fx",
-               kScreenWidth, kScreenHeight, kScreenScaleX);
+
+    /* BKSDisplayServicesServerPort (called later by UIKit) now returns the
+     * real port from the broker, enabling communication with backboardd's
+     * display services handler in purple_fb_server.c. */
 
     /* Set the main screen info in GraphicsServices */
     GSSetMainScreenInfo(kScreenWidth, kScreenHeight, kScreenScaleX, kScreenScaleY);
 
-    bridge_log("  GSSetMainScreenInfo called successfully");
-    bridge_log("  Returning TRUE (bypassing backboardd connection)");
-
+    bridge_log("  GSSetMainScreenInfo called, returning TRUE");
     return true;
 }
 
@@ -268,8 +268,26 @@ static bool replacement_BKSDisplayServicesStart(void) {
  * Any code that tries to use this port will get a send error,
  * which we'll handle as it comes.
  */
+/* Forward declarations for broker communication */
+static mach_port_t bridge_broker_lookup(const char *name);
+
 static mach_port_t replacement_BKSDisplayServicesServerPort(void) {
-    bridge_log("BKSDisplayServicesServerPort() intercepted → MACH_PORT_NULL");
+    /* Get the REAL display services port from the broker.
+     * This connects the app to the display services handler in purple_fb_server. */
+    static mach_port_t cached_port = MACH_PORT_NULL;
+    if (cached_port != MACH_PORT_NULL) return cached_port;
+
+    /* Retry a few times — the port may not be registered yet */
+    for (int retry = 0; retry < 10; retry++) {
+        mach_port_t port = bridge_broker_lookup("com.apple.backboard.display.services");
+        if (port != MACH_PORT_NULL) {
+            cached_port = port;
+            bridge_log("BKSDisplayServicesServerPort() → %u (from broker, retry=%d)", port, retry);
+            return port;
+        }
+        if (retry < 9) usleep(200000); /* 200ms between retries */
+    }
+    bridge_log("BKSDisplayServicesServerPort() → MACH_PORT_NULL (10 retries failed)");
     return MACH_PORT_NULL;
 }
 

@@ -809,6 +809,9 @@ mach_port_t pfb_GSGetPurpleApplicationPort(void) {
     return MACH_PORT_NULL;
 }
 
+/* Forward declaration */
+static void *pfb_display_services_thread(void *arg);
+
 mach_port_t pfb_GSRegisterPurpleNamedPort(const char *name) {
     /* Create a unique port for each named service (not shared dummy).
      * This allows SpringBoard and other processes to look up these
@@ -825,6 +828,16 @@ mach_port_t pfb_GSRegisterPurpleNamedPort(const char *name) {
         g_services[g_service_count].port = p;
         g_service_count++;
         pfb_notify_broker(name, p);
+
+        /* Auto-start display services handler when registered */
+        if (strstr(name, "display.services")) {
+            pfb_log("Auto-starting display services handler on port %u", p);
+            mach_port_t *ds_port = (mach_port_t *)malloc(sizeof(mach_port_t));
+            *ds_port = p;
+            pthread_t ds_thread;
+            pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
+            pthread_detach(ds_thread);
+        }
     }
     return p;
 }
@@ -1248,6 +1261,137 @@ static void pfb_notify_broker(const char *name, mach_port_t port) {
 
 static mach_port_t g_subset_port = MACH_PORT_NULL;
 
+/* ================================================================
+ * Display Services Handler Thread
+ *
+ * Responds to BKSDisplayServices MIG messages from the app process.
+ * The app calls BKSDisplayServicesGetMainScreenInfo() which sends
+ * msg_id 6001005 (0x5B916D) to get display dimensions.
+ * ================================================================ */
+
+static void *pfb_display_services_thread(void *arg) {
+    mach_port_t port = *(mach_port_t *)arg;
+    free(arg);
+
+    pfb_log("[DisplayServices] Handler thread started on port %u", port);
+
+    /* Message buffer — large enough for all display services messages */
+    uint8_t buf[1024];
+
+    while (g_running) {
+        mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
+        memset(buf, 0, sizeof(buf));
+
+        kern_return_t kr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                     0, sizeof(buf), port, 1000, MACH_PORT_NULL);
+        if (kr == MACH_RCV_TIMED_OUT) continue;
+        if (kr != KERN_SUCCESS) {
+            pfb_log("[DisplayServices] mach_msg recv error: %d", kr);
+            continue;
+        }
+
+        pfb_log("[DisplayServices] Received msg_id=%d size=%d reply_port=%u",
+                hdr->msgh_id, hdr->msgh_size, hdr->msgh_remote_port);
+
+        mach_port_t reply_port = hdr->msgh_remote_port;
+        if (reply_port == MACH_PORT_NULL) {
+            /* Check local_port for reply */
+            reply_port = hdr->msgh_local_port;
+        }
+
+        if (hdr->msgh_id == 6001005) {
+            /* BKSDisplayServicesGetMainScreenInfo
+             * Reply format: { header, NDR, retcode, width, height, scaleX, scaleY }
+             * Total 60 bytes (0x3C) */
+            #pragma pack(4)
+            struct {
+                mach_msg_header_t header;   /* 24 bytes */
+                NDR_record_t ndr;           /*  8 bytes */
+                int32_t retcode;            /*  4 bytes */
+                uint32_t width;             /*  4 bytes */
+                uint32_t height;            /*  4 bytes */
+                uint32_t scaleX;            /*  4 bytes — float as uint32 */
+                uint32_t scaleY;            /*  4 bytes — float as uint32 */
+                uint32_t pad[2];            /*  8 bytes padding to 60 */
+            } reply;
+            #pragma pack()
+
+            memset(&reply, 0, sizeof(reply));
+            reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply.header.msgh_size = 60; /* 0x3C as per protocol */
+            reply.header.msgh_remote_port = reply_port;
+            reply.header.msgh_local_port = MACH_PORT_NULL;
+            reply.header.msgh_id = 6001005 + 100; /* Reply ID = request + 100 */
+            reply.ndr = NDR_record;
+            reply.retcode = 0; /* success */
+            reply.width = PFB_PIXEL_WIDTH;   /* 750 */
+            reply.height = PFB_PIXEL_HEIGHT; /* 1334 */
+            /* Scale is 2.0 for iPhone 6s, represented as...
+             * Need to check if these are float or int.
+             * From the BKS code, they're stored as uint32 via movl */
+            float scale = 2.0f;
+            memcpy(&reply.scaleX, &scale, 4);
+            memcpy(&reply.scaleY, &scale, 4);
+
+            kr = mach_msg(&reply.header, MACH_SEND_MSG, reply.header.msgh_size,
+                         0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+            if (kr == KERN_SUCCESS) {
+                pfb_log("[DisplayServices] Replied to GetMainScreenInfo: %ux%u @%.0fx",
+                        PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, scale);
+            } else {
+                pfb_log("[DisplayServices] Reply failed: %d", kr);
+            }
+
+        } else if (hdr->msgh_id == 6001000) {
+            /* BKSDisplayServicesStart — check if display server is alive
+             * Reply: { header, NDR, retcode, isAlive }
+             * Reply ID = 6001100 */
+            #pragma pack(4)
+            struct {
+                mach_msg_header_t header;
+                NDR_record_t ndr;
+                int32_t retcode;
+                int32_t isAlive;
+            } reply;
+            #pragma pack()
+
+            memset(&reply, 0, sizeof(reply));
+            reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply.header.msgh_size = sizeof(reply);
+            reply.header.msgh_remote_port = reply_port;
+            reply.header.msgh_local_port = MACH_PORT_NULL;
+            reply.header.msgh_id = 6001100; /* Reply ID */
+            reply.ndr = NDR_record;
+            reply.retcode = 0;
+            reply.isAlive = 1; /* TRUE */
+
+            kr = mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply),
+                         0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+            if (kr == KERN_SUCCESS) {
+                pfb_log("[DisplayServices] Replied to Start: isAlive=TRUE");
+            } else {
+                pfb_log("[DisplayServices] Start reply failed: %d", kr);
+            }
+
+        } else {
+            pfb_log("[DisplayServices] Unknown msg_id %d — sending empty reply", hdr->msgh_id);
+            if (reply_port != MACH_PORT_NULL) {
+                mach_msg_header_t reply;
+                memset(&reply, 0, sizeof(reply));
+                reply.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+                reply.msgh_size = sizeof(reply);
+                reply.msgh_remote_port = reply_port;
+                reply.msgh_id = hdr->msgh_id + 100;
+                mach_msg(&reply, MACH_SEND_MSG, sizeof(reply),
+                         0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+            }
+        }
+    }
+
+    pfb_log("[DisplayServices] Handler thread exiting");
+    return NULL;
+}
+
 __attribute__((constructor))
 static void pfb_init(void) {
     pfb_log("Initializing PurpleFBServer shim");
@@ -1432,6 +1576,22 @@ static void pfb_init(void) {
         pfb_GSRegisterPurpleNamedPort("com.apple.backboard.TouchDeliveryPolicyServer");
 
         pfb_log("Purple system ports registered with broker");
+
+        /* Start display services handler thread.
+         * Listens on com.apple.backboard.display.services port and responds
+         * to BKSDisplayServicesGetMainScreenInfo (msg_id 0x5B916D = 6001005)
+         * and BKSDisplayServicesStart (msg_id 0x5B9168 = 6001000). */
+        for (int si = 0; si < g_service_count; si++) {
+            if (strstr(g_services[si].name, "display.services")) {
+                pfb_log("Starting display services handler on port %u", g_services[si].port);
+                mach_port_t *ds_port = malloc(sizeof(mach_port_t));
+                *ds_port = g_services[si].port;
+                pthread_t ds_thread;
+                pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
+                pthread_detach(ds_thread);
+                break;
+            }
+        }
     }
 
     pfb_log("PurpleFBServer ready — all interpositions active");
