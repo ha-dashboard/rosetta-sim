@@ -247,28 +247,142 @@ static mach_port_t replacement_BKSWatchdogServerPort(void) {
     return MACH_PORT_NULL;
 }
 
+/* Forward declarations for broker-based CARenderServer lookup */
+extern mach_port_t bootstrap_port;
+extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+extern kern_return_t task_get_special_port(mach_port_t, int, mach_port_t *);
+#ifndef TASK_BOOTSTRAP_PORT
+#define TASK_BOOTSTRAP_PORT 4
+#endif
+
+/* CARenderServer connection state — set when real server is available via broker */
+static mach_port_t g_ca_server_port = MACH_PORT_NULL;
+static int g_ca_server_connected = 0;
+
+/* Broker port — obtained from TASK_BOOTSTRAP_PORT when running under broker */
+static mach_port_t g_bridge_broker_port = MACH_PORT_NULL;
+
+/* Broker custom protocol message ID */
+#define BRIDGE_BROKER_LOOKUP_PORT   701
+
+/*
+ * Direct broker lookup via custom protocol (msg_id 701).
+ *
+ * iOS SDK's bootstrap_look_up uses mach_msg2/XPC internally on macOS 26,
+ * which the broker (a standard mach_msg receiver) cannot handle. Instead,
+ * we send a raw mach_msg with the broker's custom LOOKUP_PORT format.
+ *
+ * This matches the app_shim's app_broker_lookup() implementation.
+ */
+static mach_port_t bridge_broker_lookup(const char *name) {
+    if (g_bridge_broker_port == MACH_PORT_NULL || !name) return MACH_PORT_NULL;
+
+    /* Create reply port */
+    mach_port_t reply_port;
+    kern_return_t kr = mach_port_allocate(mach_task_self(),
+                                           MACH_PORT_RIGHT_RECEIVE, &reply_port);
+    if (kr != KERN_SUCCESS) return MACH_PORT_NULL;
+
+    /* Build BROKER_LOOKUP_PORT request (matches bootstrap_simple_request_t in broker) */
+    union {
+        struct {
+            mach_msg_header_t header;       /* 24 bytes */
+            NDR_record_t ndr;               /* 8 bytes */
+            uint32_t name_len;              /* 4 bytes */
+            char name[128];                 /* 128 bytes */
+        } req;
+        uint8_t raw[2048];
+    } buf;
+    memset(&buf, 0, sizeof(buf));
+
+    uint32_t name_len = (uint32_t)strlen(name);
+    if (name_len >= 128) name_len = 127;
+
+    buf.req.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                                                MACH_MSG_TYPE_MAKE_SEND_ONCE);
+    buf.req.header.msgh_size = sizeof(buf.req);
+    buf.req.header.msgh_remote_port = g_bridge_broker_port;
+    buf.req.header.msgh_local_port = reply_port;
+    buf.req.header.msgh_id = BRIDGE_BROKER_LOOKUP_PORT;
+    buf.req.ndr = NDR_record;
+    buf.req.name_len = name_len;
+    memcpy(buf.req.name, name, name_len);
+
+    /* Send request and receive reply */
+    kr = mach_msg(&buf.req.header,
+                   MACH_SEND_MSG | MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                   sizeof(buf.req),
+                   sizeof(buf),
+                   reply_port,
+                   5000,  /* 5 second timeout */
+                   MACH_PORT_NULL);
+
+    mach_port_deallocate(mach_task_self(), reply_port);
+
+    if (kr != KERN_SUCCESS) {
+        bridge_log("broker lookup '%s': mach_msg failed: %d", name, kr);
+        return MACH_PORT_NULL;
+    }
+
+    mach_msg_header_t *rh = (mach_msg_header_t *)buf.raw;
+
+    /* Check for complex reply (success — contains port descriptor) */
+    if (rh->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+        mach_msg_body_t *body = (mach_msg_body_t *)(buf.raw + sizeof(mach_msg_header_t));
+        if (body->msgh_descriptor_count >= 1) {
+            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(body + 1);
+            bridge_log("broker lookup '%s': found port=%u", name, pd->name);
+            return pd->name;
+        }
+    }
+
+    bridge_log("broker lookup '%s': not found", name);
+    return MACH_PORT_NULL;
+}
+
 /*
  * Replace CARenderServerGetServerPort()
  *
  * Original does bootstrap_look_up("com.apple.CARenderServer").
  *
- * ARCHITECTURAL DECISION: We return MACH_PORT_NULL intentionally.
- * A full local CARenderServer would require Mach IPC, MIG protocol
- * reverse-engineering, and deep CA::Render::Server internals — high risk
- * for marginal gain in a simulator context. Instead, we use CPU-only
- * rendering via renderInContext: (see frame_capture_tick).
+ * When running under the broker (TASK_BOOTSTRAP_PORT is broker port):
+ *   - Uses custom broker protocol to look up real CARenderServer
+ *   - CoreAnimation uses real GPU rendering via backboardd
+ *   - PurpleFBServer writes frames to /tmp/rosettasim_framebuffer
  *
- * Consequences of MACH_PORT_NULL:
- *   - [CADisplay mainDisplay] returns nil (we skip that assertion)
- *   - No implicit/explicit CA animations (acceptable for simulator)
- *   - No CADisplayLink vsync (we use CFRunLoopTimer at 30fps instead)
- *   - No GPU-backed content (Metal, OpenGL, video)
+ * Fallback (standalone, no broker):
+ *   - Returns MACH_PORT_NULL for CPU-only rendering
  *   - All rendering is CPU via renderInContext: into shared framebuffer
- *
- * See ITEM 17 (rendering pipeline) for optimization path.
  */
 static mach_port_t replacement_CARenderServerGetServerPort(void) {
-    /* Only log once to reduce noise — this is called frequently */
+    /* If already connected to real CARenderServer, return cached port */
+    if (g_ca_server_connected) return g_ca_server_port;
+
+    /* Get broker port if not yet resolved */
+    if (g_bridge_broker_port == MACH_PORT_NULL) {
+        kern_return_t bkr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT,
+                              &g_bridge_broker_port);
+        bridge_log("CARenderServerGetServerPort: task_get_special_port → kr=%d port=0x%x",
+                   bkr, g_bridge_broker_port);
+    }
+
+    /* Try to look up real CARenderServer from broker via custom protocol.
+     * We can't use bootstrap_look_up because the iOS SDK implementation
+     * uses mach_msg2/XPC internally on macOS 26, which the broker can't handle. */
+    if (g_bridge_broker_port != MACH_PORT_NULL) {
+        bridge_log("CARenderServerGetServerPort: looking up via broker port 0x%x",
+                   g_bridge_broker_port);
+        mach_port_t port = bridge_broker_lookup("com.apple.CARenderServer");
+        if (port != MACH_PORT_NULL) {
+            g_ca_server_port = port;
+            g_ca_server_connected = 1;
+            bridge_log("CARenderServerGetServerPort() → port %u "
+                       "(real CARenderServer via broker)", port);
+            return port;
+        }
+    }
+
+    /* Fallback to CPU rendering mode (no broker, or CARenderServer not yet registered) */
     static int _logged = 0;
     if (!_logged) {
         bridge_log("CARenderServerGetServerPort() → MACH_PORT_NULL (CPU rendering mode)");
@@ -1020,16 +1134,27 @@ static int setup_shared_framebuffer(void) {
     const char *path = getenv("ROSETTASIM_FB_PATH");
     if (!path) path = ROSETTASIM_FB_PATH;
 
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        bridge_log("ERROR: Could not create framebuffer file: %s", path);
-        return -1;
-    }
+    int fd = -1;
 
-    if (ftruncate(fd, _fb_size) < 0) {
-        bridge_log("ERROR: Could not size framebuffer to %zu bytes", _fb_size);
-        close(fd);
-        return -1;
+    {
+        /* Always create our own framebuffer for CPU rendering output.
+         * Even with CARenderServer connected, we use CPU rendering (renderInContext)
+         * for the display framebuffer because the app's layer tree isn't directly
+         * committed to CARenderServer's display surface.
+         * Note: PurpleFBServer also writes to this path from backboardd.
+         * We truncate and take ownership here — our CPU rendering includes
+         * the full view hierarchy which is more complete. */
+        fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            bridge_log("ERROR: Could not create framebuffer file: %s", path);
+            return -1;
+        }
+
+        if (ftruncate(fd, _fb_size) < 0) {
+            bridge_log("ERROR: Could not size framebuffer to %zu bytes", _fb_size);
+            close(fd);
+            return -1;
+        }
     }
 
     _fb_mmap = mmap(NULL, _fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -1041,24 +1166,28 @@ static int setup_shared_framebuffer(void) {
         return -1;
     }
 
-    /* Initialize header */
-    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
-    memset(hdr, 0, ROSETTASIM_FB_HEADER_SIZE);
-    hdr->magic         = ROSETTASIM_FB_MAGIC;
-    hdr->version       = ROSETTASIM_FB_VERSION;
-    hdr->width         = px_w;
-    hdr->height        = px_h;
-    hdr->stride        = px_w * 4;
-    hdr->format        = ROSETTASIM_FB_FORMAT_BGRA;
-    hdr->frame_counter = 0;
-    hdr->fps_target    = 30;
-    hdr->flags         = ROSETTASIM_FB_FLAG_APP_RUNNING;
+    {
+        /* Initialize header */
+        RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
+        memset(hdr, 0, ROSETTASIM_FB_HEADER_SIZE);
+        hdr->magic         = ROSETTASIM_FB_MAGIC;
+        hdr->version       = ROSETTASIM_FB_VERSION;
+        hdr->width         = px_w;
+        hdr->height        = px_h;
+        hdr->stride        = px_w * 4;
+        hdr->format        = ROSETTASIM_FB_FORMAT_BGRA;
+        hdr->frame_counter = 0;
+        hdr->fps_target    = 30;
+        hdr->flags         = ROSETTASIM_FB_FLAG_APP_RUNNING;
 
-    /* Initialize input region */
-    RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
-    memset(inp, 0, ROSETTASIM_FB_INPUT_SIZE);
+        /* Initialize input region */
+        RosettaSimInputRegion *inp = (RosettaSimInputRegion *)((uint8_t *)_fb_mmap + ROSETTASIM_FB_HEADER_SIZE);
+        memset(inp, 0, ROSETTASIM_FB_INPUT_SIZE);
+    }
 
-    bridge_log("Shared framebuffer: %dx%d (%zu bytes) at %s", px_w, px_h, _fb_size, path);
+    bridge_log("Shared framebuffer: %dx%d (%zu bytes) at %s [CPU+%s]",
+               px_w, px_h, _fb_size, path,
+               g_ca_server_connected ? "CARenderServer" : "standalone");
     return 0;
 }
 
@@ -2749,6 +2878,23 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     /* Check for and inject keyboard events from host */
     check_and_inject_keyboard();
 
+    /* When CARenderServer is active, skip CPU rendering entirely.
+     * PurpleFBServer (in backboardd) handles framebuffer rendering.
+     * We only need to process touch/keyboard input and flush CA transactions. */
+    /* Note: Even with CARenderServer connected (g_ca_server_connected=1), we still
+     * do CPU rendering for the framebuffer. CARenderServer handles CA internals
+     * (animations, effects, compositor) but the app's window layer tree isn't
+     * committed to the display surface because UIScreen lacks a proper CADisplay
+     * from CARenderServer. CPU rendering via renderInContext captures the final
+     * composited state and writes to the shared framebuffer for the host app.
+     *
+     * The CARenderServer connection DOES improve rendering quality by enabling:
+     * - CABasicAnimation / CAKeyframeAnimation (real animations instead of static)
+     * - UIVisualEffectView (blur, vibrancy)
+     * - Proper tintColor rendering
+     * - CADisplayLink vsync (if available)
+     */
+
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)_fb_mmap;
     void *pixels = (uint8_t *)_fb_mmap + ROSETTASIM_FB_META_SIZE;
 
@@ -3043,6 +3189,80 @@ static void start_frame_capture(void) {
  * dyld_sim honors __DATA,__interpose in injected libraries.
  * ================================================================ */
 
+/* ================================================================
+ * bootstrap_look_up interposition — routes service lookups through broker.
+ *
+ * CARenderServerGetServerPort() calls bootstrap_look_up() to find the
+ * CARenderServer Mach port. Since CARenderServerGetServerPort is an
+ * intra-library call within QuartzCore, we can't interpose IT directly.
+ * But bootstrap_look_up IS a cross-library call from QuartzCore to libSystem,
+ * so we CAN interpose that.
+ *
+ * When running under the broker, we intercept lookups for known services
+ * and route them through the broker's custom protocol (msg_id 701).
+ * For all other services, we pass through to the real bootstrap_look_up.
+ * ================================================================ */
+
+static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
+                                                     const char *name,
+                                                     mach_port_t *sp) {
+    /* Services that should be routed through the broker */
+    static const char *broker_services[] = {
+        "com.apple.CARenderServer",
+        "com.apple.iohideventsystem",
+        NULL
+    };
+
+    /* CARenderServer connection can be enabled via ROSETTASIM_CA_MODE=server.
+     * Default is CPU rendering which is proven to render the full UI.
+     * CARenderServer mode currently only renders animated layers (spinner)
+     * because the app's layer tree isn't committed to a CADisplay. */
+    static int _ca_mode_checked = 0;
+    static int _ca_mode_server = 0;
+    if (!_ca_mode_checked) {
+        const char *mode = getenv("ROSETTASIM_CA_MODE");
+        _ca_mode_server = (mode && strcmp(mode, "server") == 0);
+        _ca_mode_checked = 1;
+        if (_ca_mode_server) {
+            bridge_log("CARenderServer mode enabled via ROSETTASIM_CA_MODE=server");
+        }
+    }
+
+    if (_ca_mode_server && name && g_bridge_broker_port != MACH_PORT_NULL) {
+        for (int i = 0; broker_services[i]; i++) {
+            if (strcmp(name, broker_services[i]) == 0) {
+                mach_port_t port = bridge_broker_lookup(name);
+                if (port != MACH_PORT_NULL) {
+                    *sp = port;
+                    bridge_log("bootstrap_look_up('%s') → broker port %u", name, port);
+
+                    /* Track CARenderServer connection */
+                    if (strcmp(name, "com.apple.CARenderServer") == 0) {
+                        g_ca_server_port = port;
+                        g_ca_server_connected = 1;
+                    }
+                    return KERN_SUCCESS;
+                }
+                /* Broker lookup failed — fall through to real bootstrap_look_up */
+                break;
+            }
+        }
+    }
+
+    /* Pass through to real bootstrap_look_up for all other services */
+    kern_return_t kr = bootstrap_look_up(bp, name, sp);
+    if (name) {
+        static int _lookup_count = 0;
+        if (_lookup_count < 10) {  /* Limit log noise */
+            bridge_log("bootstrap_look_up('%s') → %s (%d) port=%u",
+                       name, kr == KERN_SUCCESS ? "OK" : "FAILED", kr,
+                       (kr == KERN_SUCCESS && sp) ? *sp : 0);
+            _lookup_count++;
+        }
+    }
+    return kr;
+}
+
 typedef struct {
     const void *replacement;
     const void *replacee;
@@ -3113,6 +3333,13 @@ __attribute__((section("__DATA,__interpose"))) = {
     /* _exit() - intercept direct exit that bypasses exit() */
     { (const void *)replacement_exit,
       (const void *)_exit },
+
+    /* bootstrap_look_up - route service lookups through broker when available.
+     * This is CRITICAL because CARenderServerGetServerPort() is an intra-library
+     * call within QuartzCore and cannot be interposed directly. But it calls
+     * bootstrap_look_up() which IS a cross-library call to libSystem. */
+    { (const void *)replacement_bootstrap_look_up,
+      (const void *)bootstrap_look_up },
 };
 
 /* ================================================================
@@ -4206,10 +4433,29 @@ static void rosettasim_bridge_init(void) {
                kScreenWidth, kScreenHeight, kScreenScaleX);
     bridge_log("  BKSWatchdogGetIsAlive         → TRUE");
     bridge_log("  BKSWatchdogServerPort         → MACH_PORT_NULL");
-    bridge_log("  CARenderServerGetServerPort   → MACH_PORT_NULL");
+    bridge_log("  CARenderServerGetServerPort   → broker lookup (fallback: MACH_PORT_NULL)");
 
-    /* Fix bootstrap port (old dyld_sim doesn't set global) */
+    /* Fix bootstrap port (old dyld_sim doesn't set global).
+     * When running under the broker, this sets bootstrap_port to the broker port,
+     * enabling CARenderServer lookup via bootstrap_look_up. */
     fix_bootstrap_port();
+
+    /* Also initialize the broker port for direct broker protocol messages.
+     * This is used by bridge_broker_lookup() and replacement_bootstrap_look_up()
+     * to communicate with the broker using custom msg_id 701. */
+    {
+        mach_port_t bp = MACH_PORT_NULL;
+        kern_return_t bkr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+        if (bkr == KERN_SUCCESS && bp != MACH_PORT_NULL) {
+            g_bridge_broker_port = bp;
+            bridge_log("  broker port = 0x%x (from TASK_BOOTSTRAP_PORT)", bp);
+        } else {
+            bridge_log("  no broker port (standalone mode)");
+        }
+    }
+    if (bootstrap_port != MACH_PORT_NULL) {
+        bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
+    }
 
     /* Swizzle BackBoardServices methods that crash without backboardd */
     swizzle_bks_methods();

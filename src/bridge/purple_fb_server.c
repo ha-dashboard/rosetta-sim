@@ -52,6 +52,7 @@ extern kern_return_t bootstrap_subset(mach_port_t, mach_port_t, mach_port_t *);
 extern kern_return_t bootstrap_register(mach_port_t, const char *, mach_port_t);
 extern kern_return_t bootstrap_check_in(mach_port_t, const char *, mach_port_t *);
 extern kern_return_t task_set_special_port(mach_port_t, int, mach_port_t);
+extern mach_port_t mach_reply_port(void);
 #define TASK_BOOTSTRAP_PORT 4
 extern kern_return_t mach_make_memory_entry_64(
     vm_map_t target_task,
@@ -135,6 +136,16 @@ static volatile int     g_running = 0;
 /* Shared framebuffer for host app */
 static void            *g_shared_fb = MAP_FAILED;
 static int              g_shared_fd = -1;
+
+/* Broker port for cross-process service sharing */
+static mach_port_t      g_broker_port = MACH_PORT_NULL;
+#define BROKER_REGISTER_PORT_ID 700
+
+/* ================================================================
+ * Forward declarations for internal functions
+ * ================================================================ */
+
+static void pfb_notify_broker(const char *name, mach_port_t port);
 
 /* ================================================================
  * Logging
@@ -735,6 +746,10 @@ kern_return_t pfb_bootstrap_register(mach_port_t bp, const char *name, mach_port
     kern_return_t kr = bootstrap_register(bp, name, sp);
     if (kr == KERN_SUCCESS) {
         pfb_log("  → registered OK via bootstrap");
+        /* Notify broker of the service port */
+        if (name && sp != MACH_PORT_NULL) {
+            pfb_notify_broker(name, sp);
+        }
         return kr;
     }
 
@@ -745,6 +760,12 @@ kern_return_t pfb_bootstrap_register(mach_port_t bp, const char *name, mach_port
         g_services[g_service_count].port = sp;
         g_service_count++;
         pfb_log("  → real registration failed (%d), stored in local registry", kr);
+
+        /* Notify broker of the service port */
+        if (sp != MACH_PORT_NULL) {
+            pfb_notify_broker(name, sp);
+        }
+
         return KERN_SUCCESS;  /* Pretend success */
     }
 
@@ -769,6 +790,11 @@ kern_return_t pfb_bootstrap_check_in(mach_port_t bp, const char *name, mach_port
             g_services[g_service_count].port = *sp;
             g_service_count++;
         }
+
+        /* Notify broker of the service port */
+        if (name && sp && *sp != MACH_PORT_NULL) {
+            pfb_notify_broker(name, *sp);
+        }
     } else {
         pfb_log("  → FAILED: %s (%d), creating port for local registry", mach_error_string(kr), kr);
 
@@ -787,6 +813,10 @@ kern_return_t pfb_bootstrap_check_in(mach_port_t bp, const char *name, mach_port
                 g_service_count++;
             }
             pfb_log("  → created local port %u for '%s'", port, name);
+
+            /* Notify broker of the service port */
+            pfb_notify_broker(name, port);
+
             kr = KERN_SUCCESS;
         }
     }
@@ -818,6 +848,96 @@ static struct {
 };
 
 /* ================================================================
+ * Broker notification — send service ports to broker for sharing
+ * ================================================================ */
+
+/* BROKER_REGISTER_PORT message format (msg_id 700)
+ * Must match bootstrap_complex_request_t in rosettasim_broker.c */
+#include <mach/ndr.h>
+#pragma pack(4)
+typedef struct {
+    mach_msg_header_t header;        /* 24 bytes */
+    mach_msg_body_t body;            /* 4 bytes — descriptor_count = 1 */
+    mach_msg_port_descriptor_t port; /* 12 bytes — the service port to register */
+    NDR_record_t ndr;                /* 8 bytes — required by broker */
+    uint32_t name_len;               /* 4 bytes */
+    char name[128];                  /* 128 bytes — service name */
+} BrokerRegisterPortMsg;
+#pragma pack()
+
+static void pfb_notify_broker(const char *name, mach_port_t port) {
+    if (g_broker_port == MACH_PORT_NULL || name == NULL || port == MACH_PORT_NULL) {
+        return;
+    }
+
+    pfb_log("Notifying broker of service '%s' (port %u)", name, port);
+
+    /* Construct BROKER_REGISTER_PORT request */
+    BrokerRegisterPortMsg msg;
+    memset(&msg, 0, sizeof(msg));
+
+    /* Header: complex message with port descriptor */
+    msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                           MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+    msg.header.msgh_size = sizeof(BrokerRegisterPortMsg);
+    msg.header.msgh_remote_port = g_broker_port;
+    msg.header.msgh_local_port = mach_reply_port();
+    msg.header.msgh_id = BROKER_REGISTER_PORT_ID;
+
+    /* Body: 1 port descriptor */
+    msg.body.msgh_descriptor_count = 1;
+
+    /* Port descriptor */
+    msg.port.name = port;
+    msg.port.disposition = MACH_MSG_TYPE_COPY_SEND;
+    msg.port.type = MACH_MSG_PORT_DESCRIPTOR;
+
+    /* NDR record (must match broker's expected format) */
+    msg.ndr = NDR_record;
+
+    /* Service name */
+    msg.name_len = (uint32_t)strlen(name);
+    strncpy(msg.name, name, 127);
+    msg.name[127] = '\0';
+
+    /* Send request and receive reply */
+    union {
+        struct {
+            mach_msg_header_t header;
+            uint32_t body[8];  /* Space for ret_code at offset 32 */
+        } reply;
+        uint8_t raw[64];  /* Generous buffer for 36-byte reply */
+    } reply_buf;
+    memset(&reply_buf, 0, sizeof(reply_buf));
+
+    kern_return_t kr = mach_msg(
+        &msg.header,
+        MACH_SEND_MSG | MACH_RCV_MSG,
+        sizeof(BrokerRegisterPortMsg),
+        sizeof(reply_buf),
+        msg.header.msgh_local_port,
+        1000,  /* 1 second timeout */
+        MACH_PORT_NULL
+    );
+
+    if (kr != KERN_SUCCESS) {
+        pfb_log("  → broker notification failed: %s (%d)", mach_error_string(kr), kr);
+        mach_port_deallocate(mach_task_self(), msg.header.msgh_local_port);
+        return;
+    }
+
+    /* Check reply ret_code at offset 32 */
+    uint32_t ret_code = reply_buf.reply.body[2];  /* offset 32 = body[8] */
+    if (ret_code == 0) {
+        pfb_log("  → broker registered '%s' successfully", name);
+    } else {
+        pfb_log("  → broker returned error code %u", ret_code);
+    }
+
+    mach_port_deallocate(mach_task_self(), msg.header.msgh_local_port);
+}
+
+/* ================================================================
  * Library constructor — runs before backboardd's main()
  * ================================================================ */
 
@@ -827,11 +947,22 @@ __attribute__((constructor))
 static void pfb_init(void) {
     pfb_log("Initializing PurpleFBServer shim");
 
+    /* Get the broker port from TASK_BOOTSTRAP_PORT.
+     * The broker spawned backboardd with this set to the broker's port. */
+    kern_return_t kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &g_broker_port);
+    if (kr == KERN_SUCCESS && g_broker_port != MACH_PORT_NULL) {
+        pfb_log("Found broker port: %u (from TASK_BOOTSTRAP_PORT)", g_broker_port);
+        /* Set bootstrap_port to broker so iOS SDK bootstrap calls go to broker */
+        bootstrap_port = g_broker_port;
+    } else {
+        pfb_log("WARNING: No broker port found: %s (%d)", mach_error_string(kr), kr);
+    }
+
     /* Create a bootstrap subset so we can register services.
      * Without this, bootstrap_register/check_in fail with error 141
      * because macOS doesn't allow arbitrary service registration.
      * A subset creates a private namespace where we're the authority. */
-    kern_return_t kr = bootstrap_subset(bootstrap_port, mach_task_self(), &g_subset_port);
+    kr = bootstrap_subset(bootstrap_port, mach_task_self(), &g_subset_port);
     if (kr == KERN_SUCCESS && g_subset_port != MACH_PORT_NULL) {
         pfb_log("Created bootstrap subset: %u (replacing bootstrap_port %u)",
                 g_subset_port, bootstrap_port);

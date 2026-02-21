@@ -13,7 +13,7 @@ import os
 
 def main():
     outpath = sys.argv[1] if len(sys.argv) > 1 else "/tmp/rosettasim_screenshot.png"
-    fbpath = "/tmp/rosettasim_framebuffer"
+    fbpath = os.environ.get("ROSETTASIM_FB_PATH", "/tmp/rosettasim_framebuffer")
 
     if not os.path.exists(fbpath):
         print(f"ERROR: {fbpath} not found — is the simulator running?")
