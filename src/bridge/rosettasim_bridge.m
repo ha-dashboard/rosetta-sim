@@ -5621,9 +5621,9 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             unsigned long count = [(NSArray *)allCtxs count];
                                             bridge_log("Display Pipeline [delayed]: allContexts count=%lu", count);
 
-                                            /* Force UIKit to re-create all layer backing stores.
-                                             * Content created before the remote context was set up exists
-                                             * in local memory only. We need UIKit to re-draw everything
+                                            /* NUCLEAR OPTION: Force UIKit to completely rebuild its views.
+                                             * Remove and re-add the root view controller. This destroys all
+                                             * existing backing stores and creates new ones through the active
                                              * so new backing stores go through the server pipeline.
                                              * Call setNeedsDisplay on VIEWS (not just layers) so UIKit
                                              * properly re-creates content via drawRect:. */
@@ -5633,28 +5633,22 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             id kw = a ? ((id(*)(id, SEL))objc_msgSend)(
                                                 a, sel_registerName("keyWindow")) : nil;
                                             if (kw) {
-                                                id rootL = ((id(*)(id, SEL))objc_msgSend)(
-                                                    kw, sel_registerName("layer"));
-                                                if (rootL) {
-                                                    /* Walk ALL subviews recursively and call setNeedsDisplay */
-                                                    __block void (^markViews)(id);
-                                                    markViews = ^(id view) {
-                                                        ((void(*)(id, SEL))objc_msgSend)(
-                                                            view, sel_registerName("setNeedsDisplay"));
-                                                        id subviews = ((id(*)(id, SEL))objc_msgSend)(
-                                                            view, sel_registerName("subviews"));
-                                                        for (id sv in (NSArray *)subviews) {
-                                                            markViews(sv);
-                                                        }
-                                                    };
-                                                    markViews(kw);
-                                                    bridge_log("Display Pipeline [delayed]: Marked all views for redisplay");
-
-                                                    /* Force layout + display */
+                                                /* Remove and re-set the root view controller to force
+                                                 * complete rebuild of the view/layer hierarchy */
+                                                id rvc = ((id(*)(id, SEL))objc_msgSend)(
+                                                    kw, sel_registerName("rootViewController"));
+                                                if (rvc) {
+                                                    bridge_log("Display Pipeline [delayed]: Re-setting rootViewController to force rebuild");
+                                                    ((void(*)(id, SEL, id))objc_msgSend)(
+                                                        kw, sel_registerName("setRootViewController:"), nil);
+                                                    ((void(*)(id, SEL, id))objc_msgSend)(
+                                                        kw, sel_registerName("setRootViewController:"), rvc);
+                                                    /* Force layout */
                                                     ((void(*)(id, SEL))objc_msgSend)(
                                                         kw, sel_registerName("layoutIfNeeded"));
-                                                    ((void(*)(id, SEL))objc_msgSend)(
-                                                        rootL, sel_registerName("displayIfNeeded"));
+                                                    bridge_log("Display Pipeline [delayed]: Root VC re-set complete");
+                                                } else {
+                                                    bridge_log("Display Pipeline [delayed]: No rootViewController");
                                                 }
                                             }
 
