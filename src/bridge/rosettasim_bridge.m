@@ -973,6 +973,24 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                     ((void(*)(id, SEL, id))objc_msgSend)(app, sel_registerName("setDelegate:"), app);
                     bridge_log("  App set as its own delegate: %p", (void *)app);
 
+                    /* Wait for CARenderServer and establish remote context BEFORE
+                     * any views are created. This ensures all layer backing stores
+                     * are IOSurface-backed (shared with server) instead of local. */
+                    if (!g_ca_server_connected) {
+                        bridge_log("  Waiting for CARenderServer before creating views...");
+                        for (int wait = 0; wait < 50 && !g_ca_server_connected; wait++) {
+                            /* Trigger CARenderServerGetServerPort to check */
+                            replacement_CARenderServerGetServerPort();
+                            if (g_ca_server_connected) break;
+                            usleep(100000); /* 100ms */
+                        }
+                        if (g_ca_server_connected) {
+                            bridge_log("  CARenderServer connected (port=%u) before view creation", g_ca_server_port);
+                        } else {
+                            bridge_log("  WARNING: CARenderServer not available — views will use local backing stores");
+                        }
+                    }
+
                     /* Call didFinishLaunchingWithOptions: */
                     SEL didFinishSel = sel_registerName("application:didFinishLaunchingWithOptions:");
                     Class appObjClass = object_getClass(app);
