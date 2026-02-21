@@ -1302,23 +1302,24 @@ static void *pfb_display_services_thread(void *arg) {
         if (hdr->msgh_id == 6001005) {
             /* BKSDisplayServicesGetMainScreenInfo
              * Reply format: { header, NDR, retcode, width, height, scaleX, scaleY }
-             * Total 60 bytes (0x3C) */
+             * Total 52 bytes (0x34) — confirmed from disassembly:
+             *   header (24) + NDR (8) + retcode (4) + width (4) + height (4) + scaleX (4) + scaleY (4)
+             * Reply ID = 0x5B91D1 (6001105 = request + 100) */
             #pragma pack(4)
             struct {
                 mach_msg_header_t header;   /* 24 bytes */
                 NDR_record_t ndr;           /*  8 bytes */
                 int32_t retcode;            /*  4 bytes */
-                uint32_t width;             /*  4 bytes */
-                uint32_t height;            /*  4 bytes */
+                uint32_t width;             /*  4 bytes — float as uint32 */
+                uint32_t height;            /*  4 bytes — float as uint32 */
                 uint32_t scaleX;            /*  4 bytes — float as uint32 */
                 uint32_t scaleY;            /*  4 bytes — float as uint32 */
-                uint32_t pad[2];            /*  8 bytes padding to 60 */
             } reply;
             #pragma pack()
 
             memset(&reply, 0, sizeof(reply));
             reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-            reply.header.msgh_size = 60; /* 0x3C as per protocol */
+            reply.header.msgh_size = 52; /* 0x34 — exact size from disassembly */
             reply.header.msgh_remote_port = reply_port;
             reply.header.msgh_local_port = MACH_PORT_NULL;
             reply.header.msgh_id = 6001005 + 100; /* Reply ID = request + 100 */

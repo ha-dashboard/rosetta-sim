@@ -4660,6 +4660,31 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
         bridge_log("  Calling original makeKeyAndVisible IMP");
         ((void(*)(id, SEL))_original_makeKeyAndVisible_IMP)(self, _cmd);
         bridge_log("  Original makeKeyAndVisible completed");
+
+        /* Create the UIWindow's CAContext NOW, before any views draw.
+         * UIWindow._createContext creates a remote CAContext linked to the
+         * screen's CADisplay. Set _attachable=YES so the context is displayable. */
+        Ivar attachIvar = class_getInstanceVariable(object_getClass(self), "_attachable");
+        if (attachIvar) {
+            *(BOOL *)((uint8_t *)self + ivar_getOffset(attachIvar)) = YES;
+            bridge_log("  Set UIWindow._attachable=YES");
+        }
+        SEL createCtxSel = sel_registerName("_createContextAttached:");
+        if ([(id)self respondsToSelector:createCtxSel]) {
+            ((void(*)(id, SEL, BOOL))objc_msgSend)(self, createCtxSel, YES);
+            Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
+            if (lcIvar) {
+                id lc = *(id *)((uint8_t *)self + ivar_getOffset(lcIvar));
+                if (lc) {
+                    unsigned int cid = 0;
+                    if ([(id)lc respondsToSelector:sel_registerName("contextId")])
+                        cid = ((unsigned int(*)(id, SEL))objc_msgSend)(lc, sel_registerName("contextId"));
+                    bridge_log("  UIWindow._createContext: layerContext=%p contextId=%u", (void *)lc, cid);
+                } else {
+                    bridge_log("  UIWindow._createContext: layerContext still nil");
+                }
+            }
+        }
     } else {
         /* Fallback: if we couldn't save the original IMP, do manual setup.
          * This shouldn't happen but prevents a dead-end. */
@@ -5809,6 +5834,49 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 sel_registerName("allContexts"));
                                             unsigned long count = [(NSArray *)allCtxs count];
                                             bridge_log("Display Pipeline [delayed]: allContexts count=%lu", count);
+
+                                            /* Check UIWindow._layerContext */
+                                            id _a = ((id(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                                            id _kw = _a ? ((id(*)(id, SEL))objc_msgSend)(_a, sel_registerName("keyWindow")) : nil;
+                                            if (_kw) {
+                                                Ivar lcIvar = class_getInstanceVariable(objc_getClass("UIWindow"), "_layerContext");
+                                                if (lcIvar) {
+                                                    id lc = *(id *)((uint8_t *)_kw + ivar_getOffset(lcIvar));
+                                                    bridge_log("Display Pipeline [delayed]: UIWindow._layerContext=%p", (void *)lc);
+
+                                                    if (!lc) {
+                                                        /* UIWindow never created its CAContext.
+                                                         * Call _createContext to create it now. */
+                                                        SEL createCtxSel = sel_registerName("_createContext");
+                                                        if ([(id)_kw respondsToSelector:createCtxSel]) {
+                                                            bridge_log("Display Pipeline [delayed]: Calling [UIWindow _createContext]");
+                                                            ((void(*)(id, SEL))objc_msgSend)(_kw, createCtxSel);
+
+                                                            /* Check again */
+                                                            lc = *(id *)((uint8_t *)_kw + ivar_getOffset(lcIvar));
+                                                            bridge_log("Display Pipeline [delayed]: After _createContext: _layerContext=%p", (void *)lc);
+                                                        }
+
+                                                        /* If still nil, try _createContextAttached:YES */
+                                                        if (!lc) {
+                                                            SEL createAttSel = sel_registerName("_createContextAttached:");
+                                                            if ([(id)_kw respondsToSelector:createAttSel]) {
+                                                                bridge_log("Display Pipeline [delayed]: Calling [UIWindow _createContextAttached:YES]");
+                                                                ((void(*)(id, SEL, BOOL))objc_msgSend)(_kw, createAttSel, YES);
+                                                                lc = *(id *)((uint8_t *)_kw + ivar_getOffset(lcIvar));
+                                                                bridge_log("Display Pipeline [delayed]: After _createContextAttached: _layerContext=%p", (void *)lc);
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if (lc && [(id)lc respondsToSelector:sel_registerName("contextId")]) {
+                                                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                                            lc, sel_registerName("contextId"));
+                                                        bridge_log("Display Pipeline [delayed]: _layerContext.contextId=%u", cid);
+                                                    }
+                                                }
+                                            }
 
                                             /* NUCLEAR OPTION: Force UIKit to completely rebuild its views.
                                              * Remove and re-add the root view controller. This destroys all
