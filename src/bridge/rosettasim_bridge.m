@@ -4767,26 +4767,175 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
         _addTouch_known_broken = 0;
     }
 
-    /* Call _callInitializationDelegatesForMainScene:transitionContext:
-     * This is the UIKit method that:
-     *   - Loads the main storyboard/nib
-     *   - Creates the delegate
-     *   - Calls application:didFinishLaunchingWithOptions:
-     *   - Calls makeKeyAndVisible (via storyboard loading)
-     *   - Posts UIApplicationDidFinishLaunchingNotification
-     *   - Calls applicationDidBecomeActive:
-     */
+    /* ================================================================
+     * SYNTHETIC FBSScene + DISPLAY PIPELINE
+     *
+     * Create a real FBSScene backed by CARenderServer's CADisplay.
+     * This wires UIKit's display pipeline to GPU-composited rendering:
+     *   CADisplay → FBSDisplay → FBSScene → UIScreen → UIWindow → CARenderServer
+     *
+     * UIKit's __createPlugInScreenForFBSDisplay: proves this works without
+     * FBSWorkspace. The key call is [UIScreen _FBSDisplayDidPossiblyConnect:withScene:].
+     * ================================================================ */
+    id syntheticScene = nil;
+    {
+        bridge_log("  Creating synthetic FBSScene for CARenderServer display...");
+
+        @try {
+            /* Step 1: Get CADisplay from CARenderServer */
+            id displays = ((id(*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("CADisplay"), sel_registerName("displays"));
+            NSUInteger displayCount = displays ? ((NSUInteger(*)(id, SEL))objc_msgSend)(
+                displays, sel_registerName("count")) : 0;
+            bridge_log("  CADisplay displays count=%lu", (unsigned long)displayCount);
+
+            id mainDisplay = nil;
+            if (displayCount > 0) {
+                mainDisplay = ((id(*)(id, SEL, NSUInteger))objc_msgSend)(
+                    displays, sel_registerName("objectAtIndex:"), (NSUInteger)0);
+                bridge_log("  CADisplay[0] = %p", (void *)mainDisplay);
+            }
+
+            if (mainDisplay) {
+                /* Step 2: Create FBSDisplay wrapping the CADisplay */
+                Class fbsDisplayClass = objc_getClass("FBSDisplay");
+                id fbsDisplay = nil;
+
+                if (fbsDisplayClass) {
+                    /* Try +displayWithCADisplay: */
+                    SEL displayWithCA = sel_registerName("displayWithCADisplay:");
+                    if (class_respondsToSelector(object_getClass((id)fbsDisplayClass), displayWithCA)) {
+                        fbsDisplay = ((id(*)(id, SEL, id))objc_msgSend)(
+                            (id)fbsDisplayClass, displayWithCA, mainDisplay);
+                        bridge_log("  FBSDisplay.displayWithCADisplay: = %p", (void *)fbsDisplay);
+                    }
+
+                    if (!fbsDisplay) {
+                        /* Try -initWithDisplay: or -initWithCADisplay: */
+                        id alloc = ((id(*)(id, SEL))objc_msgSend)(
+                            (id)fbsDisplayClass, sel_registerName("alloc"));
+                        SEL initDisplay = sel_registerName("initWithDisplay:");
+                        if (class_respondsToSelector(fbsDisplayClass, initDisplay)) {
+                            fbsDisplay = ((id(*)(id, SEL, id))objc_msgSend)(
+                                alloc, initDisplay, mainDisplay);
+                            bridge_log("  FBSDisplay.initWithDisplay: = %p", (void *)fbsDisplay);
+                        }
+                    }
+
+                    if (!fbsDisplay) {
+                        /* Try +mainDisplay */
+                        SEL mainDisplaySel = sel_registerName("mainDisplay");
+                        if (class_respondsToSelector(object_getClass((id)fbsDisplayClass), mainDisplaySel)) {
+                            fbsDisplay = ((id(*)(id, SEL))objc_msgSend)(
+                                (id)fbsDisplayClass, mainDisplaySel);
+                            bridge_log("  FBSDisplay.mainDisplay = %p", (void *)fbsDisplay);
+                        }
+                    }
+                } else {
+                    bridge_log("  WARNING: FBSDisplay class not found");
+                }
+
+                if (fbsDisplay) {
+                    /* Step 3: Wire UIScreen to the FBSDisplay + scene.
+                     * [UIScreen _FBSDisplayDidPossiblyConnect:withScene:andPost:] */
+                    Class uiScreenClass = objc_getClass("UIScreen");
+                    SEL connectSel = sel_registerName("_FBSDisplayDidPossiblyConnect:withScene:andPost:");
+
+                    if (class_respondsToSelector(object_getClass((id)uiScreenClass), connectSel)) {
+                        /* Create a minimal FBSScene */
+                        Class sceneClass = objc_getClass("FBSScene");
+                        if (sceneClass) {
+                            /* Try initWithQueue:identifier:display:settings:clientSettings: */
+                            SEL sceneInitSel = sel_registerName("initWithQueue:identifier:display:settings:clientSettings:");
+                            id sceneAlloc = ((id(*)(id, SEL))objc_msgSend)(
+                                (id)sceneClass, sel_registerName("alloc"));
+
+                            /* Create scene settings */
+                            Class settingsClass = objc_getClass("UIMutableApplicationSceneSettings");
+                            id sceneSettings = nil;
+                            if (settingsClass) {
+                                sceneSettings = ((id(*)(id, SEL))objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)settingsClass, sel_registerName("alloc")),
+                                    sel_registerName("init"));
+                            }
+
+                            Class clientSettingsClass = objc_getClass("UIMutableApplicationSceneClientSettings");
+                            id clientSettings = nil;
+                            if (clientSettingsClass) {
+                                clientSettings = ((id(*)(id, SEL))objc_msgSend)(
+                                    ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)clientSettingsClass, sel_registerName("alloc")),
+                                    sel_registerName("init"));
+                            }
+
+                            id sceneId = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                                (id)objc_getClass("NSString"),
+                                sel_registerName("stringWithUTF8String:"),
+                                "com.apple.frontboard.default");
+
+                            if (class_respondsToSelector(sceneClass, sceneInitSel)) {
+                                syntheticScene = ((id(*)(id, SEL, id, id, id, id, id))objc_msgSend)(
+                                    sceneAlloc, sceneInitSel,
+                                    dispatch_get_main_queue(),
+                                    sceneId,
+                                    fbsDisplay,
+                                    sceneSettings,
+                                    clientSettings);
+                                bridge_log("  FBSScene created: %p", (void *)syntheticScene);
+                            } else {
+                                bridge_log("  WARNING: FBSScene does not respond to initWithQueue:...");
+                            }
+                        }
+
+                        if (syntheticScene || fbsDisplay) {
+                            /* Connect UIScreen to the display */
+                            @try {
+                                ((void(*)(id, SEL, id, id, BOOL))objc_msgSend)(
+                                    (id)uiScreenClass, connectSel,
+                                    fbsDisplay, syntheticScene, YES);
+                                bridge_log("  UIScreen._FBSDisplayDidPossiblyConnect: DONE");
+
+                                /* Check if UIScreen.mainScreen is now valid */
+                                id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
+                                    (id)uiScreenClass, sel_registerName("mainScreen"));
+                                bridge_log("  UIScreen.mainScreen = %p", (void *)mainScreen);
+                            } @catch (id ex) {
+                                bridge_log("  UIScreen._FBSDisplayDidPossiblyConnect threw: %s",
+                                           [[ex description] UTF8String] ?: "unknown");
+                            }
+                        }
+                    } else {
+                        bridge_log("  WARNING: UIScreen does not respond to _FBSDisplayDidPossiblyConnect:");
+                    }
+                }
+            } else {
+                bridge_log("  WARNING: No CADisplay available (CARenderServer not connected?)");
+            }
+        } @catch (id ex) {
+            bridge_log("  Synthetic FBSScene creation failed: %s",
+                       [[ex description] UTF8String] ?: "unknown");
+        }
+    }
+
+    /* Now try calling _callInitializationDelegatesForMainScene with the synthetic scene */
     SEL callInitSel = sel_registerName("_callInitializationDelegatesForMainScene:transitionContext:");
-    if (class_respondsToSelector(object_getClass(self), callInitSel)) {
-        /* _callInitializationDelegatesForMainScene: crashes with SIGILL when
-         * scene is nil. Instead, perform the delegate initialization directly.
-         * This is what that method does internally:
-         *   1. Load main storyboard/nib
-         *   2. Call application:didFinishLaunchingWithOptions:
-         *   3. Post notifications
-         *   4. Call applicationDidBecomeActive:
-         */
-        bridge_log("  Performing delegate initialization directly (no FBSScene)...");
+    if (syntheticScene && class_respondsToSelector(object_getClass(self), callInitSel)) {
+        bridge_log("  Calling _callInitializationDelegatesForMainScene with synthetic scene...");
+        @try {
+            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                self, callInitSel, syntheticScene, transitionContext);
+            bridge_log("  _callInitializationDelegatesForMainScene completed!");
+            _didFinishLaunching_called = 1;
+        } @catch (id ex) {
+            bridge_log("  _callInitializationDelegatesForMainScene threw: %s — falling back to manual init",
+                       [[ex description] UTF8String] ?: "unknown");
+            syntheticScene = nil; /* Fall through to manual init below */
+        }
+    }
+
+    if (!_didFinishLaunching_called) {
+        bridge_log("  Performing delegate initialization directly...");
     }
 
     /* Get the delegate (already set by UIApplicationMain before _run) */
@@ -5038,316 +5187,378 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
         }
     }
 
-    /* Set up frame capture (rendering pipeline) */
-    bridge_log("  Setting up frame capture from _runWithMainScene...");
-    find_root_window(_bridge_delegate);
-
-    /* Post-window warmup: send a synthetic BEGAN+ENDED touch with the real
-     * root window and a proper IOHIDEvent. This exercises the full gesture
-     * recognizer codepath including the ENDED phase. The first ENDED event
-     * through sendEvent: crashes (one-time initialization in gesture processing),
-     * so doing it here means real user touches work from the first tap. */
-    if (_bridge_root_window) {
-        bridge_log("  Post-window warmup: synthetic BEGAN+ENDED on root window...");
-        _inject_single_touch(ROSETTASIM_TOUCH_BEGAN, 0.0, 0.0);
-        _inject_single_touch(ROSETTASIM_TOUCH_ENDED, 0.0, 0.0);
-        bridge_log("  Post-window warmup complete");
-    }
-
-    start_frame_capture();
-
     /* ================================================================
-     * GPU Rendering: Check if CARenderServer has a display we can use.
+     * Display Pipeline: FBSScene + CARenderServer
      *
-     * When CARenderServer is connected (via broker), query it for displays.
-     * If a main display exists, try to associate UIScreen with it and
-     * enable GPU rendering mode (CARenderServer composites to PurpleDisplay
-     * framebuffer instead of CPU renderInContext).
+     * Strategy: Create a synthetic FBSScene backed by the real CADisplay
+     * from CARenderServer. Call UIScreen._FBSDisplayDidPossiblyConnect:
+     * to wire UIScreen to the display. This makes UIKit set up the REAL
+     * display pipeline:
+     *   - UIScreen gets the CADisplay
+     *   - UIWindow renders through CARenderServer
+     *   - CARenderServer composites onto the PurpleDisplay surface
+     *   - The sync thread in purple_fb_server copies to shared framebuffer
+     *
+     * If this fails, fall back to CPU rendering (find_root_window +
+     * start_frame_capture with renderInContext).
      * ================================================================ */
+    int _fbs_display_pipeline_active = 0;
+
     if (g_ca_server_connected) {
-        bridge_log("GPU Rendering: Checking CARenderServer display availability...");
+        bridge_log("Display Pipeline: CARenderServer connected, attempting FBSScene pipeline...");
         @try {
+            /* Step 1: Get real CADisplay from CARenderServer */
             Class caDisplayClass = objc_getClass("CADisplay");
+            id mainDisplay = nil;
+            unsigned long displayCount = 0;
+
             if (caDisplayClass) {
-                /* Query CARenderServer for displays via _CASGetDisplays MIG call */
                 id displays = ((id(*)(id, SEL))objc_msgSend)(
                     (id)caDisplayClass, sel_registerName("displays"));
-                id mainDisplay = ((id(*)(id, SEL))objc_msgSend)(
+                mainDisplay = ((id(*)(id, SEL))objc_msgSend)(
                     (id)caDisplayClass, sel_registerName("mainDisplay"));
 
-                unsigned long displayCount = 0;
                 if (displays) {
                     displayCount = ((unsigned long(*)(id, SEL))objc_msgSend)(
                         displays, sel_registerName("count"));
                 }
 
-                bridge_log("GPU Rendering: [CADisplay displays] count=%lu", displayCount);
+                bridge_log("Display Pipeline: [CADisplay displays] count=%lu, mainDisplay=%p",
+                           displayCount, (void *)mainDisplay);
+
+                /* Log display details */
                 if (displays && displayCount > 0) {
                     for (unsigned long di = 0; di < displayCount; di++) {
                         id d = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
                             displays, sel_registerName("objectAtIndex:"), di);
                         id dName = ((id(*)(id, SEL))objc_msgSend)(d, sel_registerName("name"));
-                        id dUid = ((id(*)(id, SEL))objc_msgSend)(d, sel_registerName("uniqueId"));
-                        bridge_log("GPU Rendering:   display[%lu]: name=%s uid=%s ptr=%p",
+                        bridge_log("Display Pipeline:   display[%lu]: name=%s ptr=%p",
                                    di,
-                                   dName ? ((const char *(*)(id, SEL))objc_msgSend)(dName, sel_registerName("UTF8String")) : "nil",
-                                   dUid ? ((const char *(*)(id, SEL))objc_msgSend)(dUid, sel_registerName("UTF8String")) : "nil",
+                                   dName ? ((const char *(*)(id, SEL))objc_msgSend)(
+                                       dName, sel_registerName("UTF8String")) : "nil",
                                    (void *)d);
                     }
                 }
-                bridge_log("GPU Rendering: [CADisplay mainDisplay] = %p", (void *)mainDisplay);
 
-                /* Dump UIScreen ivars to understand display association */
-                Class uiScreenClass = objc_getClass("UIScreen");
-                if (uiScreenClass) {
-                    unsigned int ivarCount = 0;
-                    Ivar *ivars = class_copyIvarList(uiScreenClass, &ivarCount);
-                    bridge_log("GPU Rendering: UIScreen has %u ivars:", ivarCount);
-                    for (unsigned int i = 0; i < ivarCount; i++) {
-                        bridge_log("GPU Rendering:   ivar[%u]: %s (type=%s offset=%ld)",
-                                   i, ivar_getName(ivars[i]),
-                                   ivar_getTypeEncoding(ivars[i]) ?: "?",
-                                   ivar_getOffset(ivars[i]));
-                    }
-                    free(ivars);
-
-                    id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
-                        (id)uiScreenClass, sel_registerName("mainScreen"));
-                    bridge_log("GPU Rendering: [UIScreen mainScreen] = %p", (void *)mainScreen);
-
-                    if (mainDisplay && mainScreen) {
-                        /* Try to associate UIScreen with CADisplay.
-                         * Look for _display or _caDisplay ivar. */
-                        const char *display_ivar_names[] = {
-                            "_display", "_caDisplay", "_displayConfiguration",
-                            "_displayId", NULL
-                        };
-                        for (int ni = 0; display_ivar_names[ni]; ni++) {
-                            Ivar dIvar = class_getInstanceVariable(uiScreenClass,
-                                                                    display_ivar_names[ni]);
-                            if (dIvar) {
-                                id currentVal = *(id *)((uint8_t *)mainScreen + ivar_getOffset(dIvar));
-                                bridge_log("GPU Rendering: UIScreen.%s = %p (attempting to set to %p)",
-                                           display_ivar_names[ni], (void *)currentVal, (void *)mainDisplay);
-                                if (!currentVal || currentVal != mainDisplay) {
-                                    *(id *)((uint8_t *)mainScreen + ivar_getOffset(dIvar)) = mainDisplay;
-                                    bridge_log("GPU Rendering: Set UIScreen.%s = %p (CADisplay mainDisplay)",
-                                               display_ivar_names[ni], (void *)mainDisplay);
-                                }
-                                break;
-                            }
-                        }
-
-                        /* === CAContext diagnostic: check if window has a render context === */
-                        if (_bridge_root_window) {
-                            id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
-                                _bridge_root_window, sel_registerName("layer"));
-                            bridge_log("GPU Rendering: root window layer = %p", (void *)rootLayer);
-
-                            /* Check CAContext class methods */
-                            Class caContextClass = objc_getClass("CAContext");
-                            if (caContextClass) {
-                                /* List class methods to find remote context creation */
-                                unsigned int cmCount = 0;
-                                Method *cmethods = class_copyMethodList(object_getClass((id)caContextClass), &cmCount);
-                                bridge_log("GPU Rendering: CAContext has %u class methods:", cmCount);
-                                for (unsigned int ci = 0; ci < cmCount && ci < 15; ci++) {
-                                    bridge_log("GPU Rendering:   +%s", sel_getName(method_getName(cmethods[ci])));
-                                }
-                                free(cmethods);
-
-                                /* List instance methods */
-                                unsigned int imCount = 0;
-                                Method *imethods = class_copyMethodList(caContextClass, &imCount);
-                                bridge_log("GPU Rendering: CAContext has %u instance methods:", imCount);
-                                for (unsigned int ci = 0; ci < imCount && ci < 20; ci++) {
-                                    bridge_log("GPU Rendering:   -%s", sel_getName(method_getName(imethods[ci])));
-                                }
-                                free(imethods);
-
-                                /* Try to create a remote context with the display.
-                                 * Extract displayId from CADisplay._impl C++ object.
-                                 * Layout: vtable(8) + objcBackPtr(8) + name(8) + deviceName(8) + displayId(4) */
-                                Ivar implIvar = class_getInstanceVariable(object_getClass(mainDisplay), "_impl");
-                                if (implIvar) {
-                                    void *impl = *(void **)((uint8_t *)mainDisplay + ivar_getOffset(implIvar));
-                                    if (impl) {
-                                        unsigned int displayId = *(unsigned int *)((uint8_t *)impl + 32);
-                                        bridge_log("GPU Rendering: CADisplay._impl = %p, displayId = %u", impl, displayId);
-
-                                        /* Try remoteContextWithOptions: */
-                                        SEL remoteCtxSel = sel_registerName("remoteContextWithOptions:");
-                                        if (class_respondsToSelector(object_getClass((id)caContextClass), remoteCtxSel)) {
-                                            bridge_log("GPU Rendering: Found +[CAContext remoteContextWithOptions:]");
-                                            @try {
-                                                /* Build options dictionary: {kCAContextDisplayId: displayId} */
-                                                Class nsDictClass = objc_getClass("NSDictionary");
-                                                Class nsNumClass = objc_getClass("NSNumber");
-                                                id displayIdNum = ((id(*)(id, SEL, unsigned int))objc_msgSend)(
-                                                    (id)nsNumClass, sel_registerName("numberWithUnsignedInt:"), displayId);
-                                                id keys[] = { ((id(*)(id, SEL, const char *))objc_msgSend)(
-                                                    (id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"),
-                                                    "displayId") };
-                                                id vals[] = { displayIdNum };
-                                                id opts = ((id(*)(id, SEL, id *, id *, unsigned long))objc_msgSend)(
-                                                    (id)nsDictClass, sel_registerName("dictionaryWithObjects:forKeys:count:"),
-                                                    vals, keys, 1);
-
-                                                id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
-                                                    (id)caContextClass, remoteCtxSel, opts);
-                                                bridge_log("GPU Rendering: remoteContext = %p", (void *)remoteCtx);
-
-                                                if (remoteCtx) {
-                                                    /* Set the window's root layer as the context's layer.
-                                                     * Use [remoteCtx setLayer:rootLayer] — this is an INSTANCE method.
-                                                     * Must check instance, not class. */
-                                                    SEL setLayerSel = sel_registerName("setLayer:");
-                                                    Class remoteCtxClass = object_getClass(remoteCtx);
-
-                                                    /* List instance methods to find layer-related ones */
-                                                    unsigned int rmCount = 0;
-                                                    Method *rmethods = class_copyMethodList(remoteCtxClass, &rmCount);
-                                                    bridge_log("GPU Rendering: remoteCtx instance has %u methods:", rmCount);
-                                                    for (unsigned int ri = 0; ri < rmCount && ri < 30; ri++) {
-                                                        bridge_log("GPU Rendering:   -%s",
-                                                                   sel_getName(method_getName(rmethods[ri])));
-                                                    }
-                                                    if (rmethods) free(rmethods);
-
-                                                    /* Try setLayer: on the INSTANCE (not class) */
-                                                    if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
-                                                        ((void(*)(id, SEL, id))objc_msgSend)(
-                                                            remoteCtx, setLayerSel, rootLayer);
-                                                        bridge_log("GPU Rendering: Set remote context layer = root window layer");
-                                                    } else {
-                                                        bridge_log("GPU Rendering: remoteCtx does NOT respond to setLayer:");
-                                                        /* Try alternative: layer property via KVC */
-                                                        @try {
-                                                            [(id)remoteCtx setValue:rootLayer forKey:@"layer"];
-                                                            bridge_log("GPU Rendering: Set layer via KVC");
-                                                        } @catch (id kvcEx) {
-                                                            bridge_log("GPU Rendering: KVC setLayer failed: %s",
-                                                                       [[kvcEx description] UTF8String] ?: "unknown");
-                                                        }
-                                                    }
-
-                                                    /* Get context ID — check INSTANCE, not class */
-                                                    SEL ctxIdSel = sel_registerName("contextId");
-                                                    unsigned int ctxId = 0;
-                                                    if ([(id)remoteCtx respondsToSelector:ctxIdSel]) {
-                                                        ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                                                            remoteCtx, ctxIdSel);
-                                                        bridge_log("GPU Rendering: remote context ID = %u", ctxId);
-                                                    } else {
-                                                        bridge_log("GPU Rendering: remoteCtx does NOT respond to contextId");
-                                                        /* Try _contextId ivar */
-                                                        Ivar ctxIvar = class_getInstanceVariable(remoteCtxClass, "_contextId");
-                                                        if (ctxIvar) {
-                                                            ctxId = *(unsigned int *)((uint8_t *)(void *)remoteCtx + ivar_getOffset(ctxIvar));
-                                                            bridge_log("GPU Rendering: context ID from ivar = %u", ctxId);
-                                                        }
-                                                    }
-
-                                                    /* Write contextId to IPC file so purple_fb_server
-                                                     * can create a CALayerHost in backboardd's display tree */
-                                                    if (ctxId != 0) {
-                                                        int ctx_fd = open(ROSETTASIM_FB_CONTEXT_PATH,
-                                                                          O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                                                        if (ctx_fd >= 0) {
-                                                            char ctx_buf[32];
-                                                            int ctx_len = snprintf(ctx_buf, sizeof(ctx_buf), "%u", ctxId);
-                                                            write(ctx_fd, ctx_buf, ctx_len);
-                                                            close(ctx_fd);
-                                                            bridge_log("GPU Rendering: wrote context ID %u to %s",
-                                                                       ctxId, ROSETTASIM_FB_CONTEXT_PATH);
-                                                        }
-                                                    } else {
-                                                        bridge_log("GPU Rendering: WARNING context ID is 0, cannot share with backboardd");
-                                                    }
-
-                                                    /* Retain the context so it doesn't get deallocated */
-                                                    ((id(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("retain"));
-                                                }
-                                            } @catch (id ex) {
-                                                bridge_log("GPU Rendering: remoteContext creation failed: %s",
-                                                           ((const char *(*)(id, SEL))objc_msgSend)(
-                                                               ex, sel_registerName("UTF8String")) ?: "unknown");
-                                            }
-                                        } else {
-                                            /* Try localContextWithOptions: as fallback */
-                                            SEL localCtxSel = sel_registerName("localContextWithOptions:");
-                                            if (class_respondsToSelector(object_getClass((id)caContextClass), localCtxSel)) {
-                                                bridge_log("GPU Rendering: Found +[CAContext localContextWithOptions:] (no remote)");
-                                            } else {
-                                                bridge_log("GPU Rendering: No remote or local context creation method found");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            /* Force a full commit of the layer tree to CARenderServer */
-                            @try {
-                                Class catClass = objc_getClass("CATransaction");
-                                if (catClass) {
-                                    ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
-                                    bridge_log("GPU Rendering: Flushed CATransaction after context setup");
-                                }
-                            } @catch (id ex) { /* ignore */ }
-                        }
-
-                        /* GPU rendering via CALayerHost pipeline:
-                         * 1. Remote CAContext published app's layer tree (above)
-                         * 2. ContextId written to IPC file for purple_fb_server
-                         * 3. purple_fb_server creates CALayerHost in backboardd
-                         * 4. CARenderServer composites onto PurpleDisplay surface
-                         * 5. purple_fb_server syncs to GPU framebuffer file
-                         * 6. We map the GPU framebuffer and copy to app framebuffer
-                         *
-                         * Try to map the GPU framebuffer for reading. */
-                        {
-                            const char *gpu_fb_path = ROSETTASIM_FB_GPU_PATH;
-                            int gpu_fd = open(gpu_fb_path, O_RDONLY);
-                            if (gpu_fd >= 0) {
-                                struct stat st;
-                                if (fstat(gpu_fd, &st) == 0 && st.st_size > 0) {
-                                    _backboardd_fb_size = (size_t)st.st_size;
-                                    _backboardd_fb_mmap = mmap(NULL, _backboardd_fb_size,
-                                                                PROT_READ, MAP_SHARED, gpu_fd, 0);
-                                    if (_backboardd_fb_mmap != MAP_FAILED) {
-                                        g_gpu_rendering_active = 1;
-                                        bridge_log("GPU Rendering: Mapped backboardd framebuffer at %s "
-                                                   "(%zu bytes) — GPU compositing ACTIVE",
-                                                   gpu_fb_path, _backboardd_fb_size);
-                                    } else {
-                                        _backboardd_fb_mmap = NULL;
-                                        bridge_log("GPU Rendering: mmap of %s failed — staying in CPU mode",
-                                                   gpu_fb_path);
-                                    }
-                                } else {
-                                    bridge_log("GPU Rendering: %s empty or stat failed — staying in CPU mode",
-                                               gpu_fb_path);
-                                }
-                                close(gpu_fd);
-                            } else {
-                                bridge_log("GPU Rendering: %s not found — staying in CPU mode "
-                                           "(backboardd may not be running)", gpu_fb_path);
-                            }
-                        }
-
-                        if (!g_gpu_rendering_active) {
-                            bridge_log("GPU Rendering: CARenderServer connected — "
-                                       "server-assisted quality active, CPU rendering as fallback");
-                        }
-                    } else {
-                        bridge_log("GPU Rendering: No CADisplay mainDisplay — staying in CPU mode");
-                    }
+                /* Use firstObject from displays if mainDisplay is nil */
+                if (!mainDisplay && displays && displayCount > 0) {
+                    mainDisplay = ((id(*)(id, SEL))objc_msgSend)(
+                        displays, sel_registerName("firstObject"));
+                    bridge_log("Display Pipeline: mainDisplay was nil, using firstObject=%p",
+                               (void *)mainDisplay);
                 }
             }
+
+            if (mainDisplay) {
+                /* Step 2: Create FBSDisplay wrapping the CADisplay */
+                Class fbsDisplayClass = objc_getClass("FBSDisplay");
+                id fbsDisplay = nil;
+
+                if (fbsDisplayClass) {
+                    /* Try initWithCADisplay:isMainDisplay: first (more explicit) */
+                    SEL initMainSel = sel_registerName("initWithCADisplay:isMainDisplay:");
+                    SEL initCASel = sel_registerName("initWithCADisplay:");
+
+                    id fbsDisplayAlloc = ((id(*)(id, SEL))objc_msgSend)(
+                        (id)fbsDisplayClass, sel_registerName("alloc"));
+
+                    if (class_respondsToSelector(fbsDisplayClass, initMainSel)) {
+                        fbsDisplay = ((id(*)(id, SEL, id, BOOL))objc_msgSend)(
+                            fbsDisplayAlloc, initMainSel, mainDisplay, (BOOL)YES);
+                        bridge_log("Display Pipeline: FBSDisplay initWithCADisplay:isMainDisplay: = %p",
+                                   (void *)fbsDisplay);
+                    } else if (class_respondsToSelector(fbsDisplayClass, initCASel)) {
+                        fbsDisplay = ((id(*)(id, SEL, id))objc_msgSend)(
+                            fbsDisplayAlloc, initCASel, mainDisplay);
+                        bridge_log("Display Pipeline: FBSDisplay initWithCADisplay: = %p",
+                                   (void *)fbsDisplay);
+                    } else {
+                        bridge_log("Display Pipeline: FBSDisplay has no CADisplay init method");
+                        /* Log available init methods for debugging */
+                        unsigned int mCount = 0;
+                        Method *methods = class_copyMethodList(fbsDisplayClass, &mCount);
+                        bridge_log("Display Pipeline: FBSDisplay has %u instance methods:", mCount);
+                        for (unsigned int mi = 0; mi < mCount && mi < 20; mi++) {
+                            bridge_log("Display Pipeline:   -%s",
+                                       sel_getName(method_getName(methods[mi])));
+                        }
+                        if (methods) free(methods);
+                    }
+                } else {
+                    bridge_log("Display Pipeline: FBSDisplay class not found");
+                }
+
+                if (fbsDisplay) {
+                    /* Step 3: Create UIMutableApplicationSceneSettings with display config */
+                    Class sceneSettingsClass = objc_getClass("UIMutableApplicationSceneSettings");
+                    id sceneSettings = nil;
+
+                    if (sceneSettingsClass) {
+                        sceneSettings = ((id(*)(id, SEL))objc_msgSend)(
+                            ((id(*)(id, SEL))objc_msgSend)(
+                                (id)sceneSettingsClass, sel_registerName("alloc")),
+                            sel_registerName("init"));
+
+                        if (sceneSettings) {
+                            bridge_log("Display Pipeline: UIMutableApplicationSceneSettings created: %p",
+                                       (void *)sceneSettings);
+
+                            /* The frame/interfaceOrientation are on FBSMutableSceneSettings (superclass).
+                             * UIMutableApplicationSceneSettings inherits from UIApplicationSceneSettings
+                             * which inherits from FBSMutableSceneSettings. */
+                            @try {
+                                /* Set frame — CGRect {0, 0, width, height} */
+                                SEL setFrameSel = sel_registerName("setFrame:");
+                                if ([(id)sceneSettings respondsToSelector:setFrameSel]) {
+                                    _RSBridgeCGRect frame = {0, 0, kScreenWidth, kScreenHeight};
+                                    typedef void (*setFrame_fn)(id, SEL, _RSBridgeCGRect);
+                                    ((setFrame_fn)objc_msgSend)(sceneSettings, setFrameSel, frame);
+                                    bridge_log("Display Pipeline: setFrame: {0, 0, %.0f, %.0f}",
+                                               kScreenWidth, kScreenHeight);
+                                }
+
+                                /* Set interface orientation to portrait (1) */
+                                SEL setOrientSel = sel_registerName("setInterfaceOrientation:");
+                                if ([(id)sceneSettings respondsToSelector:setOrientSel]) {
+                                    ((void(*)(id, SEL, long))objc_msgSend)(
+                                        sceneSettings, setOrientSel, 1L /* UIInterfaceOrientationPortrait */);
+                                    bridge_log("Display Pipeline: setInterfaceOrientation: 1 (portrait)");
+                                }
+
+                                /* Enable device orientation events */
+                                SEL setDevOrientSel = sel_registerName("setDeviceOrientationEventsEnabled:");
+                                if ([(id)sceneSettings respondsToSelector:setDevOrientSel]) {
+                                    ((void(*)(id, SEL, BOOL))objc_msgSend)(
+                                        sceneSettings, setDevOrientSel, (BOOL)YES);
+                                    bridge_log("Display Pipeline: setDeviceOrientationEventsEnabled: YES");
+                                }
+                            } @catch (id ex) {
+                                bridge_log("Display Pipeline: Exception setting scene settings: %s",
+                                           [[ex description] UTF8String] ?: "unknown");
+                            }
+                        }
+                    }
+
+                    /* Step 4: Create UIMutableApplicationSceneClientSettings */
+                    Class clientSettingsClass = objc_getClass("UIMutableApplicationSceneClientSettings");
+                    id clientSettings = nil;
+
+                    if (clientSettingsClass) {
+                        clientSettings = ((id(*)(id, SEL))objc_msgSend)(
+                            ((id(*)(id, SEL))objc_msgSend)(
+                                (id)clientSettingsClass, sel_registerName("alloc")),
+                            sel_registerName("init"));
+                        bridge_log("Display Pipeline: UIMutableApplicationSceneClientSettings = %p",
+                                   (void *)clientSettings);
+                    }
+
+                    /* Step 5: Create FBSScene with display, settings, and client settings */
+                    Class fbsSceneClass = objc_getClass("FBSScene");
+                    id fbsScene = nil;
+
+                    if (fbsSceneClass) {
+                        SEL sceneInitSel = sel_registerName("initWithQueue:identifier:display:settings:clientSettings:");
+                        if (class_respondsToSelector(fbsSceneClass, sceneInitSel)) {
+                            @try {
+                                id sceneAlloc = ((id(*)(id, SEL))objc_msgSend)(
+                                    (id)fbsSceneClass, sel_registerName("alloc"));
+
+                                id sceneId = ((id(*)(id, SEL, const char *))objc_msgSend)(
+                                    (id)objc_getClass("NSString"),
+                                    sel_registerName("stringWithUTF8String:"),
+                                    "com.apple.frontboard.systemappserver");
+
+                                fbsScene = ((id(*)(id, SEL, id, id, id, id, id))objc_msgSend)(
+                                    sceneAlloc, sceneInitSel,
+                                    (id)dispatch_get_main_queue(),
+                                    sceneId,
+                                    fbsDisplay,
+                                    sceneSettings,
+                                    clientSettings);
+
+                                bridge_log("Display Pipeline: FBSScene created: %p", (void *)fbsScene);
+                            } @catch (id ex) {
+                                bridge_log("Display Pipeline: FBSScene creation threw: %s",
+                                           [[ex description] UTF8String] ?: "unknown");
+                            }
+                        } else {
+                            bridge_log("Display Pipeline: FBSScene does not respond to initWithQueue:...");
+                            /* Log available init methods */
+                            unsigned int mCount = 0;
+                            Method *methods = class_copyMethodList(fbsSceneClass, &mCount);
+                            for (unsigned int mi = 0; mi < mCount && mi < 20; mi++) {
+                                const char *mName = sel_getName(method_getName(methods[mi]));
+                                if (strstr(mName, "init")) {
+                                    bridge_log("Display Pipeline:   -%s", mName);
+                                }
+                            }
+                            if (methods) free(methods);
+                        }
+                    }
+
+                    /* Step 6: Wire UIScreen to the display via _FBSDisplayDidPossiblyConnect */
+                    Class uiScreenClass = objc_getClass("UIScreen");
+                    if (uiScreenClass && fbsDisplay) {
+                        SEL connectSel = sel_registerName("_FBSDisplayDidPossiblyConnect:withScene:andPost:");
+
+                        if (class_respondsToSelector(object_getClass((id)uiScreenClass), connectSel)) {
+                            @try {
+                                bridge_log("Display Pipeline: Calling [UIScreen _FBSDisplayDidPossiblyConnect:%p withScene:%p andPost:YES]",
+                                           (void *)fbsDisplay, (void *)fbsScene);
+
+                                ((void(*)(id, SEL, id, id, BOOL))objc_msgSend)(
+                                    (id)uiScreenClass, connectSel,
+                                    fbsDisplay, fbsScene, (BOOL)YES);
+
+                                bridge_log("Display Pipeline: _FBSDisplayDidPossiblyConnect completed");
+
+                                /* Verify UIScreen.mainScreen now has the display */
+                                id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
+                                    (id)uiScreenClass, sel_registerName("mainScreen"));
+                                bridge_log("Display Pipeline: [UIScreen mainScreen] = %p (after connect)",
+                                           (void *)mainScreen);
+
+                                /* Check if UIScreen has a _display ivar set now */
+                                if (mainScreen) {
+                                    Ivar dIvar = class_getInstanceVariable(uiScreenClass, "_display");
+                                    if (dIvar) {
+                                        id displayVal = *(id *)((uint8_t *)mainScreen + ivar_getOffset(dIvar));
+                                        bridge_log("Display Pipeline: UIScreen._display = %p", (void *)displayVal);
+                                    }
+                                }
+
+                                _fbs_display_pipeline_active = 1;
+                            } @catch (id ex) {
+                                bridge_log("Display Pipeline: _FBSDisplayDidPossiblyConnect threw: %s",
+                                           [[ex description] UTF8String] ?: "unknown");
+                            }
+                        } else {
+                            /* Try the simpler 1-arg and 2-arg variants */
+                            SEL connect2Sel = sel_registerName("_FBSDisplayDidPossiblyConnect:withScene:");
+                            SEL connect1Sel = sel_registerName("_FBSDisplayDidPossiblyConnect:");
+
+                            if (class_respondsToSelector(object_getClass((id)uiScreenClass), connect2Sel)) {
+                                @try {
+                                    bridge_log("Display Pipeline: Trying 2-arg variant...");
+                                    ((void(*)(id, SEL, id, id))objc_msgSend)(
+                                        (id)uiScreenClass, connect2Sel, fbsDisplay, fbsScene);
+                                    _fbs_display_pipeline_active = 1;
+                                    bridge_log("Display Pipeline: 2-arg _FBSDisplayDidPossiblyConnect completed");
+                                } @catch (id ex) {
+                                    bridge_log("Display Pipeline: 2-arg threw: %s",
+                                               [[ex description] UTF8String] ?: "unknown");
+                                }
+                            } else if (class_respondsToSelector(object_getClass((id)uiScreenClass), connect1Sel)) {
+                                @try {
+                                    bridge_log("Display Pipeline: Trying 1-arg variant...");
+                                    ((void(*)(id, SEL, id))objc_msgSend)(
+                                        (id)uiScreenClass, connect1Sel, fbsDisplay);
+                                    _fbs_display_pipeline_active = 1;
+                                    bridge_log("Display Pipeline: 1-arg _FBSDisplayDidPossiblyConnect completed");
+                                } @catch (id ex) {
+                                    bridge_log("Display Pipeline: 1-arg threw: %s",
+                                               [[ex description] UTF8String] ?: "unknown");
+                                }
+                            } else {
+                                bridge_log("Display Pipeline: UIScreen has no _FBSDisplayDidPossiblyConnect variant");
+                            }
+                        }
+                    }
+
+                    /* Step 7: If FBSScene pipeline is active, map the GPU framebuffer
+                     * for monitoring. CARenderServer composites to PurpleDisplay surface,
+                     * purple_fb_server syncs to /tmp/rosettasim_framebuffer_gpu. We map
+                     * that to copy frames to the app framebuffer for the host viewer. */
+                    if (_fbs_display_pipeline_active) {
+                        /* Force a full commit of the layer tree to CARenderServer */
+                        @try {
+                            Class catClass = objc_getClass("CATransaction");
+                            if (catClass) {
+                                ((void(*)(id, SEL))objc_msgSend)(
+                                    (id)catClass, sel_registerName("flush"));
+                                bridge_log("Display Pipeline: Flushed CATransaction");
+                            }
+                        } @catch (id ex) { /* ignore */ }
+
+                        /* Map the GPU framebuffer for relay to app framebuffer */
+                        const char *gpu_fb_path = ROSETTASIM_FB_GPU_PATH;
+                        int gpu_fd = open(gpu_fb_path, O_RDONLY);
+                        if (gpu_fd >= 0) {
+                            struct stat st;
+                            if (fstat(gpu_fd, &st) == 0 && st.st_size > 0) {
+                                _backboardd_fb_size = (size_t)st.st_size;
+                                _backboardd_fb_mmap = mmap(NULL, _backboardd_fb_size,
+                                                            PROT_READ, MAP_SHARED, gpu_fd, 0);
+                                if (_backboardd_fb_mmap != MAP_FAILED) {
+                                    g_gpu_rendering_active = 1;
+                                    bridge_log("Display Pipeline: Mapped GPU framebuffer at %s "
+                                               "(%zu bytes) — REAL GPU compositing ACTIVE",
+                                               gpu_fb_path, _backboardd_fb_size);
+                                } else {
+                                    _backboardd_fb_mmap = NULL;
+                                    bridge_log("Display Pipeline: mmap of %s failed: %s",
+                                               gpu_fb_path, strerror(errno));
+                                }
+                            } else {
+                                bridge_log("Display Pipeline: %s empty or stat failed", gpu_fb_path);
+                            }
+                            close(gpu_fd);
+                        } else {
+                            bridge_log("Display Pipeline: %s not found (backboardd may not be running)",
+                                       gpu_fb_path);
+                        }
+
+                        /* Set up the app's own framebuffer for frame relay.
+                         * Even with GPU rendering, we need the CPU framebuffer to relay
+                         * frames from the GPU framebuffer to the standard path for the
+                         * host viewer. find_root_window is still needed for touch injection. */
+                        find_root_window(_bridge_delegate);
+
+                        /* Start frame capture — in GPU mode, frame_capture_tick copies
+                         * from the GPU framebuffer instead of doing renderInContext. */
+                        start_frame_capture();
+
+                        bridge_log("Display Pipeline: FBSScene pipeline ACTIVE — "
+                                   "UIKit renders through CARenderServer natively");
+                    }
+
+                    /* Retain objects to prevent deallocation */
+                    if (fbsDisplay) ((id(*)(id, SEL))objc_msgSend)(fbsDisplay, sel_registerName("retain"));
+                    if (fbsScene) ((id(*)(id, SEL))objc_msgSend)(fbsScene, sel_registerName("retain"));
+                    if (sceneSettings) ((id(*)(id, SEL))objc_msgSend)(sceneSettings, sel_registerName("retain"));
+                    if (clientSettings) ((id(*)(id, SEL))objc_msgSend)(clientSettings, sel_registerName("retain"));
+                } else {
+                    bridge_log("Display Pipeline: FBSDisplay creation failed — falling back to CPU rendering");
+                }
+            } else {
+                bridge_log("Display Pipeline: No CADisplay available — falling back to CPU rendering");
+            }
         } @catch (id ex) {
-            bridge_log("GPU Rendering: Exception during setup: %s",
-                       ((const char *(*)(id, SEL))objc_msgSend)(ex, sel_registerName("UTF8String")) ?: "unknown");
+            bridge_log("Display Pipeline: Exception during setup: %s",
+                       [[ex description] UTF8String] ?: "unknown");
         }
+    } else {
+        bridge_log("Display Pipeline: CARenderServer not connected — using CPU rendering");
+    }
+
+    /* Fallback: CPU rendering if FBSScene pipeline didn't activate */
+    if (!_fbs_display_pipeline_active) {
+        bridge_log("  Falling back to CPU rendering (find_root_window + start_frame_capture)...");
+        find_root_window(_bridge_delegate);
+
+        /* Post-window warmup: send a synthetic BEGAN+ENDED touch with the real
+         * root window and a proper IOHIDEvent. This exercises the full gesture
+         * recognizer codepath including the ENDED phase. The first ENDED event
+         * through sendEvent: crashes (one-time initialization in gesture processing),
+         * so doing it here means real user touches work from the first tap. */
+        if (_bridge_root_window) {
+            bridge_log("  Post-window warmup: synthetic BEGAN+ENDED on root window...");
+            _inject_single_touch(ROSETTASIM_TOUCH_BEGAN, 0.0, 0.0);
+            _inject_single_touch(ROSETTASIM_TOUCH_ENDED, 0.0, 0.0);
+            bridge_log("  Post-window warmup complete");
+        }
+
+        start_frame_capture();
     }
 
     /* ================================================================
