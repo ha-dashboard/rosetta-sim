@@ -44,8 +44,8 @@
 #define BOOTSTRAP_BAD_COUNT         1104
 #define BOOTSTRAP_NO_MEMORY         1105
 
-/* Maximum registry entries */
-#define MAX_SERVICES    64
+/* Maximum registry entries — backboardd registers ~17, SpringBoard ~35, app ~5 */
+#define MAX_SERVICES    128
 #define MAX_NAME_LEN    128
 
 /* Service registry entry */
@@ -511,6 +511,7 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     char env_dyld_root[1024], env_dyld_insert[1024];
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
+    char env_hid_manager[1280];
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s", shim_path);
@@ -519,6 +520,12 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
     snprintf(env_cffixed_home, sizeof(env_cffixed_home), "CFFIXED_USER_HOME=%s", g_sim_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
+
+    /* HID System Manager bundle path — resolve relative to cwd */
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+    snprintf(env_hid_manager, sizeof(env_hid_manager),
+             "SIMULATOR_HID_SYSTEM_MANAGER=%s/src/bridge/RosettaSimHIDManager.bundle", cwd);
 
     char *env[] = {
         env_dyld_root,
@@ -535,6 +542,7 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
         "SIMULATOR_MAINSCREEN_WIDTH=750",
         "SIMULATOR_MAINSCREEN_HEIGHT=1334",
         "SIMULATOR_MAINSCREEN_SCALE=2.0",
+        env_hid_manager,
         NULL
     };
 
@@ -566,6 +574,98 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     g_backboardd_pid = pid;
 
     return 0;
+}
+
+/* Track child PIDs for cleanup */
+static pid_t g_assertiond_pid = -1;
+static pid_t g_springboard_pid = -1;
+
+/* Generic function to spawn an iOS simulator daemon with broker port.
+ * Uses DYLD_ROOT_PATH for framework resolution and springboard_shim.dylib
+ * for bootstrap_look_up routing through the broker. */
+static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
+                             const char *label, pid_t *out_pid) {
+    broker_log("[broker] spawning %s: %s\n", label, binary_path);
+
+    if (access(binary_path, X_OK) != 0) {
+        broker_log("[broker] %s not found: %s\n", label, binary_path);
+        return -1;
+    }
+
+    ensure_sim_home();
+
+    char env_dyld_root[1024], env_dyld_insert[1280];
+    char env_iphone_sim_root[1024], env_sim_root[1024];
+    char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
+
+    snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
+
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+    snprintf(env_dyld_insert, sizeof(env_dyld_insert),
+             "DYLD_INSERT_LIBRARIES=%s/src/bridge/springboard_shim.dylib", cwd);
+    snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
+    snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
+    snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
+    snprintf(env_cffixed_home, sizeof(env_cffixed_home), "CFFIXED_USER_HOME=%s", g_sim_home);
+    snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
+
+    char *env[] = {
+        env_dyld_root,
+        env_dyld_insert,
+        env_iphone_sim_root,
+        env_sim_root,
+        env_home,
+        env_cffixed_home,
+        env_tmpdir,
+        "SIMULATOR_DEVICE_NAME=iPhone 6s",
+        "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1",
+        "SIMULATOR_RUNTIME_VERSION=10.3",
+        "SIMULATOR_RUNTIME_BUILD_VERSION=14E8301",
+        "SIMULATOR_MAINSCREEN_WIDTH=750",
+        "SIMULATOR_MAINSCREEN_HEIGHT=1334",
+        "SIMULATOR_MAINSCREEN_SCALE=2.0",
+        NULL
+    };
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);
+
+    char *bin_copy = strdup(binary_path);
+    char *argv[] = { bin_copy, NULL };
+    pid_t pid;
+    int result = posix_spawn(&pid, binary_path, NULL, &attr, argv, env);
+    posix_spawnattr_destroy(&attr);
+    free(bin_copy);
+
+    if (result != 0) {
+        broker_log("[broker] %s spawn failed: %s\n", label, strerror(result));
+        return -1;
+    }
+
+    broker_log("[broker] %s spawned with pid %d\n", label, pid);
+    if (out_pid) *out_pid = pid;
+    return 0;
+}
+
+/* Spawn assertiond — process assertion daemon.
+ * Must start BEFORE SpringBoard (SpringBoard's AssertionServices
+ * framework connects to assertiond's XPC services during bootstrap). */
+static int spawn_assertiond(const char *sdk_path) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/usr/libexec/assertiond", sdk_path);
+    return spawn_sim_daemon(path, sdk_path, "assertiond", &g_assertiond_pid);
+}
+
+/* Spawn SpringBoard — the system app.
+ * Connects to backboardd (CARenderServer, display/HID) and assertiond
+ * (process assertions). Manages app lifecycle and display assignment. */
+static int spawn_springboard(const char *sdk_path) {
+    char path[1024];
+    snprintf(path, sizeof(path),
+             "%s/System/Library/CoreServices/SpringBoard.app/SpringBoard", sdk_path);
+    return spawn_sim_daemon(path, sdk_path, "SpringBoard", &g_springboard_pid);
 }
 
 /* Spawn an app process with broker port as bootstrap.
@@ -817,25 +917,135 @@ int main(int argc, char *argv[]) {
                     break;
             }
 
-            /* Check if CARenderServer is now registered */
+            /* Check if CARenderServer AND Purple services are registered.
+             * SpringBoard needs: CARenderServer, PurpleSystemEventPort,
+             * PurpleWorkspacePort, and backboard services to bootstrap. */
+            int has_ca = 0, has_event = 0, has_workspace = 0, has_display = 0;
             for (int i = 0; i < MAX_SERVICES; i++) {
-                if (g_services[i].active && strstr(g_services[i].name, "CARenderServer")) {
-                    ca_found = 1;
-                    break;
-                }
+                if (!g_services[i].active) continue;
+                if (strstr(g_services[i].name, "CARenderServer")) has_ca = 1;
+                if (strstr(g_services[i].name, "PurpleSystemEventPort")) has_event = 1;
+                if (strstr(g_services[i].name, "PurpleWorkspacePort")) has_workspace = 1;
+                if (strstr(g_services[i].name, "display.services")) has_display = 1;
+            }
+            if (has_ca && has_event && has_workspace && has_display) {
+                ca_found = 1;
             }
         }
 
         if (ca_found) {
-            broker_log("[broker] CARenderServer registered, spawning app\n");
+            broker_log("[broker] backboardd services ready (CARenderServer + Purple ports)\n");
         } else {
-            broker_log("[broker] WARNING: CARenderServer not registered after timeout, spawning app anyway\n");
+            broker_log("[broker] WARNING: backboardd services not all registered after timeout\n");
         }
 
-        /* Spawn the app with the bridge library injected.
-         * The bridge handles UIKit lifecycle AND connects to CARenderServer
-         * via the broker port (set as TASK_BOOTSTRAP_PORT). */
-        spawn_app(app_path, sdk_path, bridge_path);
+        /* Phase 2: Spawn assertiond (process assertion daemon).
+         * Must start BEFORE SpringBoard — SpringBoard's AssertionServices
+         * framework connects to assertiond's XPC services during bootstrap.
+         * Without assertiond, SpringBoard fails with "Bootstrap failed". */
+        broker_log("[broker] spawning assertiond...\n");
+        if (spawn_assertiond(sdk_path) != 0) {
+            broker_log("[broker] WARNING: failed to spawn assertiond\n");
+        } else {
+            /* Give assertiond a moment to register its XPC services */
+            broker_log("[broker] waiting for assertiond to initialize...\n");
+            for (int attempt = 0; attempt < 10; attempt++) {
+                memset(tmp_buf, 0, sizeof(tmp_buf));
+                kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                                 0, sizeof(tmp_buf), g_broker_port,
+                                                 500, MACH_PORT_NULL);
+                if (msg_kr == MACH_RCV_TIMED_OUT) continue;
+                if (msg_kr != KERN_SUCCESS) break;
+                broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
+                switch (tmp_req->msgh_id) {
+                    case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
+                    case BOOTSTRAP_REGISTER: handle_register(tmp_req); break;
+                    case BOOTSTRAP_LOOK_UP: handle_look_up(tmp_req); break;
+                    case BOOTSTRAP_PARENT: handle_parent(tmp_req); break;
+                    case BOOTSTRAP_SUBSET: handle_subset(tmp_req); break;
+                    case BROKER_REGISTER_PORT:
+                    case BROKER_LOOKUP_PORT:
+                    case BROKER_SPAWN_APP:
+                        handle_broker_message(tmp_req); break;
+                    default:
+                        if (tmp_req->msgh_remote_port != MACH_PORT_NULL)
+                            send_error_reply(tmp_req->msgh_remote_port, tmp_req->msgh_id + MIG_REPLY_OFFSET, MIG_BAD_ID);
+                        break;
+                }
+                /* Check if assertiond registered any services */
+                for (int i = 0; i < MAX_SERVICES; i++) {
+                    if (g_services[i].active && strstr(g_services[i].name, "assertiond")) {
+                        broker_log("[broker] assertiond service registered: %s\n", g_services[i].name);
+                        goto assertiond_ready;
+                    }
+                }
+            }
+            assertiond_ready:
+            broker_log("[broker] assertiond init phase complete\n");
+        }
+
+        /* Phase 3: Spawn SpringBoard.
+         * SpringBoard connects to backboardd's services (CARenderServer,
+         * PurpleSystemEventPort, etc.) and assertiond. It becomes the
+         * system app and manages app lifecycle and display assignment. */
+        broker_log("[broker] spawning SpringBoard...\n");
+        if (spawn_springboard(sdk_path) != 0) {
+            broker_log("[broker] WARNING: failed to spawn SpringBoard, spawning app directly\n");
+            spawn_app(app_path, sdk_path, bridge_path);
+        } else {
+            /* Wait for SpringBoard to register its services before spawning app.
+             * Key service: com.apple.frontboard.workspace (FBSWorkspace) */
+            broker_log("[broker] waiting for SpringBoard services...\n");
+            int sb_ready = 0;
+            for (int attempt = 0; attempt < 40 && !sb_ready; attempt++) {
+                memset(tmp_buf, 0, sizeof(tmp_buf));
+                kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                                 0, sizeof(tmp_buf), g_broker_port,
+                                                 500, MACH_PORT_NULL);
+                if (msg_kr == MACH_RCV_TIMED_OUT) continue;
+                if (msg_kr != KERN_SUCCESS) break;
+
+                broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
+
+                switch (tmp_req->msgh_id) {
+                    case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
+                    case BOOTSTRAP_REGISTER: handle_register(tmp_req); break;
+                    case BOOTSTRAP_LOOK_UP: handle_look_up(tmp_req); break;
+                    case BOOTSTRAP_PARENT: handle_parent(tmp_req); break;
+                    case BOOTSTRAP_SUBSET: handle_subset(tmp_req); break;
+                    case BROKER_REGISTER_PORT:
+                    case BROKER_LOOKUP_PORT:
+                    case BROKER_SPAWN_APP:
+                        handle_broker_message(tmp_req); break;
+                    default:
+                        if (tmp_req->msgh_remote_port != MACH_PORT_NULL)
+                            send_error_reply(tmp_req->msgh_remote_port, tmp_req->msgh_id + MIG_REPLY_OFFSET, MIG_BAD_ID);
+                        break;
+                }
+
+                /* Check if SpringBoard registered its key services */
+                for (int i = 0; i < MAX_SERVICES; i++) {
+                    if (g_services[i].active &&
+                        (strstr(g_services[i].name, "PurpleSystemAppPort") ||
+                         strstr(g_services[i].name, "frontboard.workspace"))) {
+                        sb_ready = 1;
+                        broker_log("[broker] SpringBoard service registered: %s\n", g_services[i].name);
+                        break;
+                    }
+                }
+            }
+
+            if (sb_ready) {
+                broker_log("[broker] SpringBoard ready, spawning app\n");
+            } else {
+                broker_log("[broker] WARNING: SpringBoard services not registered after timeout, spawning app anyway\n");
+            }
+
+            /* Phase 3: Spawn the app.
+             * With SpringBoard running, the app should connect properly
+             * through the FBSWorkspace protocol and get display assignment. */
+            spawn_app(app_path, sdk_path, bridge_path);
+        }
     }
 
     /* Run message loop */
@@ -843,6 +1053,18 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     broker_log("[broker] cleaning up\n");
+
+    if (g_springboard_pid > 0) {
+        broker_log("[broker] killing SpringBoard (pid %d)\n", g_springboard_pid);
+        kill(g_springboard_pid, SIGTERM);
+        waitpid(g_springboard_pid, NULL, WNOHANG);
+    }
+
+    if (g_assertiond_pid > 0) {
+        broker_log("[broker] killing assertiond (pid %d)\n", g_assertiond_pid);
+        kill(g_assertiond_pid, SIGTERM);
+        waitpid(g_assertiond_pid, NULL, WNOHANG);
+    }
 
     if (g_backboardd_pid > 0) {
         broker_log("[broker] killing backboardd (pid %d)\n", g_backboardd_pid);

@@ -55,13 +55,20 @@ echo "App FB:    $APP_FB"
 echo "========================================"
 echo ""
 
-# Cleanup
+# Cleanup — ALWAYS kill by PID, never by pattern matching.
+# Pattern-based kills (pgrep -f "backboardd") can match macOS system services.
 cleanup() {
     echo ""
     echo "Shutting down..."
-    kill $(pgrep -f "rosettasim_broker" 2>/dev/null) 2>/dev/null || true
-    kill $(pgrep -f "backboardd.*PurpleFBServer" 2>/dev/null) 2>/dev/null || true
-    kill $(pgrep -f "RosettaSim" 2>/dev/null) 2>/dev/null || true
+    # Kill broker by PID (it kills its own children on SIGTERM)
+    if [[ -n "${BROKER_PID:-}" ]]; then
+        kill "$BROKER_PID" 2>/dev/null || true
+        wait "$BROKER_PID" 2>/dev/null || true
+    fi
+    # Kill host app by PID
+    if [[ -n "${HOST_PID:-}" ]]; then
+        kill "$HOST_PID" 2>/dev/null || true
+    fi
     rm -f /tmp/rosettasim_broker.pid "$APP_FB" /tmp/rosettasim_framebuffer
     echo "Done."
 }
@@ -79,9 +86,11 @@ echo "Starting broker..."
     > /tmp/rosettasim_broker.log 2>&1 &
 BROKER_PID=$!
 
-# Wait for app framebuffer to appear
-echo "Waiting for app to start..."
-for i in $(seq 1 30); do
+# Wait for app framebuffer to appear.
+# The broker waits for backboardd services + SpringBoard + then spawns app,
+# which can take up to 60 seconds.
+echo "Waiting for app to start (this may take up to 60s with SpringBoard)..."
+for i in $(seq 1 120); do
     if [[ -f "$APP_FB" ]]; then
         echo "App framebuffer ready."
         break
@@ -90,9 +99,15 @@ for i in $(seq 1 30); do
 done
 
 if [[ ! -f "$APP_FB" ]]; then
-    echo "ERROR: App framebuffer not created after 15s"
+    echo "ERROR: App framebuffer not created after 60s"
     echo "Check: tail -f /tmp/rosettasim_broker.log"
-    exit 1
+    # Don't exit — try to continue with backboardd framebuffer
+    echo "Trying with backboardd framebuffer instead..."
+    APP_FB="/tmp/rosettasim_framebuffer"
+    if [[ ! -f "$APP_FB" ]]; then
+        echo "No framebuffer at all — check logs"
+        exit 1
+    fi
 fi
 
 # Start host app reading from the app framebuffer

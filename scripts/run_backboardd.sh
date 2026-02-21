@@ -18,12 +18,20 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SDK="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
+HID_BUNDLE="$PROJECT_ROOT/src/bridge/RosettaSimHIDManager.bundle"
 SIM_HOME="$PROJECT_ROOT/.sim_home"
 
 # Build PurpleFBServer if needed
 if [[ ! -f "$PFB" ]] || ! codesign -v "$PFB" 2>/dev/null; then
     echo "Building PurpleFBServer..."
     "$SCRIPT_DIR/build_purple_fb.sh"
+fi
+
+# Build HID Manager bundle if needed
+if [[ ! -f "$HID_BUNDLE/Contents/MacOS/RosettaSimHIDManager" ]] || \
+   ! codesign -v "$HID_BUNDLE" 2>/dev/null; then
+    echo "Building RosettaSimHIDManager..."
+    "$SCRIPT_DIR/build_hid_manager.sh"
 fi
 
 # Create sim home
@@ -43,6 +51,7 @@ echo "RosettaSim backboardd"
 echo "========================================"
 echo "SDK:       $SDK"
 echo "Shim:      $PFB"
+echo "HID Mgr:   $HID_BUNDLE"
 echo "Sim Home:  $SIM_HOME"
 echo "========================================"
 
@@ -62,6 +71,7 @@ if [[ $BACKGROUND -eq 1 ]]; then
       SIMULATOR_MAINSCREEN_WIDTH="750" \
       SIMULATOR_MAINSCREEN_HEIGHT="1334" \
       SIMULATOR_MAINSCREEN_SCALE="2.0" \
+      SIMULATOR_HID_SYSTEM_MANAGER="$HID_BUNDLE" \
       "$SDK/usr/libexec/backboardd" > /tmp/backboardd.log 2>&1 &
 
     BBD_PID=$!
@@ -91,5 +101,6 @@ else
       SIMULATOR_MAINSCREEN_WIDTH="750" \
       SIMULATOR_MAINSCREEN_HEIGHT="1334" \
       SIMULATOR_MAINSCREEN_SCALE="2.0" \
+      SIMULATOR_HID_SYSTEM_MANAGER="$HID_BUNDLE" \
       "$SDK/usr/libexec/backboardd"
 fi

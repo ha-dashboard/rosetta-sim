@@ -504,22 +504,54 @@ void pfb_GSEventInitializeWorkspaceWithQueue(void *queue) {
      * IOHIDEventSystem, not through the GS Purple port infrastructure. */
 }
 
-mach_port_t pfb_GSGetPurpleSystemEventPort(void) {
-    mach_port_t p = pfb_get_dummy_port();
-    pfb_log("GSGetPurpleSystemEventPort() → %u", p);
+/* Purple system ports — each gets its own unique port registered with broker.
+ * These are singleton ports returned on repeated calls (like launchd services). */
+static mach_port_t g_purple_event_port = MACH_PORT_NULL;
+static mach_port_t g_purple_workspace_port = MACH_PORT_NULL;
+static mach_port_t g_purple_app_port = MACH_PORT_NULL;
+
+/* Forward declarations for service registry (defined later in the file) */
+#define MAX_SERVICES 64
+static struct { char name[128]; mach_port_t port; } g_services[MAX_SERVICES];
+static int g_service_count;
+static void pfb_notify_broker(const char *name, mach_port_t port);
+
+static mach_port_t pfb_alloc_and_register(const char *name) {
+    mach_port_t p = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+    mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
+    if (name && p != MACH_PORT_NULL && g_service_count < MAX_SERVICES) {
+        strncpy(g_services[g_service_count].name, name, 127);
+        g_services[g_service_count].name[127] = 0;
+        g_services[g_service_count].port = p;
+        g_service_count++;
+        pfb_notify_broker(name, p);
+    }
     return p;
+}
+
+mach_port_t pfb_GSGetPurpleSystemEventPort(void) {
+    if (g_purple_event_port == MACH_PORT_NULL) {
+        g_purple_event_port = pfb_alloc_and_register("PurpleSystemEventPort");
+    }
+    pfb_log("GSGetPurpleSystemEventPort() → %u", g_purple_event_port);
+    return g_purple_event_port;
 }
 
 mach_port_t pfb_GSGetPurpleWorkspacePort(void) {
-    mach_port_t p = pfb_get_dummy_port();
-    pfb_log("GSGetPurpleWorkspacePort() → %u", p);
-    return p;
+    if (g_purple_workspace_port == MACH_PORT_NULL) {
+        g_purple_workspace_port = pfb_alloc_and_register("PurpleWorkspacePort");
+    }
+    pfb_log("GSGetPurpleWorkspacePort() → %u", g_purple_workspace_port);
+    return g_purple_workspace_port;
 }
 
 mach_port_t pfb_GSGetPurpleSystemAppPort(void) {
-    mach_port_t p = pfb_get_dummy_port();
-    pfb_log("GSGetPurpleSystemAppPort() → %u", p);
-    return p;
+    if (g_purple_app_port == MACH_PORT_NULL) {
+        g_purple_app_port = pfb_alloc_and_register("PurpleSystemAppPort");
+    }
+    pfb_log("GSGetPurpleSystemAppPort() → %u", g_purple_app_port);
+    return g_purple_app_port;
 }
 
 mach_port_t pfb_GSGetPurpleApplicationPort(void) {
@@ -528,14 +560,40 @@ mach_port_t pfb_GSGetPurpleApplicationPort(void) {
 }
 
 mach_port_t pfb_GSRegisterPurpleNamedPort(const char *name) {
-    mach_port_t p = pfb_get_dummy_port();
+    /* Create a unique port for each named service (not shared dummy).
+     * This allows SpringBoard and other processes to look up these
+     * services through the broker. */
+    mach_port_t p = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+    mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
     pfb_log("GSRegisterPurpleNamedPort('%s') → %u", name ? name : "(null)", p);
+
+    /* Register in local registry AND notify broker */
+    if (name && p != MACH_PORT_NULL && g_service_count < MAX_SERVICES) {
+        strncpy(g_services[g_service_count].name, name, 127);
+        g_services[g_service_count].name[127] = 0;
+        g_services[g_service_count].port = p;
+        g_service_count++;
+        pfb_notify_broker(name, p);
+    }
     return p;
 }
 
 mach_port_t pfb_GSRegisterPurpleNamedPerPIDPort(const char *name, int pid) {
-    mach_port_t p = pfb_get_dummy_port();
+    /* Same as GSRegisterPurpleNamedPort but with PID suffix */
+    mach_port_t p = MACH_PORT_NULL;
+    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p);
+    mach_port_insert_right(mach_task_self(), p, p, MACH_MSG_TYPE_MAKE_SEND);
     pfb_log("GSRegisterPurpleNamedPerPIDPort('%s', %d) → %u", name ? name : "(null)", pid, p);
+
+    /* Register with broker using the service name (without PID) */
+    if (name && p != MACH_PORT_NULL && g_service_count < MAX_SERVICES) {
+        strncpy(g_services[g_service_count].name, name, 127);
+        g_services[g_service_count].name[127] = 0;
+        g_services[g_service_count].port = p;
+        g_service_count++;
+        pfb_notify_broker(name, p);
+    }
     return p;
 }
 
@@ -703,10 +761,9 @@ static void pfb_handleFailureMethod(id self, SEL _cmd, SEL method, id object,
     /* Don't call original — suppress ALL assertions */
 }
 
-/* Track registered services for later lookup */
-#define MAX_SERVICES 64
-static struct { char name[128]; mach_port_t port; } g_services[MAX_SERVICES];
-static int g_service_count = 0;
+/* Track registered services for later lookup
+ * (g_services, g_service_count, MAX_SERVICES forward-declared above
+ *  near the Purple port functions) */
 
 kern_return_t pfb_bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp) {
     if (name && strcmp(name, PFB_SERVICE_NAME) == 0) {
@@ -1100,6 +1157,33 @@ static void pfb_init(void) {
             method_setImplementation(regM2, noop2);
             pfb_log("Swizzled BSBaseXPCServer.registerServer");
         }
+    }
+
+    /* Proactively create and register Purple system ports with the broker.
+     * SpringBoard needs these ports available BEFORE it starts:
+     *   - PurpleSystemEventPort: GSEvent delivery
+     *   - PurpleWorkspacePort: Workspace management
+     *   - PurpleSystemAppPort: System app check-in
+     *   - com.apple.backboard.system-app-server: System app management
+     *   - com.apple.backboard.checkin: Initial check-in
+     * These are normally created by GSEventInitializeWorkspaceWithQueue which
+     * we skip. Create them now so the broker can serve them to SpringBoard. */
+    {
+        pfb_log("Pre-registering Purple system ports for SpringBoard...");
+
+        /* These calls create unique ports and register with broker */
+        pfb_GSGetPurpleSystemEventPort();
+        pfb_GSGetPurpleWorkspacePort();
+        pfb_GSGetPurpleSystemAppPort();
+
+        /* Also pre-register the backboard services SpringBoard needs */
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.system-app-server");
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.checkin");
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.animation-fence-arbiter");
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.hid.focus");
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.TouchDeliveryPolicyServer");
+
+        pfb_log("Purple system ports registered with broker");
     }
 
     pfb_log("PurpleFBServer ready — all interpositions active");
