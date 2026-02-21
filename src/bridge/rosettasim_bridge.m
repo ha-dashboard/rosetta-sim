@@ -5364,6 +5364,31 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                 _fbs_display_pipeline_active = 1;
                                 bridge_log("Display Pipeline: UIScreen wired to CARenderServer display");
 
+                                /* Make all CAContexts visible on the server.
+                                 * The context may not be automatically visible. */
+                                @try {
+                                    id allCtxs = ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)objc_getClass("CAContext"),
+                                        sel_registerName("allContexts"));
+                                    bridge_log("Display Pipeline: CAContext.allContexts=%lu",
+                                               (unsigned long)[(NSArray *)allCtxs count]);
+                                    for (id ctx in (NSArray *)allCtxs) {
+                                        SEL renderCtxSel = sel_registerName("renderContext");
+                                        if ([(id)ctx respondsToSelector:renderCtxSel]) {
+                                            void *rc = ((void *(*)(id, SEL))objc_msgSend)(ctx, renderCtxSel);
+                                            if (rc) {
+                                                typedef void (*svfn)(void *, bool);
+                                                svfn fn = (svfn)dlsym(RTLD_DEFAULT,
+                                                    "_ZN2CA6Render7Context11set_visibleEb");
+                                                if (fn) {
+                                                    fn(rc, true);
+                                                    bridge_log("Display Pipeline: set_visible(true) on %p", rc);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } @catch (id ex) { /* ignore */ }
+
                                 /* Force all layers to redraw.
                                  * Static content's backing stores migrated to the server
                                  * but weren't marked dirty. Only animated layers (spinners)
