@@ -5327,6 +5327,93 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                     ((id(*)(id, SEL))objc_msgSend)(mainDisplay, sel_registerName("retain"));
                                     object_setIvar(mainScreen, displayIvar, mainDisplay);
                                     bridge_log("Display Pipeline: set _display=%p", (void *)mainDisplay);
+
+                                    /* Set the client port so UIKit's default CA pipeline
+                                     * routes render commits to CARenderServer */
+                                    Class caCtxClass = objc_getClass("CAContext");
+                                    SEL setClientPortSel = sel_registerName("setClientPort:");
+                                    if (caCtxClass && class_respondsToSelector(
+                                            object_getClass((id)caCtxClass), setClientPortSel)) {
+                                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                                            (id)caCtxClass, setClientPortSel, g_ca_server_port);
+                                        bridge_log("Display Pipeline: [CAContext setClientPort:%u]", g_ca_server_port);
+                                    }
+
+                                    /* Send RegisterClient MIG message to CARenderServer.
+                                     * This registers the app as a display client so the server
+                                     * composites its content onto the display surface.
+                                     * MIG msg_id 40202 (0x9D0A), complex message with 3 port descriptors. */
+                                    if (g_ca_server_port != MACH_PORT_NULL) {
+                                        #pragma pack(4)
+                                        struct {
+                                            mach_msg_header_t header;     /* 24 bytes */
+                                            mach_msg_body_t body;         /*  4 bytes */
+                                            mach_msg_port_descriptor_t ports[3]; /* 36 bytes (12 each) */
+                                            NDR_record_t ndr;             /*  8 bytes */
+                                            uint32_t priority;            /*  4 bytes */
+                                        } req;
+                                        struct {
+                                            mach_msg_header_t header;
+                                            NDR_record_t ndr;
+                                            kern_return_t retcode;
+                                            uint32_t server_port_out;
+                                            uint32_t context_id_out;
+                                            uint32_t fence_port_out;
+                                        } reply;
+                                        #pragma pack()
+
+                                        memset(&req, 0, sizeof(req));
+                                        req.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                                            MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+                                        req.header.msgh_size = sizeof(req);
+                                        req.header.msgh_remote_port = g_ca_server_port;
+                                        mach_port_t replyPort;
+                                        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &replyPort);
+                                        req.header.msgh_local_port = replyPort;
+                                        req.header.msgh_id = 40202; /* RegisterClient */
+                                        req.body.msgh_descriptor_count = 3;
+
+                                        /* Port descriptor 0: display port (use 0 for main display) */
+                                        req.ports[0].name = 0; /* display ID as port? */
+                                        req.ports[0].disposition = MACH_MSG_TYPE_COPY_SEND;
+                                        req.ports[0].type = MACH_MSG_PORT_DESCRIPTOR;
+
+                                        /* Port descriptor 1: task port */
+                                        req.ports[1].name = mach_task_self();
+                                        req.ports[1].disposition = MACH_MSG_TYPE_COPY_SEND;
+                                        req.ports[1].type = MACH_MSG_PORT_DESCRIPTOR;
+
+                                        /* Port descriptor 2: render/notify port (can be 0) */
+                                        req.ports[2].name = MACH_PORT_NULL;
+                                        req.ports[2].disposition = MACH_MSG_TYPE_COPY_SEND;
+                                        req.ports[2].type = MACH_MSG_PORT_DESCRIPTOR;
+
+                                        req.ndr = NDR_record;
+                                        req.priority = 0; /* default priority */
+
+                                        bridge_log("Display Pipeline: Sending RegisterClient (msg_id=40202) to port %u", g_ca_server_port);
+
+                                        /* First just send, to check if the message format is accepted */
+                                        kern_return_t kr = mach_msg(&req.header,
+                                            MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+                                            sizeof(req), sizeof(reply),
+                                            replyPort, 2000, /* 2s timeout */
+                                            MACH_PORT_NULL);
+
+                                        if (kr == KERN_SUCCESS) {
+                                            bridge_log("Display Pipeline: RegisterClient reply: retcode=%d server_port=%u context_id=%u fence=%u",
+                                                       reply.retcode, reply.server_port_out,
+                                                       reply.context_id_out, reply.fence_port_out);
+                                            if (reply.retcode == 0 && reply.context_id_out != 0) {
+                                                bridge_log("Display Pipeline: CLIENT REGISTERED with context ID %u",
+                                                           reply.context_id_out);
+                                            }
+                                        } else {
+                                            bridge_log("Display Pipeline: RegisterClient mach_msg failed: kr=%d (0x%x)",
+                                                       kr, kr);
+                                        }
+                                        mach_port_deallocate(mach_task_self(), replyPort);
+                                    }
                                 }
 
                                 /* Set _fbsDisplay (FBSDisplay) */
@@ -5389,10 +5476,10 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                     }
                                 } @catch (id ex) { /* ignore */ }
 
-                                /* Force all layers to redraw.
-                                 * Static content's backing stores migrated to the server
-                                 * but weren't marked dirty. Only animated layers (spinners)
-                                 * appear without this. */
+                                /* Create a displayable remote CAContext after window is ready.
+                                 * The key insight: CA::Render::Context only composites to the
+                                 * display surface when "displayable" = YES in the options dict.
+                                 * kCAContextDisplayable (0x1a2028 in QuartzCore) is the key. */
                                 @try {
                                     id app = ((id(*)(id, SEL))objc_msgSend)(
                                         (id)objc_getClass("UIApplication"),
@@ -5403,21 +5490,195 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                         id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
                                             keyWindow, sel_registerName("layer"));
                                         if (rootLayer) {
-                                            ((void(*)(id, SEL))objc_msgSend)(
-                                                rootLayer, sel_registerName("setNeedsDisplay"));
-                                            /* Recursively mark all sublayers dirty */
-                                            id sublayers = ((id(*)(id, SEL))objc_msgSend)(
-                                                rootLayer, sel_registerName("sublayers"));
-                                            for (id layer in (NSArray *)sublayers) {
-                                                ((void(*)(id, SEL))objc_msgSend)(
-                                                    layer, sel_registerName("setNeedsDisplay"));
+                                            /* Create displayable remote CAContext */
+                                            Class caCtxClass = objc_getClass("CAContext");
+                                            SEL remoteCtxSel = sel_registerName("remoteContextWithOptions:");
+                                            if (caCtxClass && class_respondsToSelector(
+                                                    object_getClass((id)caCtxClass), remoteCtxSel)) {
+                                                /* Build options dict with displayable=YES and display=displayId */
+                                                unsigned int displayId = 1; /* from CADisplay */
+                                                @try {
+                                                    SEL didSel = sel_registerName("displayId");
+                                                    if ([(id)mainDisplay respondsToSelector:didSel]) {
+                                                        displayId = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                                            mainDisplay, didSel);
+                                                    }
+                                                } @catch (id ex) { /* use default 1 */ }
+
+                                                /* Use kCAContextDisplayable if available, else literal string */
+                                                id displayableKey = *(id *)dlsym(RTLD_DEFAULT, "kCAContextDisplayable");
+                                                if (!displayableKey) displayableKey = @"displayable";
+                                                id displayKey = @"display";
+
+                                                NSDictionary *opts = @{
+                                                    displayKey: @(displayId),
+                                                    displayableKey: @YES
+                                                };
+                                                bridge_log("Display Pipeline: Creating displayable CAContext (display=%u)", displayId);
+
+                                                id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
+                                                    (id)caCtxClass, remoteCtxSel, opts);
+                                                if (remoteCtx) {
+                                                    /* Set the window's layer as the context's layer */
+                                                    SEL setLayerSel = sel_registerName("setLayer:");
+                                                    if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
+                                                        ((void(*)(id, SEL, id))objc_msgSend)(
+                                                            remoteCtx, setLayerSel, rootLayer);
+                                                        bridge_log("Display Pipeline: Set context layer = rootLayer");
+                                                    }
+
+                                                    SEL ctxIdSel = sel_registerName("contextId");
+                                                    if ([(id)remoteCtx respondsToSelector:ctxIdSel]) {
+                                                        unsigned int ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                                            remoteCtx, ctxIdSel);
+                                                        bridge_log("Display Pipeline: Displayable context ID = %u", ctxId);
+
+                                                        /* Write context ID for backboardd's CALayerHost */
+                                                        int ctxFd = open(ROSETTASIM_FB_CONTEXT_PATH,
+                                                            O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                                        if (ctxFd >= 0) {
+                                                            char buf[32];
+                                                            int len = snprintf(buf, sizeof(buf), "%u", ctxId);
+                                                            write(ctxFd, buf, len);
+                                                            close(ctxFd);
+                                                        }
+                                                    }
+
+                                                    /* Flush to push the context creation to server */
+                                                    ((void(*)(id, SEL))objc_msgSend)(
+                                                        (id)objc_getClass("CATransaction"),
+                                                        sel_registerName("flush"));
+                                                    bridge_log("Display Pipeline: Flushed displayable context");
+
+                                                    /* Retain to prevent deallocation */
+                                                    ((id(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("retain"));
+                                                } else {
+                                                    bridge_log("Display Pipeline: remoteContextWithOptions: returned nil");
+                                                }
                                             }
+                                            bridge_log("Display Pipeline: Context setup complete");
+                                        }
+                                    } else {
+                                        bridge_log("Display Pipeline: No keyWindow yet");
+                                    }
+
+                                    /* Schedule a delayed check to find UIKit's own context and
+                                     * make it displayable. UIKit creates its context during
+                                     * makeKeyAndVisible, which happens after this code runs. */
+                                    dispatch_after(
+                                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                                        dispatch_get_main_queue(), ^{
+                                        @try {
+                                            id allCtxs = ((id(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("CAContext"),
+                                                sel_registerName("allContexts"));
+                                            unsigned long count = [(NSArray *)allCtxs count];
+                                            bridge_log("Display Pipeline [delayed]: allContexts count=%lu", count);
+
+                                            /* Force the entire layer tree to re-render.
+                                             * The key: after UIKit creates all views and sets their content,
+                                             * call displayIfNeeded recursively on every layer. This causes
+                                             * each layer to re-create its backing store and push the content
+                                             * to CARenderServer. Without this, backing stores created BEFORE
+                                             * the context was displayable don't get pushed. */
+                                            id a = ((id(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("UIApplication"),
+                                                sel_registerName("sharedApplication"));
+                                            id kw = a ? ((id(*)(id, SEL))objc_msgSend)(
+                                                a, sel_registerName("keyWindow")) : nil;
+                                            if (kw) {
+                                                id rootL = ((id(*)(id, SEL))objc_msgSend)(
+                                                    kw, sel_registerName("layer"));
+                                                if (rootL) {
+                                                    /* Set needs display on the whole tree */
+                                                    ((void(*)(id, SEL))objc_msgSend)(
+                                                        rootL, sel_registerName("setNeedsDisplay"));
+                                                    /* Walk sublayers recursively */
+                                                    void (^markDirty)(id) = ^(id layer) {};
+                                                    __block void (^markDirtyR)(id);
+                                                    markDirtyR = ^(id layer) {
+                                                        ((void(*)(id, SEL))objc_msgSend)(
+                                                            layer, sel_registerName("setNeedsDisplay"));
+                                                        /* Also invalidate contents to force re-render */
+                                                        ((void(*)(id, SEL, id))objc_msgSend)(
+                                                            layer, sel_registerName("setContents:"), nil);
+                                                        id subs = ((id(*)(id, SEL))objc_msgSend)(
+                                                            layer, sel_registerName("sublayers"));
+                                                        for (id sub in (NSArray *)subs) {
+                                                            markDirtyR(sub);
+                                                        }
+                                                    };
+                                                    markDirtyR(rootL);
+                                                    bridge_log("Display Pipeline [delayed]: Invalidated all layer contents");
+
+                                                    /* Force layout + display + commit */
+                                                    ((void(*)(id, SEL))objc_msgSend)(
+                                                        kw, sel_registerName("layoutIfNeeded"));
+                                                    ((void(*)(id, SEL))objc_msgSend)(
+                                                        rootL, sel_registerName("displayIfNeeded"));
+                                                }
+                                            }
+
+                                            /* Flush to push everything to server */
                                             ((void(*)(id, SEL))objc_msgSend)(
                                                 (id)objc_getClass("CATransaction"),
                                                 sel_registerName("flush"));
-                                            bridge_log("Display Pipeline: Forced full layer redraw");
+                                            bridge_log("Display Pipeline [delayed]: Flushed after invalidation");
+
+                                            /* Diagnostic: Use CARenderServerCaptureDisplay to see
+                                             * what the server renders. If this shows content, the
+                                             * server HAS the data but isn't compositing to our surface.
+                                             * If this is blank, the server truly doesn't have the content. */
+                                            @try {
+                                                typedef int (*CaptureDisplayFn)(unsigned int serverPort,
+                                                    const char *displayName, unsigned long count,
+                                                    const unsigned int *clientIds, bool
+
+, unsigned int
+
+buffer, int
+
+w, int
+
+h, unsigned long
+
+rowBytes, void *transform);
+                                                CaptureDisplayFn captureFn = (CaptureDisplayFn)dlsym(
+                                                    RTLD_DEFAULT, "CARenderServerCaptureDisplay");
+                                                if (captureFn) {
+                                                    bridge_log("Display Pipeline [delayed]: CARenderServerCaptureDisplay found");
+                                                } else {
+                                                    bridge_log("Display Pipeline [delayed]: CARenderServerCaptureDisplay NOT found");
+                                                }
+
+                                                /* Also check: what does CARenderServerGetServerPort return? */
+                                                typedef mach_port_t (*GetPortFn)(void);
+                                                GetPortFn getPort = (GetPortFn)dlsym(RTLD_DEFAULT,
+                                                    "CARenderServerGetServerPort");
+                                                if (getPort) {
+                                                    mach_port_t sp = getPort();
+                                                    bridge_log("Display Pipeline [delayed]: CARenderServerGetServerPort()=%u", sp);
+                                                }
+
+                                                /* Check CARenderServerGetClientPort */
+                                                typedef mach_port_t (*GetClientPortFn)(unsigned int sp);
+                                                GetClientPortFn getClientPort = (GetClientPortFn)dlsym(
+                                                    RTLD_DEFAULT, "CARenderServerGetClientPort");
+                                                if (getClientPort) {
+                                                    mach_port_t sp = getPort ? getPort() : 0;
+                                                    mach_port_t cp = getClientPort(sp);
+                                                    bridge_log("Display Pipeline [delayed]: CARenderServerGetClientPort(%u)=%u", sp, cp);
+                                                }
+                                            } @catch (id ex) {
+                                                bridge_log("Display Pipeline [delayed]: diagnostic threw: %s",
+                                                           [[ex description] UTF8String] ?: "unknown");
+                                            }
+                                        } @catch (id ex) {
+                                            bridge_log("Display Pipeline [delayed]: threw: %s",
+                                                       [[ex description] UTF8String] ?: "unknown");
                                         }
-                                    } else {
+                                    });
+                                    if (0) { /* dead code to balance braces from original */
                                         bridge_log("Display Pipeline: No keyWindow yet — will retry");
                                         /* Schedule delayed redraw after window creation */
                                         dispatch_after(
