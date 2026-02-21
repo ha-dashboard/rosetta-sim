@@ -51,6 +51,7 @@
 
 /* Forward declarations for frame capture system */
 static id _bridge_delegate = nil;
+static id _bridge_root_window = nil;
 static void find_root_window(id delegate);
 static void start_frame_capture(void);
 static void _mark_display_dirty(void);
@@ -1447,8 +1448,52 @@ static bool replacement_SCNetworkReachabilityUnscheduleFromRunLoop(
         }
     }
 
-    bridge_log("RosettaSimURLProtocol: HTTP %d (%lu bytes body)",
-               statusCode, (unsigned long)bodyData.length);
+    bridge_log("RosettaSimURLProtocol: HTTP %d (%lu bytes body) %s",
+               statusCode, (unsigned long)bodyData.length, path.UTF8String);
+
+    /* Auto-connect: When /auth/providers succeeds, the app shows the login
+     * form with the correct auth mode. Trigger connectTapped after a delay
+     * so the login flow proceeds automatically. The Connect button is outside
+     * the card's clipsToBounds area and not tappable by the user. */
+    if (statusCode == 200 && [path containsString:@"auth/providers"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            bridge_log("Auto-connect: Searching for HAConnectionFormView...");
+            Class formClass = objc_getClass("HAConnectionFormView");
+            if (!formClass || !_bridge_root_window) {
+                bridge_log("Auto-connect: HAConnectionFormView class or root window not found");
+                return;
+            }
+            /* Search the view hierarchy for the form view */
+            id formView = nil;
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:_bridge_root_window];
+            while (stack.count > 0) {
+                id view = stack.lastObject;
+                [stack removeLastObject];
+                if ([view isKindOfClass:formClass]) {
+                    formView = view;
+                    break;
+                }
+                NSArray *subviews = ((id(*)(id, SEL))objc_msgSend)(
+                    view, sel_registerName("subviews"));
+                if (subviews) {
+                    [stack addObjectsFromArray:subviews];
+                }
+            }
+            if (formView) {
+                bridge_log("Auto-connect: Found HAConnectionFormView %p — calling connectTapped", (void *)formView);
+                @try {
+                    ((void(*)(id, SEL))objc_msgSend)(formView, sel_registerName("connectTapped"));
+                    bridge_log("Auto-connect: connectTapped invoked successfully");
+                } @catch (id ex) {
+                    bridge_log("Auto-connect: connectTapped threw: %s",
+                               ((const char *(*)(id, SEL))objc_msgSend)(ex, sel_registerName("UTF8String")) ?: "unknown");
+                }
+            } else {
+                bridge_log("Auto-connect: HAConnectionFormView not found in hierarchy");
+            }
+        });
+    }
 
     /* Log error response bodies for debugging */
     if (statusCode >= 400 && bodyData.length > 0 && bodyData.length < 2048) {
@@ -1732,6 +1777,44 @@ static void _register_url_protocol(void) {
                             handler(bodyData, response, nil);
                             bridge_log("NSURLSession swizzle: completion handler invoked on main queue");
                         });
+
+                        /* Auto-connect: trigger connectTapped after auth/providers succeeds */
+                        if (statusCode == 200 && [path containsString:@"auth/providers"]) {
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                bridge_log("Auto-connect: Searching for HAConnectionFormView...");
+                                Class formClass = objc_getClass("HAConnectionFormView");
+                                if (!formClass || !_bridge_root_window) {
+                                    bridge_log("Auto-connect: HAConnectionFormView class or root window not found");
+                                    return;
+                                }
+                                id formView = nil;
+                                NSMutableArray *stack = [NSMutableArray arrayWithObject:_bridge_root_window];
+                                while (stack.count > 0) {
+                                    id view = stack.lastObject;
+                                    [stack removeLastObject];
+                                    if ([view isKindOfClass:formClass]) {
+                                        formView = view;
+                                        break;
+                                    }
+                                    NSArray *subviews = ((id(*)(id, SEL))objc_msgSend)(
+                                        view, sel_registerName("subviews"));
+                                    if (subviews) [stack addObjectsFromArray:subviews];
+                                }
+                                if (formView) {
+                                    bridge_log("Auto-connect: Found HAConnectionFormView %p -- calling connectTapped", (void *)formView);
+                                    @try {
+                                        ((void(*)(id, SEL))objc_msgSend)(formView, sel_registerName("connectTapped"));
+                                        bridge_log("Auto-connect: connectTapped invoked successfully");
+                                    } @catch (id ex) {
+                                        bridge_log("Auto-connect: connectTapped threw: %s",
+                                                   ((const char *(*)(id, SEL))objc_msgSend)(ex, sel_registerName("UTF8String")) ?: "unknown");
+                                    }
+                                } else {
+                                    bridge_log("Auto-connect: HAConnectionFormView not found in hierarchy");
+                                }
+                            });
+                        }
                     }
                 });
 
@@ -1765,7 +1848,6 @@ typedef struct { double x, y, w, h; } _RSBridgeCGRect;
 /* Framebuffer state */
 static void *_fb_mmap = NULL;    /* Will be set to MAP_FAILED sentinel or valid ptr */
 static size_t _fb_size = 0;
-static id _bridge_root_window = nil;
 
 /* ================================================================
  * Window stack — tracks all visible UIWindows for proper z-ordering.
