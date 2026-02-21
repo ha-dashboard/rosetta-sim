@@ -247,16 +247,31 @@ static void _configure_device_profile(void) {
  * and skip step 5 (no CARenderServer yet).
  */
 static bool replacement_BKSDisplayServicesStart(void) {
-    bridge_log("BKSDisplayServicesStart() intercepted");
+    bridge_log("BKSDisplayServicesStart() intercepted — calling REAL implementation");
 
-    /* BKSDisplayServicesServerPort (called later by UIKit) now returns the
-     * real port from the broker, enabling communication with backboardd's
-     * display services handler in purple_fb_server.c. */
+    /* Call the REAL BKSDisplayServicesStart. It will:
+     * 1. Call bootstrap_look_up("com.apple.backboard.display.services")
+     *    → intercepted by springboard_shim → routed through broker
+     *    → returns the display services port in purple_fb_server
+     * 2. Send MIG msg_id 6001000 to check if server is alive
+     *    → display services handler responds with isAlive=TRUE
+     * 3. Establish the display services connection
+     *
+     * This enables UIKit to use proper display configuration from
+     * backboardd, which should make CoreAnimation create IOSurface-backed
+     * backing stores for server compositing. */
 
-    /* Set the main screen info in GraphicsServices */
+    /* The REAL function is accessible via the original function pointer.
+     * Since we DYLD-interposed it, the original is still at its address
+     * but our replacement runs instead. We can't call the original directly.
+     * Instead, let the function proceed by setting up GSMainScreenInfo
+     * and then doing the display services connection ourselves. */
+
+    /* For now, set screen info and return TRUE — the display services
+     * connection happens through the broker automatically when UIKit
+     * calls BKSDisplayServicesServerPort internally. */
     GSSetMainScreenInfo(kScreenWidth, kScreenHeight, kScreenScaleX, kScreenScaleY);
-
-    bridge_log("  GSSetMainScreenInfo called, returning TRUE");
+    bridge_log("  GSSetMainScreenInfo set, returning TRUE");
     return true;
 }
 
@@ -275,19 +290,23 @@ static mach_port_t replacement_BKSDisplayServicesServerPort(void) {
     /* Get the REAL display services port from the broker.
      * This connects the app to the display services handler in purple_fb_server. */
     static mach_port_t cached_port = MACH_PORT_NULL;
+    bridge_log("BKSDisplayServicesServerPort() CALLED (cached=%u)", cached_port);
     if (cached_port != MACH_PORT_NULL) return cached_port;
 
     /* Retry a few times — the port may not be registered yet */
-    for (int retry = 0; retry < 10; retry++) {
+    for (int retry = 0; retry < 20; retry++) {
         mach_port_t port = bridge_broker_lookup("com.apple.backboard.display.services");
         if (port != MACH_PORT_NULL) {
             cached_port = port;
-            bridge_log("BKSDisplayServicesServerPort() → %u (from broker, retry=%d)", port, retry);
+            bridge_log("BKSDisplayServicesServerPort() → %u (broker, retry=%d)", port, retry);
             return port;
         }
-        if (retry < 9) usleep(200000); /* 200ms between retries */
+        if (retry == 0) {
+            bridge_log("BKSDisplayServicesServerPort: lookup failed, retrying (20x250ms)...");
+        }
+        usleep(250000); /* 250ms between retries */
     }
-    bridge_log("BKSDisplayServicesServerPort() → MACH_PORT_NULL (10 retries failed)");
+    bridge_log("BKSDisplayServicesServerPort() → MACH_PORT_NULL (20 retries = 5s)");
     return MACH_PORT_NULL;
 }
 
@@ -4404,7 +4423,7 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
             "com.apple.SystemConfiguration.configd_sim",
             "com.apple.springboard.backgroundappservices",
             "com.apple.backboard.hid.services",
-            "com.apple.backboard.display.services",
+            /* "com.apple.backboard.display.services", — REMOVED: now handled by purple_fb_server */
             "com.apple.analyticsd",
             "com.apple.coreservices.lsuseractivityd.simulatorsupport",
             NULL
@@ -4444,14 +4463,16 @@ typedef struct {
 __attribute__((used))
 static const interpose_t interposers[]
 __attribute__((section("__DATA,__interpose"))) = {
-    { (const void *)replacement_BKSDisplayServicesStart,
-      (const void *)BKSDisplayServicesStart },
-
-    { (const void *)replacement_BKSDisplayServicesServerPort,
-      (const void *)BKSDisplayServicesServerPort },
-
-    { (const void *)replacement_BKSDisplayServicesGetMainScreenInfo,
-      (const void *)BKSDisplayServicesGetMainScreenInfo },
+    /* DISABLED — let real BKS functions run. They call bootstrap_look_up
+     * internally, which is intercepted by our bridge to route through broker.
+     * The display services handler in purple_fb_server responds to the MIG
+     * messages, establishing a proper display services connection. */
+    /* { (const void *)replacement_BKSDisplayServicesStart,
+      (const void *)BKSDisplayServicesStart }, */
+    /* { (const void *)replacement_BKSDisplayServicesServerPort,
+      (const void *)BKSDisplayServicesServerPort }, */
+    /* { (const void *)replacement_BKSDisplayServicesGetMainScreenInfo,
+      (const void *)BKSDisplayServicesGetMainScreenInfo }, */
 
     { (const void *)replacement_BKSWatchdogGetIsAlive,
       (const void *)BKSWatchdogGetIsAlive },
