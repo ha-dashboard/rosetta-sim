@@ -5363,6 +5363,68 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
 
                                 _fbs_display_pipeline_active = 1;
                                 bridge_log("Display Pipeline: UIScreen wired to CARenderServer display");
+
+                                /* Force all layers to redraw.
+                                 * Static content's backing stores migrated to the server
+                                 * but weren't marked dirty. Only animated layers (spinners)
+                                 * appear without this. */
+                                @try {
+                                    id app = ((id(*)(id, SEL))objc_msgSend)(
+                                        (id)objc_getClass("UIApplication"),
+                                        sel_registerName("sharedApplication"));
+                                    id keyWindow = app ? ((id(*)(id, SEL))objc_msgSend)(
+                                        app, sel_registerName("keyWindow")) : nil;
+                                    if (keyWindow) {
+                                        id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
+                                            keyWindow, sel_registerName("layer"));
+                                        if (rootLayer) {
+                                            ((void(*)(id, SEL))objc_msgSend)(
+                                                rootLayer, sel_registerName("setNeedsDisplay"));
+                                            /* Recursively mark all sublayers dirty */
+                                            id sublayers = ((id(*)(id, SEL))objc_msgSend)(
+                                                rootLayer, sel_registerName("sublayers"));
+                                            for (id layer in (NSArray *)sublayers) {
+                                                ((void(*)(id, SEL))objc_msgSend)(
+                                                    layer, sel_registerName("setNeedsDisplay"));
+                                            }
+                                            ((void(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("CATransaction"),
+                                                sel_registerName("flush"));
+                                            bridge_log("Display Pipeline: Forced full layer redraw");
+                                        }
+                                    } else {
+                                        bridge_log("Display Pipeline: No keyWindow yet — will retry");
+                                        /* Schedule delayed redraw after window creation */
+                                        dispatch_after(
+                                            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                            dispatch_get_main_queue(), ^{
+                                            @try {
+                                                id a = ((id(*)(id, SEL))objc_msgSend)(
+                                                    (id)objc_getClass("UIApplication"),
+                                                    sel_registerName("sharedApplication"));
+                                                id w = a ? ((id(*)(id, SEL))objc_msgSend)(
+                                                    a, sel_registerName("keyWindow")) : nil;
+                                                if (w) {
+                                                    id l = ((id(*)(id, SEL))objc_msgSend)(
+                                                        w, sel_registerName("layer"));
+                                                    if (l) {
+                                                        /* Mark entire tree dirty */
+                                                        ((void(*)(id, SEL, BOOL))objc_msgSend)(
+                                                            l, sel_registerName("setNeedsLayoutAndDisplay"),
+                                                            YES);
+                                                        ((void(*)(id, SEL))objc_msgSend)(
+                                                            (id)objc_getClass("CATransaction"),
+                                                            sel_registerName("flush"));
+                                                        bridge_log("Display Pipeline: Delayed full redraw triggered");
+                                                    }
+                                                }
+                                            } @catch (id ex) { /* ignore */ }
+                                        });
+                                    }
+                                } @catch (id ex) {
+                                    bridge_log("Display Pipeline: Force redraw threw: %s",
+                                               [[ex description] UTF8String] ?: "unknown");
+                                }
                             }
                         }
                     }
