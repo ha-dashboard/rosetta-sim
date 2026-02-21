@@ -3908,9 +3908,64 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         }
 
     gpu_copy:
-        /* PHASE 3: Copy from backboardd framebuffer (CARenderServer output).
-         * 1-frame latency: content populated this tick is composited by the
-         * server asynchronously and visible next tick (~33ms at 30fps). */
+        /* PHASE 3: Try UIWindow.createIOSurfaceFromScreen: to capture
+         * server-composited content. This is what the real iOS simulator uses. */
+        @try {
+            Class uiWindowClass = objc_getClass("UIWindow");
+            SEL captSel = sel_registerName("createIOSurfaceFromScreen:");
+            if (uiWindowClass && class_respondsToSelector(
+                    object_getClass((id)uiWindowClass), captSel)) {
+                Class uiScreenClass = objc_getClass("UIScreen");
+                id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)uiScreenClass, sel_registerName("mainScreen"));
+                if (mainScreen) {
+                    /* IOSurfaceRef createIOSurfaceFromScreen:(UIScreen*) */
+                    typedef void * (*CaptFn)(id, SEL, id);
+                    void *ioSurface = ((CaptFn)objc_msgSend)(
+                        (id)uiWindowClass, captSel, mainScreen);
+                    if (ioSurface) {
+                        /* Read IOSurface properties */
+                        typedef size_t (*IOSGetWidthFn)(void *);
+                        typedef size_t (*IOSGetHeightFn)(void *);
+                        typedef int (*IOSLockFn)(void *, uint32_t, uint32_t *);
+                        typedef void * (*IOSGetBaseAddrFn)(void *);
+                        typedef int (*IOSUnlockFn)(void *, uint32_t, uint32_t *);
+
+                        IOSGetWidthFn getW = (IOSGetWidthFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+                        IOSGetHeightFn getH = (IOSGetHeightFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+                        IOSLockFn lockFn = (IOSLockFn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+                        IOSGetBaseAddrFn getBase = (IOSGetBaseAddrFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+                        IOSUnlockFn unlockFn = (IOSUnlockFn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+
+                        if (getW && getH && lockFn && getBase && unlockFn) {
+                            size_t sw = getW(ioSurface);
+                            size_t sh = getH(ioSurface);
+                            lockFn(ioSurface, 1 /* kIOSurfaceLockReadOnly */, NULL);
+                            void *base = getBase(ioSurface);
+                            if (base && sw == dst_hdr->width && sh == dst_hdr->height) {
+                                size_t bytes = sw * sh * 4;
+                                memcpy(dst_pixels, base, bytes);
+                                dst_hdr->frame_counter++;
+                                static int _logged_ios = 0;
+                                if (!_logged_ios) {
+                                    _logged_ios = 1;
+                                    bridge_log("GPU CAPTURE: createIOSurfaceFromScreen %zux%zu → copied to framebuffer", sw, sh);
+                                }
+                            }
+                            unlockFn(ioSurface, 1, NULL);
+                        }
+                        /* Release IOSurface */
+                        typedef void (*CFRelFn)(void *);
+                        CFRelFn cfRel = (CFRelFn)dlsym(RTLD_DEFAULT, "CFRelease");
+                        if (cfRel) cfRel(ioSurface);
+                    }
+                }
+            }
+        } @catch (id ex) {
+            /* Ignore — will fall through to PurpleDisplay surface copy */
+        }
+
+        /* Fallback: copy from PurpleDisplay surface (backboardd framebuffer) */
         {
             RosettaSimFramebufferHeader *src_hdr = (RosettaSimFramebufferHeader *)_backboardd_fb_mmap;
             void *src_pixels = (uint8_t *)_backboardd_fb_mmap + ROSETTASIM_FB_META_SIZE;
