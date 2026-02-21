@@ -423,8 +423,27 @@ static mach_port_t bridge_broker_lookup(const char *name) {
  *   - All rendering is CPU via renderInContext: into shared framebuffer
  */
 static mach_port_t replacement_CARenderServerGetServerPort(void) {
-    /* If already connected to real CARenderServer, return cached port */
-    if (g_ca_server_connected) return g_ca_server_port;
+    /* If already connected to real CARenderServer, return cached port.
+     * Also ensure client port is set on first access. */
+    if (g_ca_server_connected) {
+        static int _client_port_set_cached = 0;
+        if (!_client_port_set_cached) {
+            _client_port_set_cached = 1;
+            mach_port_t cp = MACH_PORT_NULL;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
+            mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
+            Class caCtxCls = objc_getClass("CAContext");
+            if (caCtxCls) {
+                SEL scpSel = sel_registerName("setClientPort:");
+                if (class_respondsToSelector(object_getClass((id)caCtxCls), scpSel)) {
+                    ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                        (id)caCtxCls, scpSel, cp);
+                    bridge_log("CARenderServerGetServerPort: setClientPort:%u (cached path)", cp);
+                }
+            }
+        }
+        return g_ca_server_port;
+    }
 
     /* Get broker port if not yet resolved */
     if (g_bridge_broker_port == MACH_PORT_NULL) {
@@ -446,6 +465,27 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
             g_ca_server_connected = 1;
             bridge_log("CARenderServerGetServerPort() → port %u "
                        "(real CARenderServer via broker)", port);
+
+            /* Set client port IMMEDIATELY so CoreAnimation knows to use
+             * IOSurface-backed backing stores for server compositing.
+             * This MUST happen before ANY views/layers are created. */
+            static int _client_port_set = 0;
+            if (!_client_port_set) {
+                _client_port_set = 1;
+                mach_port_t cp = MACH_PORT_NULL;
+                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
+                mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
+                Class caCtxCls = objc_getClass("CAContext");
+                if (caCtxCls) {
+                    SEL scpSel = sel_registerName("setClientPort:");
+                    if (class_respondsToSelector(object_getClass((id)caCtxCls), scpSel)) {
+                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                            (id)caCtxCls, scpSel, cp);
+                        bridge_log("CARenderServerGetServerPort: setClientPort:%u (early init)", cp);
+                    }
+                }
+            }
+
             return port;
         }
     }
