@@ -262,10 +262,14 @@ static void pfb_setup_shared_framebuffer(void) {
 /* Copy rendered pixels from backboardd's surface to the shared framebuffer.
  * Called periodically from the server thread or could be triggered on
  * flush_shmem from PurpleDisplay. For now we'll use a simple periodic copy. */
+static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
+
 static void pfb_sync_to_shared(void) {
     if (g_shared_fb == MAP_FAILED || g_surface_addr == 0) return;
 
     uint8_t *pixel_dest = (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE;
+
+    /* Primary: copy from CARenderServer's PurpleDisplay surface */
     memcpy(pixel_dest, (void *)g_surface_addr, PFB_SURFACE_SIZE);
 
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_shared_fb;
@@ -629,8 +633,9 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
             pfb_log("CALayerHost set as server context layer directly");
         }
 
-        /* Retain the layer host */
+        /* Retain the layer host and store globally */
         ((id (*)(id, SEL))objc_msgSend)(layerHost, sel_registerName("retain"));
+        g_layer_host_ref = layerHost;
 
         /* Flush the transaction to commit immediately */
         Class catClass = (Class)objc_getClass("CATransaction");

@@ -469,7 +469,7 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
          * returning a real port, CA should set up the server connection.
          * Creating extra contexts might interfere with the default pipeline. */
         static int _early_ctx = 0;
-        if (0 && !_early_ctx) {
+        if (!_early_ctx) { /* re-enabled for CALayerHost */
             _early_ctx = 1;
             mach_port_t cp = MACH_PORT_NULL;
             mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
@@ -4706,7 +4706,7 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
         /* Use the PRE-CREATED remote context from CARenderServerGetServerPort.
          * This context was created BEFORE any views exist, ensuring all layer
          * backing stores go through the server pipeline from the start. */
-        if (0 && _bridge_pre_created_context) { /* DISABLED — let CA handle naturally */
+        if (_bridge_pre_created_context) { /* re-enabled for proper GPU rendering */
             /* Set the pre-created context as UIWindow's _layerContext */
             Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
             if (lcIvar) {
