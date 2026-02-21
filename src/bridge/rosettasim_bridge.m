@@ -5334,9 +5334,17 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                     SEL setClientPortSel = sel_registerName("setClientPort:");
                                     if (caCtxClass && class_respondsToSelector(
                                             object_getClass((id)caCtxClass), setClientPortSel)) {
+                                        /* Create a receive port for the client.
+                                         * setClientPort sets the port that the SERVER sends callbacks to.
+                                         * It must NOT be the server port — it must be a port the client OWNS. */
+                                        mach_port_t clientPort = MACH_PORT_NULL;
+                                        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &clientPort);
+                                        mach_port_insert_right(mach_task_self(), clientPort, clientPort,
+                                                               MACH_MSG_TYPE_MAKE_SEND);
                                         ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                                            (id)caCtxClass, setClientPortSel, g_ca_server_port);
-                                        bridge_log("Display Pipeline: [CAContext setClientPort:%u]", g_ca_server_port);
+                                            (id)caCtxClass, setClientPortSel, clientPort);
+                                        bridge_log("Display Pipeline: [CAContext setClientPort:%u] (client receive port)",
+                                                   clientPort);
                                     }
 
                                     /* Send RegisterClient MIG message to CARenderServer.
@@ -5528,10 +5536,30 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 if (!displayableKey) displayableKey = @"displayable";
                                                 id displayKey = @"display";
 
-                                                NSDictionary *opts = @{
-                                                    displayKey: @(displayId),
-                                                    displayableKey: @YES
-                                                };
+                                                /* Also include kCAContextClientPortNumber so connect_remote
+                                                 * passes our client port to the server during registration */
+                                                id clientPortKey = nil;
+                                                void *cpkPtr = dlsym(RTLD_DEFAULT, "kCAContextClientPortNumber");
+                                                if (cpkPtr) clientPortKey = *(id *)cpkPtr;
+                                                if (!clientPortKey) clientPortKey = @"clientPortNumber";
+
+                                                NSDictionary *opts;
+                                                /* Read back the client port we set earlier */
+                                                void *ucpPtr = dlsym(RTLD_DEFAULT, "_ZN2CA7Context17_user_client_portE");
+                                                mach_port_t ucp = ucpPtr ? *(mach_port_t *)ucpPtr : 0;
+                                                if (ucp != 0) {
+                                                    opts = @{
+                                                        displayKey: @(displayId),
+                                                        displayableKey: @YES,
+                                                        clientPortKey: @(ucp)
+                                                    };
+                                                    bridge_log("Display Pipeline: opts include clientPortNumber=%u", ucp);
+                                                } else {
+                                                    opts = @{
+                                                        displayKey: @(displayId),
+                                                        displayableKey: @YES
+                                                    };
+                                                }
                                                 bridge_log("Display Pipeline: Creating displayable CAContext (display=%u)", displayId);
 
                                                 id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
@@ -5593,12 +5621,12 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             unsigned long count = [(NSArray *)allCtxs count];
                                             bridge_log("Display Pipeline [delayed]: allContexts count=%lu", count);
 
-                                            /* Force the entire layer tree to re-render.
-                                             * The key: after UIKit creates all views and sets their content,
-                                             * call displayIfNeeded recursively on every layer. This causes
-                                             * each layer to re-create its backing store and push the content
-                                             * to CARenderServer. Without this, backing stores created BEFORE
-                                             * the context was displayable don't get pushed. */
+                                            /* Force UIKit to re-create all layer backing stores.
+                                             * Content created before the remote context was set up exists
+                                             * in local memory only. We need UIKit to re-draw everything
+                                             * so new backing stores go through the server pipeline.
+                                             * Call setNeedsDisplay on VIEWS (not just layers) so UIKit
+                                             * properly re-creates content via drawRect:. */
                                             id a = ((id(*)(id, SEL))objc_msgSend)(
                                                 (id)objc_getClass("UIApplication"),
                                                 sel_registerName("sharedApplication"));
@@ -5608,28 +5636,21 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 id rootL = ((id(*)(id, SEL))objc_msgSend)(
                                                     kw, sel_registerName("layer"));
                                                 if (rootL) {
-                                                    /* Set needs display on the whole tree */
-                                                    ((void(*)(id, SEL))objc_msgSend)(
-                                                        rootL, sel_registerName("setNeedsDisplay"));
-                                                    /* Walk sublayers recursively */
-                                                    void (^markDirty)(id) = ^(id layer) {};
-                                                    __block void (^markDirtyR)(id);
-                                                    markDirtyR = ^(id layer) {
+                                                    /* Walk ALL subviews recursively and call setNeedsDisplay */
+                                                    __block void (^markViews)(id);
+                                                    markViews = ^(id view) {
                                                         ((void(*)(id, SEL))objc_msgSend)(
-                                                            layer, sel_registerName("setNeedsDisplay"));
-                                                        /* Also invalidate contents to force re-render */
-                                                        ((void(*)(id, SEL, id))objc_msgSend)(
-                                                            layer, sel_registerName("setContents:"), nil);
-                                                        id subs = ((id(*)(id, SEL))objc_msgSend)(
-                                                            layer, sel_registerName("sublayers"));
-                                                        for (id sub in (NSArray *)subs) {
-                                                            markDirtyR(sub);
+                                                            view, sel_registerName("setNeedsDisplay"));
+                                                        id subviews = ((id(*)(id, SEL))objc_msgSend)(
+                                                            view, sel_registerName("subviews"));
+                                                        for (id sv in (NSArray *)subviews) {
+                                                            markViews(sv);
                                                         }
                                                     };
-                                                    markDirtyR(rootL);
-                                                    bridge_log("Display Pipeline [delayed]: Invalidated all layer contents");
+                                                    markViews(kw);
+                                                    bridge_log("Display Pipeline [delayed]: Marked all views for redisplay");
 
-                                                    /* Force layout + display + commit */
+                                                    /* Force layout + display */
                                                     ((void(*)(id, SEL))objc_msgSend)(
                                                         kw, sel_registerName("layoutIfNeeded"));
                                                     ((void(*)(id, SEL))objc_msgSend)(
