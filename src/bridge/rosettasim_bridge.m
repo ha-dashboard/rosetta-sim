@@ -5973,7 +5973,14 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                     if (lc && [(id)lc respondsToSelector:sel_registerName("contextId")]) {
                                                         unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                                                             lc, sel_registerName("contextId"));
-                                                        bridge_log("Display Pipeline [delayed]: _layerContext.contextId=%u", cid);
+                                                        bridge_log("Display Pipeline [delayed]: _layerContext.contextId=%u class=%s",
+                                                                   cid, class_getName(object_getClass(lc)));
+                                                        SEL rcS = sel_registerName("renderContext");
+                                                        if ([(id)lc respondsToSelector:rcS]) {
+                                                            void *rc = ((void *(*)(id, SEL))objc_msgSend)(lc, rcS);
+                                                            bridge_log("Display Pipeline [delayed]: renderContext=%p (%s)",
+                                                                       rc, rc ? "REMOTE" : "LOCAL");
+                                                        }
                                                     }
                                                 }
                                             }
