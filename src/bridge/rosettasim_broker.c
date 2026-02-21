@@ -792,6 +792,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     env[ei++] = "SIMULATOR_MAINSCREEN_SCALE=2.0";
     env[ei++] = "SIMULATOR_LEGACY_ASSET_SUFFIX=";
     env[ei++] = "__CTFontManagerDisableAutoActivation=1";
+    env[ei++] = "CA_ALWAYS_RENDER=1";
     /* Use separate framebuffer path for the app to avoid conflict with
      * PurpleFBServer's 60Hz sync in backboardd */
     env[ei++] = "ROSETTASIM_FB_PATH=/tmp/rosettasim_app_framebuffer";
