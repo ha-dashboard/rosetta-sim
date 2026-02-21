@@ -426,19 +426,39 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
     /* If already connected to real CARenderServer, return cached port.
      * Also ensure client port is set on first access. */
     if (g_ca_server_connected) {
-        static int _client_port_set_cached = 0;
-        if (!_client_port_set_cached) {
-            _client_port_set_cached = 1;
+        static int _early_ctx = 0;
+        if (!_early_ctx) {
+            _early_ctx = 1;
             mach_port_t cp = MACH_PORT_NULL;
             mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
             mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
             Class caCtxCls = objc_getClass("CAContext");
             if (caCtxCls) {
-                SEL scpSel = sel_registerName("setClientPort:");
-                if (class_respondsToSelector(object_getClass((id)caCtxCls), scpSel)) {
-                    ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                        (id)caCtxCls, scpSel, cp);
-                    bridge_log("CARenderServerGetServerPort: setClientPort:%u (cached path)", cp);
+                ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                    (id)caCtxCls, sel_registerName("setClientPort:"), cp);
+                bridge_log("CARenderServerGetServerPort: setClientPort:%u", cp);
+                @try {
+                    NSDictionary *opts = @{@"displayable": @YES, @"display": @(1), @"clientPortNumber": @(cp)};
+                    id ctx = ((id(*)(id, SEL, id))objc_msgSend)(
+                        (id)caCtxCls, sel_registerName("remoteContextWithOptions:"), opts);
+                    if (ctx) {
+                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                            ctx, sel_registerName("contextId"));
+                        bridge_log("CARenderServerGetServerPort: EARLY ctx ID=%u", cid);
+                        /* Check if client port is now registered */
+                        typedef mach_port_t (*GetCPFn)(unsigned int);
+                        GetCPFn gcp = (GetCPFn)dlsym(RTLD_DEFAULT, "CARenderServerGetClientPort");
+                        if (gcp) {
+                            mach_port_t rcp = gcp(g_ca_server_port);
+                            bridge_log("CARenderServerGetServerPort: GetClientPort(%u)=%u (after early ctx)", g_ca_server_port, rcp);
+                        }
+                        ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("retain"));
+                        int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                        if (fd >= 0) { char b[32]; int l = snprintf(b,32,"%u",cid); write(fd,b,l); close(fd); }
+                    }
+                } @catch (id ex) {
+                    bridge_log("CARenderServerGetServerPort: early ctx threw: %s",
+                               [[ex description] UTF8String] ?: "?");
                 }
             }
         }
