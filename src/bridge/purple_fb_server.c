@@ -577,27 +577,57 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
         }
     }
 
+    /* Try using CAWindowServer context instead of display layer */
+    if (!displayLayer) {
+        Class cwsClass = (Class)objc_getClass("CAWindowServer");
+        if (cwsClass) {
+            /* Get or create the server context */
+            SEL ctxSel = sel_registerName("context");
+            if (class_respondsToSelector(object_getClass((id)cwsClass), ctxSel)) {
+                id serverCtx = ((id(*)(id, SEL))objc_msgSend)((id)cwsClass, ctxSel);
+                if (serverCtx) {
+                    pfb_log("CAWindowServer.context = %p", (void *)serverCtx);
+                    /* Get the server context's layer */
+                    SEL layerSel = sel_registerName("layer");
+                    if (class_respondsToSelector(object_getClass(serverCtx), layerSel)) {
+                        displayLayer = ((id(*)(id, SEL))objc_msgSend)(serverCtx, layerSel);
+                        pfb_log("Server context layer = %p", (void *)displayLayer);
+                    }
+                    if (!displayLayer) {
+                        /* Try setLayer on server context with our layer host */
+                        SEL setLayerSel = sel_registerName("setLayer:");
+                        if (class_respondsToSelector(object_getClass(serverCtx), setLayerSel)) {
+                            pfb_log("Setting CALayerHost as server context layer");
+                            ((void(*)(id, SEL, id))objc_msgSend)(serverCtx, setLayerSel, layerHost);
+                            displayLayer = layerHost; /* mark as done */
+                        }
+                    }
+                } else {
+                    pfb_log("CAWindowServer.context returned nil");
+                }
+            }
+        }
+    }
+
     if (displayLayer) {
         pfb_log("Display layer = %p (class=%s)", (void *)displayLayer,
                 class_getName(object_getClass(displayLayer)));
 
-        /* Set the layer host's frame to match the display dimensions */
-        /* Use bounds of the display layer */
-        /* Set frame on layer host to cover entire display.
-         * Use known display dimensions instead of bounds (avoids objc_msgSend_stret issues). */
         typedef struct { double x, y, w, h; } CGRect_t;
         CGRect_t frame = { 0, 0, (double)PFB_POINT_WIDTH, (double)PFB_POINT_HEIGHT };
         pfb_log("Setting CALayerHost frame: %.0fx%.0f", frame.w, frame.h);
 
-        /* setFrame: takes CGRect by value — on x86_64 this goes through objc_msgSend
-         * (not stret) because CGRect is passed, not returned */
         typedef void (*SetFrameFn)(id, SEL, CGRect_t);
         ((SetFrameFn)objc_msgSend)(layerHost, sel_registerName("setFrame:"), frame);
 
-        /* Add layer host as sublayer of display layer */
-        ((void (*)(id, SEL, id))objc_msgSend)(
-            displayLayer, sel_registerName("addSublayer:"), layerHost);
-        pfb_log("CALayerHost added as sublayer of display layer");
+        /* Add layer host as sublayer if not already set as the context layer */
+        if (displayLayer != layerHost) {
+            ((void (*)(id, SEL, id))objc_msgSend)(
+                displayLayer, sel_registerName("addSublayer:"), layerHost);
+            pfb_log("CALayerHost added as sublayer of display layer");
+        } else {
+            pfb_log("CALayerHost set as server context layer directly");
+        }
 
         /* Retain the layer host */
         ((id (*)(id, SEL))objc_msgSend)(layerHost, sel_registerName("retain"));
