@@ -5341,9 +5341,27 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
 
                                     /* Send RegisterClient MIG message to CARenderServer.
                                      * This registers the app as a display client so the server
-                                     * composites its content onto the display surface.
-                                     * MIG msg_id 40202 (0x9D0A), complex message with 3 port descriptors. */
+                                     * composites its content onto the display surface. */
                                     if (g_ca_server_port != MACH_PORT_NULL) {
+                                        /* Try calling the MIG client stub directly via dlsym */
+                                        typedef kern_return_t (*CASRegFn)(
+                                            mach_port_t, mach_port_t, mach_port_t,
+                                            mach_port_t, uint32_t, mach_port_t *,
+                                            uint32_t *, uint32_t *);
+                                        CASRegFn casReg = (CASRegFn)dlsym(RTLD_DEFAULT, "__CASRegisterClient");
+                                        if (casReg) {
+                                            mach_port_t outSP = 0;
+                                            uint32_t outCID = 0, outFP = 0;
+                                            kern_return_t kr2 = casReg(g_ca_server_port,
+                                                MACH_PORT_NULL, mach_task_self(),
+                                                MACH_PORT_NULL, 0, &outSP, &outCID, &outFP);
+                                            bridge_log("Display Pipeline: __CASRegisterClient kr=%d ctx=%u server=%u fence=%u",
+                                                       kr2, outCID, outSP, outFP);
+                                        } else {
+                                            bridge_log("Display Pipeline: __CASRegisterClient not found");
+                                        }
+                                    }
+                                    if (0 && g_ca_server_port != MACH_PORT_NULL) { /* disabled manual msg */
                                         #pragma pack(4)
                                         struct {
                                             mach_msg_header_t header;     /* 24 bytes */
