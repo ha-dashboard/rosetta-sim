@@ -1108,6 +1108,24 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                         bridge_log("  No app reference, delegate created: %s @ %p", delName, (void *)delegate);
                     }
 
+                    /* Register URL protocol BEFORE calling didFinishLaunching.
+                     * The app may make network requests during init. Without our
+                     * protocol, these go through CFNetwork → cfprefsd → XPC → block.
+                     * Just the registerClass: call — NSURLSession swizzle deferred. */
+                    {
+                        Class protocolClass = objc_getClass("RosettaSimURLProtocol");
+                        if (protocolClass) {
+                            Class nsurlProto = objc_getClass("NSURLProtocol");
+                            if (nsurlProto) {
+                                ((void(*)(id, SEL, Class))objc_msgSend)(
+                                    (id)nsurlProto,
+                                    sel_registerName("registerClass:"),
+                                    protocolClass);
+                                bridge_log("  Registered RosettaSimURLProtocol before didFinishLaunching");
+                            }
+                        }
+                    }
+
                     /* Call application:didFinishLaunchingWithOptions: */
                     SEL didFinishSel = sel_registerName("application:didFinishLaunchingWithOptions:");
                     if (class_respondsToSelector(delClass, didFinishSel)) {

@@ -803,8 +803,22 @@ static mach_port_t replacement_xpc_look_up_endpoint(
     } else {
         /* CLIENT look-up: get send right from broker */
         kern_return_t kr = replacement_bootstrap_look_up(bp, name, &port);
-        bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': port=0x%x (kr=%d)\n",
-                 name, port, kr);
+        if (kr != KERN_SUCCESS || port == MACH_PORT_NULL) {
+            /* Service not found. Return a DEAD port instead of NULL.
+             * With NULL, xpc_connection_send_message_with_reply_sync hangs
+             * forever waiting for a dispatch event that never fires.
+             * With a dead port, the send fails immediately with
+             * MACH_SEND_INVALID_DEST and libxpc reports an error. */
+            mach_port_t dead = MACH_PORT_NULL;
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &dead);
+            /* Deallocate immediately → port becomes dead name for anyone holding send right */
+            mach_port_deallocate(mach_task_self(), dead);
+            port = dead;
+            bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': NOT FOUND → dead port 0x%x\n",
+                     name, port);
+        } else {
+            bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': port=0x%x\n", name, port);
+        }
     }
 
     return port;
