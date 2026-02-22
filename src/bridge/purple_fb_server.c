@@ -774,6 +774,7 @@ static mach_port_t g_purple_app_port = MACH_PORT_NULL;
 #define MAX_SERVICES 64
 static struct { char name[128]; mach_port_t port; } g_services[MAX_SERVICES];
 static int g_service_count;
+static volatile int g_display_services_started;
 static void pfb_notify_broker(const char *name, mach_port_t port);
 
 static mach_port_t pfb_alloc_and_register(const char *name) {
@@ -839,14 +840,18 @@ mach_port_t pfb_GSRegisterPurpleNamedPort(const char *name) {
         g_service_count++;
         pfb_notify_broker(name, p);
 
-        /* Auto-start display services handler when registered */
+        /* Auto-start display services handler when registered (exactly once). */
         if (strstr(name, "display.services")) {
-            pfb_log("Auto-starting display services handler on port %u", p);
-            mach_port_t *ds_port = (mach_port_t *)malloc(sizeof(mach_port_t));
-            *ds_port = p;
-            pthread_t ds_thread;
-            pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
-            pthread_detach(ds_thread);
+            if (__sync_bool_compare_and_swap(&g_display_services_started, 0, 1)) {
+                pfb_log("Auto-starting display services handler on port %u", p);
+                mach_port_t *ds_port = (mach_port_t *)malloc(sizeof(mach_port_t));
+                *ds_port = p;
+                pthread_t ds_thread;
+                pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
+                pthread_detach(ds_thread);
+            } else {
+                pfb_log("Display services handler already started; skipping auto-start");
+            }
         }
     }
     return p;
@@ -1592,6 +1597,7 @@ static void pfb_init(void) {
         pfb_GSRegisterPurpleNamedPort("com.apple.backboard.animation-fence-arbiter");
         pfb_GSRegisterPurpleNamedPort("com.apple.backboard.hid.focus");
         pfb_GSRegisterPurpleNamedPort("com.apple.backboard.TouchDeliveryPolicyServer");
+        pfb_GSRegisterPurpleNamedPort("com.apple.backboard.display.services");
 
         pfb_log("Purple system ports registered with broker");
 
@@ -1601,12 +1607,16 @@ static void pfb_init(void) {
          * and BKSDisplayServicesStart (msg_id 0x5B9168 = 6001000). */
         for (int si = 0; si < g_service_count; si++) {
             if (strstr(g_services[si].name, "display.services")) {
-                pfb_log("Starting display services handler on port %u", g_services[si].port);
-                mach_port_t *ds_port = malloc(sizeof(mach_port_t));
-                *ds_port = g_services[si].port;
-                pthread_t ds_thread;
-                pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
-                pthread_detach(ds_thread);
+                if (__sync_bool_compare_and_swap(&g_display_services_started, 0, 1)) {
+                    pfb_log("Starting display services handler on port %u", g_services[si].port);
+                    mach_port_t *ds_port = malloc(sizeof(mach_port_t));
+                    *ds_port = g_services[si].port;
+                    pthread_t ds_thread;
+                    pthread_create(&ds_thread, NULL, pfb_display_services_thread, ds_port);
+                    pthread_detach(ds_thread);
+                } else {
+                    pfb_log("Display services handler already started; not starting again");
+                }
                 break;
             }
         }

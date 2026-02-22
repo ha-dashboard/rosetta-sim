@@ -1,5 +1,49 @@
 # Session 15 Handoff — XPC Pipe Bypass + All Processes Stable
 
+## Update (2026-02-22) — assertiond fixed; next: backboard display.services
+
+Status (confirmed in `/tmp/rosettasim_broker.log`):
+- `assertiond` stays alive past the +30s gate (observed +38s) with **zero** `Connection invalid` failures.
+- `SpringBoard` stays alive.
+- The app currently crashes with: `backboardd isn't running, result: 268435459 isAlive: 0` (`0x10000003` / `MACH_SEND_INVALID_DEST`).
+
+Root cause for the earlier assertiond crash:
+- Broker’s XPC pipe routine 805 reply had incorrect libxpc wire type constants (notably `mach_recv`), causing libxpc to destroy the receive right during deserialization.
+- libxpc also requires XPC pipe replies to use `msgh_id = 0x20000000` (`XPC_PIPE_REPLY_MSG_ID`).
+
+Next fix target:
+- Ensure `com.apple.backboard.display.services` is registered before the app launches (in `src/bridge/purple_fb_server.c`), and start the display services handler thread exactly once.
+
+> NOTE: The remainder of this handoff file predates the protocol fixes above and is now stale/contradictory. Treat it as historical notes only.
+
+## Update (2026-02-22) — assertiond still crashes (Connection invalid)
+The earlier “SOLVED / all stable” status is out-of-date.
+
+Current goal: keep `assertiond` alive past the ~+30s gate by fixing mach-service LISTENER registration for:
+- `com.apple.assertiond.processinfoservice`
+- `com.apple.assertiond.processassertionconnection`
+
+Evidence from `/tmp/rosettasim_broker.log` (current runs):
+- Broker receives XPC pipe requests (`msgh_id=0x10000000`) with `routine=805` for multiple `com.apple.assertiond.*` services.
+- Broker replies with a complex Mach message containing a port descriptor + an XPC dictionary with `"port"` typed as `mach_recv`.
+- Despite this, `assertiond` still terminates with:
+  - `NSInternalInconsistencyException ... Connection invalid`
+  - `BSXPCServerException ... "Connection invalid"`
+
+Key new protocol-level finding (iOS 10.3 simulator `libxpc.dylib`):
+- `_xpc_pipe_routine` checks the *reply* Mach message ID before unpacking the XPC reply dictionary.
+- It expects `reply->msgh_id == 0x20000000`.
+- If we echo the request ID (`0x10000000`) in the reply, libxpc will not unpack/consume descriptors → listener ports remain 0.
+
+Action (in `src/bridge/rosettasim_broker.c`):
+- Set **all** XPC pipe replies (routine 805 check-in, routine 100 GetJobs, generic replies, routine 804 endpoint lookup) to use:
+  - `msgh_id = 0x20000000` (`XPC_PIPE_REPLY_MSG_ID`)
+
+Next verification discriminator:
+- After rebuilding broker + bounded run, confirm:
+  - assertiond listener connections have non-zero port fields post-resume
+  - no `Connection invalid` crash for the two services above
+
 ## Mission
 Make the iOS 9.3/10.3 simulator work with the hass-dashboard app on macOS 26 ARM64 via Rosetta 2. No fakes, no swizzles on the app itself, proper implementations.
 

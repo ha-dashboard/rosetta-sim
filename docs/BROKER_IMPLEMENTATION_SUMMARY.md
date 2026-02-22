@@ -1,5 +1,10 @@
 # RosettaSim Broker Implementation Summary
 
+> NOTE (2026-02-22): This document reflects an earlier “bootstrap-only” broker snapshot.
+> The current broker (`src/bridge/rosettasim_broker.c`) is a native arm64 macOS binary and also implements
+> XPC pipe (launchd) routines (e.g. GetJobs=100, endpoint lookup=804, check-in=805) required for iOS 10.3 daemons.
+> See `src/bridge/README_BROKER.md` for current protocol notes.
+
 ## What Was Implemented
 
 A production-quality Mach port broker that enables cross-process Mach port sharing between backboardd and iOS app processes running in the RosettaSim simulator environment.

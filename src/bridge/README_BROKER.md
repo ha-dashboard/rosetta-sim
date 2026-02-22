@@ -10,7 +10,7 @@ The broker acts as a mini bootstrap server, allowing iOS binaries running via Ro
 
 ```
 ┌─────────────────────────────────────────┐
-│   RosettaSim Broker (x86_64 macOS)     │
+│   RosettaSim Broker (arm64 macOS)      │
 │                                         │
 │  - Mach port registry                   │
 │  - Message dispatch loop                │
@@ -36,7 +36,7 @@ The broker acts as a mini bootstrap server, allowing iOS binaries running via Ro
 ./scripts/build_broker.sh
 ```
 
-This compiles `rosettasim_broker.c` as an x86_64 macOS binary (NOT against the iOS SDK) and code-signs it.
+This compiles `rosettasim_broker.c` as an arm64 macOS binary (NOT against the iOS SDK) and code-signs it.
 
 ## Usage
 
@@ -65,79 +65,93 @@ This compiles `rosettasim_broker.c` as an x86_64 macOS binary (NOT against the i
 
 ## Protocol
 
-The broker handles two types of messages:
+The broker handles three categories of IPC:
 
-### 1. MIG Bootstrap Messages (subsystem 400)
+### 1. MIG bootstrap messages
 
-These are standard bootstrap protocol messages sent by dyld and iOS frameworks:
+These are `mach_msg` requests sent to the task’s bootstrap port. **Note:** the message IDs observed for the iOS 10.3 simulator runtime differ from older docs — see the `BOOTSTRAP_*` defines in `src/bridge/rosettasim_broker.c`.
 
-- **bootstrap_check_in (400)**: Create a new receive port for a service
-  - Client sends: service name
-  - Broker creates: receive port + send right
-  - Broker returns: send right to client
-  - Broker registers: name → port in registry
+- **bootstrap_check_in (402)**: service check-in / acquire the receive right for a Mach service
+- **bootstrap_register (403)**: register an existing port under a name
+- **bootstrap_look_up (404)**: look up a named service (returns a send right)
+- **bootstrap_parent (406)**: requested by dyld; broker replies with `KERN_INVALID_RIGHT`
+- **bootstrap_subset (409)**: broker replies with `KERN_INVALID_RIGHT` (matches modern macOS behavior)
 
-- **bootstrap_register (401)**: Register an existing port
-  - Client sends: service name + port descriptor
-  - Broker registers: name → port in registry
-  - Broker returns: success/error
+### 2. Legacy custom broker messages (700-799)
 
-- **bootstrap_look_up (402)**: Look up a service by name
-  - Client sends: service name
-  - Broker looks up: name → port
-  - Broker returns: send right to port or error 1102
+Used by injected shims (e.g. `purple_fb_server.dylib`) that need a stable path to the broker even when the iOS SDK’s bootstrap APIs take an incompatible fast path on modern macOS.
 
-- **bootstrap_parent (404)**: Request parent bootstrap port
-  - Sent by dyld during initialization
-  - Broker returns: error (not supported)
+- **BROKER_REGISTER_PORT (700)**: register a port under a name (includes a `name_len` field)
+- **BROKER_LOOKUP_PORT (701)**: look up a port by name (includes a `name_len` field)
+- **BROKER_SPAWN_APP (702)**: placeholder (not yet implemented as an IPC message)
 
-- **bootstrap_subset (405)**: Create bootstrap subset
-  - Broker returns: KERN_INVALID_RIGHT (17) - same as real macOS
+### 3. XPC pipe (sim launchd rendezvous)
 
-### 2. Custom Broker Messages (700-799)
+Many iOS 10.3 daemons register XPC Mach services via `xpc_connection_create_mach_service()`, which talks to “launchd” over an XPC pipe connection. The broker emulates the simulator launchd rendezvous port:
 
-These are RosettaSim-specific messages:
+- Service name: `com.apple.xpc.sim.launchd.rendezvous`
+- Request Mach msg ID: `0x10000000` (`XPC_LAUNCH_MSG_ID`)
+- Reply Mach msg ID: **must** be `0x20000000` (`XPC_PIPE_REPLY_MSG_ID`) or libxpc will ignore the reply’s ports/payload.
 
-- **BROKER_REGISTER_PORT (700)**: Register a port (same as bootstrap_register)
-- **BROKER_LOOKUP_PORT (701)**: Look up a port (same as bootstrap_look_up)
-- **BROKER_SPAWN_APP (702)**: Request to spawn an app process (not yet implemented)
+Implemented launchd routines:
+- `routine=100` (GetJobs)
+- `routine=804` (endpoint lookup): returns a `mach_send` right (`MOVE_SEND`) and XPC `"port"` typed `mach_send`
+- `routine=805` (check-in): returns a `mach_recv` receive right (`MOVE_RECEIVE`) and XPC `"port"` typed `mach_recv`
+
+XPC wire type IDs (iOS 10.3 simulator `libxpc.dylib`):
+- `bool = 0x00002000`
+- `int64 = 0x00003000`
+- `uint64 = 0x00004000`
+- `string = 0x00009000`
+- `dict = 0x0000f000`
+- `mach_send = 0x0000d000`
+- `mach_recv = 0x00015000`
 
 ## Message Formats
 
-### Simple Request (look_up, check_in)
+### MIG simple request (look_up, check_in)
 ```c
 mach_msg_header_t (24 bytes)
 NDR_record_t (8 bytes)
-uint32_t name_len
 char name[128]
-Total: 164 bytes
+Total: 160 bytes
 ```
 
-### Complex Request (register)
+### MIG complex request (register)
 ```c
 mach_msg_header_t (24 bytes)
 mach_msg_body_t (4 bytes)
 mach_msg_port_descriptor_t (12 bytes)
 NDR_record_t (8 bytes)
-uint32_t name_len
 char name[128]
-Total: 180 bytes
+Total: 176 bytes
 ```
 
-### Port Reply (success)
+### MIG port reply (success)
 ```c
 mach_msg_header_t (24 bytes) - COMPLEX flag set
 mach_msg_body_t (4 bytes)
 mach_msg_port_descriptor_t (12 bytes)
 Total: 40 bytes
 ```
-
-### Error Reply
+### MIG error reply
 ```c
 mach_msg_header_t (24 bytes)
 NDR_record_t (8 bytes)
 kern_return_t (4 bytes)
 Total: 36 bytes
+```
+
+### Legacy broker request formats (700/701)
+
+These mirror the old “name_len + name[128]” layout used by some injected shims:
+
+```c
+// Simple (lookup): header + NDR + name_len + name[128]
+Total: 164 bytes
+
+// Complex (register): header + body + port_desc + NDR + name_len + name[128]
+Total: 180 bytes
 ```
 
 ## Process Spawning
@@ -161,7 +175,7 @@ Child processes inherit the broker port as their bootstrap port and can immediat
 
 The broker maintains an in-memory registry with:
 
-- **Capacity**: 64 services
+- **Capacity**: 128 services
 - **Key**: Service name (max 128 chars)
 - **Value**: Mach port send right
 - **Operations**: Register, lookup
@@ -187,9 +201,9 @@ All output is written to stderr using `write(STDERR_FILENO, ...)` for debugging.
 
 1. Broker starts and creates broker port
 2. Broker spawns backboardd with broker port as bootstrap port
-3. backboardd's dyld sends bootstrap_parent (404) - broker ignores
+3. backboardd's dyld sends bootstrap_parent (406) - broker ignores
 4. backboardd initializes, purple_fb_server.dylib creates CARenderServer
-5. purple_fb_server.dylib registers "com.apple.PurpleFBServer" via check_in (400)
+5. purple_fb_server.dylib registers \"PurpleFBServer\" and Purple ports via BROKER_REGISTER_PORT (700)
 6. Apps can now lookup "com.apple.PurpleFBServer" and connect
 7. Broker receives SIGCHLD when backboardd exits
 8. Broker shuts down gracefully

@@ -2,7 +2,7 @@
 #
 # build_broker.sh - Build the RosettaSim Mach port broker
 #
-# This script compiles rosettasim_broker.c as an x86_64 macOS binary
+# This script compiles rosettasim_broker.c as an arm64 macOS binary
 # (NOT against the iOS SDK).
 
 set -e
@@ -37,3 +37,7 @@ echo "Build complete: $OUT_FILE"
 
 # Show file info
 file "$OUT_FILE"
+
+echo ""
+echo "Ensuring bootstrap_fix.dylib is fresh..."
+bash "$SCRIPT_DIR/build_bootstrap_fix.sh"

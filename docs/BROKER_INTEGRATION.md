@@ -1,5 +1,9 @@
 # Broker Integration Guide
 
+> NOTE (2026-02-22): This guide was written for the earlier bootstrap-only broker.
+> The current broker also implements XPC pipe (launchd) routines needed for iOS 10.3 XPC mach-service registration.
+> See `src/bridge/README_BROKER.md` and `src/bridge/rosettasim_broker.c` for up-to-date protocol details.
+
 This guide explains how to integrate the RosettaSim broker with the existing RosettaSim project.
 
 ## Overview

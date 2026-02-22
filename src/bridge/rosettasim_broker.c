@@ -33,6 +33,8 @@
 #define BROKER_LOOKUP_PORT      701
 #define BROKER_SPAWN_APP        702
 #define XPC_LAUNCH_MSG_ID       0x10000000
+#define XPC_PIPE_REPLY_MSG_ID   0x20000000  /* libxpc expects replies to xpc_pipe_routine with this msgh_id */
+#define XPC_LISTENER_REG_ID     0x77303074  /* listener registration from _xpc_connection_check_in */
 
 #define MIG_REPLY_OFFSET        100
 
@@ -55,6 +57,7 @@ typedef struct {
     char name[MAX_NAME_LEN];
     mach_port_t port;
     int active;
+    int receive_moved;  /* 1 if receive right already MOVE_RECEIVE'd to a caller */
 } service_entry_t;
 
 /* Global state */
@@ -259,37 +262,48 @@ static void handle_check_in(mach_msg_header_t *request) {
     bootstrap_simple_request_t *req = (bootstrap_simple_request_t *)request;
     char service_name[MAX_NAME_LEN];
 
-    /* Extract service name (fixed 128-byte field, null-terminated) */
     memcpy(service_name, req->name, MAX_NAME_LEN);
     service_name[MAX_NAME_LEN - 1] = '\0';
 
-    broker_log("[broker] check_in request: %s\n", service_name);
-
-    /* Check if service was pre-created. If so, give the existing
-     * port's receive right to the caller (this is how launchd works:
-     * the port is pre-created from the plist MachServices, and the
-     * daemon gets the receive right via check_in). */
-    mach_port_t service_port = MACH_PORT_NULL;
+    /* Find existing service entry */
+    int slot = -1;
     for (int i = 0; i < MAX_SERVICES; i++) {
         if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
-            service_port = g_services[i].port;
-            broker_log("[broker] check_in '%s': found pre-created port 0x%x\n",
-                       service_name, service_port);
+            slot = i;
             break;
         }
     }
 
-    if (service_port == MACH_PORT_NULL) {
+    broker_log("[broker] check_in '%s': reply_port=0x%x slot=%d moved=%d\n",
+               service_name, request->msgh_remote_port,
+               slot, slot >= 0 ? g_services[slot].receive_moved : 0);
+
+    /* GUARD: if receive right was already moved, block the repeat */
+    if (slot >= 0 && g_services[slot].receive_moved) {
+        broker_log("[broker] check_in '%s': repeat-blocked (receive already moved for port 0x%x)\n",
+                   service_name, g_services[slot].port);
+        send_error_reply(request->msgh_remote_port,
+                         request->msgh_id + MIG_REPLY_OFFSET,
+                         BOOTSTRAP_SERVICE_ACTIVE);
+        return;
+    }
+
+    mach_port_t service_port = MACH_PORT_NULL;
+
+    if (slot >= 0) {
+        /* First check_in for pre-created service */
+        service_port = g_services[slot].port;
+        broker_log("[broker] check_in '%s': FIRST, pre-created port 0x%x\n",
+                   service_name, service_port);
+    } else {
         /* Not pre-created — create a new port */
         kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service_port);
         if (kr != KERN_SUCCESS) {
-            broker_log("[broker] failed to allocate port for check_in: 0x%x\n", kr);
             send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
             return;
         }
         kr = mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
         if (kr != KERN_SUCCESS) {
-            broker_log("[broker] failed to insert send right: 0x%x\n", kr);
             mach_port_deallocate(mach_task_self(), service_port);
             send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
             return;
@@ -300,14 +314,23 @@ static void handle_check_in(mach_msg_header_t *request) {
             send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, result);
             return;
         }
+        for (int i = 0; i < MAX_SERVICES; i++) {
+            if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
+                slot = i;
+                break;
+            }
+        }
     }
 
-    /* Send RECEIVE right to caller (MOVE_RECEIVE transfers ownership).
-     * After this, broker has: send right. Caller has: receive right.
-     * Clients doing look_up will get send rights to the same port. */
+    /* Send RECEIVE right to caller (MOVE_RECEIVE transfers ownership) */
     send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET,
                     service_port, MACH_MSG_TYPE_MOVE_RECEIVE);
-    broker_log("[broker] check_in '%s': sent receive right 0x%x\n", service_name, service_port);
+
+    if (slot >= 0) {
+        g_services[slot].receive_moved = 1;
+    }
+    broker_log("[broker] check_in '%s': MOVE_RECEIVE sent, port=0x%x\n",
+               service_name, service_port);
 }
 
 /* Handle bootstrap_register (ID 403)
@@ -442,22 +465,32 @@ static void handle_broker_message(mach_msg_header_t *request) {
  *   4 bytes: entry count
  *   entries: key (null-padded to 4-byte align) + type(4) + value
  *
- * Type codes:
- *   0x00003000 = bool
- *   0x00004000 = int64
+ * Type codes (iOS 10.3 simulator libxpc.dylib):
+ *   0x00002000 = bool
+ *   0x00003000 = int64
+ *   0x00004000 = uint64
  *   0x00009000 = string (4-byte length prefix, null-terminated, padded)
  *   0x0000f000 = dictionary
- *   0x0000c000 = mach_send (port in descriptor, not inline)
- *   0x0000d000 = mach_recv (port in descriptor, not inline)
+ *   0x0000d000 = mach_send (port in descriptor, not inline)
+ *   0x00015000 = mach_recv (port in descriptor, not inline)
+ *
+ * NOTE: If the XPC type (mach_send vs mach_recv) or the Mach descriptor disposition
+ * mismatches what libxpc expects, libxpc will clean up the right and treat the value
+ * as invalid (leading to later "Connection invalid" failures).
  */
 
 #define XPC_MAGIC       0x58504321  /* "!CPX" */
 #define XPC_VERSION     5
-#define XPC_TYPE_DICT   0x0000f000
-#define XPC_TYPE_INT64  0x00004000
-#define XPC_TYPE_STRING 0x00009000
-#define XPC_TYPE_BOOL   0x00003000
-#define XPC_TYPE_MACH_RECV 0x0000d000
+/* XPC wire type IDs — from libxpc.dylib class table (iOS 10.3 simulator).
+ * These are index << 12: null=1, bool=2, int64=3, uint64=4, ... */
+#define XPC_TYPE_BOOL   0x00002000  /* index 2 */
+#define XPC_TYPE_INT64  0x00003000  /* index 3 */
+#define XPC_TYPE_UINT64 0x00004000  /* index 4 */
+#define XPC_TYPE_STRING 0x00009000  /* index 9 */
+#define XPC_TYPE_MACH_SEND 0x0000d000  /* index 13 */
+#define XPC_TYPE_ARRAY  0x0000e000  /* index 14 */
+#define XPC_TYPE_DICT   0x0000f000  /* index 15 */
+#define XPC_TYPE_MACH_RECV 0x00015000  /* index 21 */
 
 /* Extract the service name from an XPC pipe check-in request.
  * Scans the XPC dictionary for the "name" key and returns its string value. */
@@ -488,8 +521,8 @@ static const char *xpc_extract_service_name(const uint8_t *xpc_data, uint32_t xp
         uint32_t val_type = *(uint32_t *)(xpc_data + pos);
         pos += 4;
 
-        if (val_type == XPC_TYPE_INT64) {
-            /* 8-byte integer */
+        if (val_type == XPC_TYPE_INT64 || val_type == XPC_TYPE_UINT64) {
+            /* 8-byte integer (int64=0x3000 or uint64=0x4000) */
             if (pos + 8 > xpc_len) break;
             pos += 8;
         } else if (val_type == XPC_TYPE_STRING) {
@@ -526,24 +559,378 @@ static const char *xpc_extract_service_name(const uint8_t *xpc_data, uint32_t xp
     return NULL;
 }
 
-/* Build an XPC pipe check-in response with MachServices.
+/* Extract an int64 value for a specific key from the root XPC dictionary.
+ * Returns 0 if not found. */
+static uint64_t xpc_extract_int64_key(const uint8_t *xpc_data, uint32_t xpc_len,
+                                      const char *wanted_key) {
+    if (xpc_len < 20) return 0;
+    uint32_t magic = *(uint32_t *)xpc_data;
+    if (magic != XPC_MAGIC) return 0;
+    uint32_t root_type = *(uint32_t *)(xpc_data + 8);
+    if (root_type != XPC_TYPE_DICT) return 0;
+    uint32_t entry_count = *(uint32_t *)(xpc_data + 16);
+    uint32_t pos = 20;
+    for (uint32_t i = 0; i < entry_count && pos < xpc_len; i++) {
+        const char *key = (const char *)(xpc_data + pos);
+        uint32_t key_len = (uint32_t)strnlen(key, xpc_len - pos);
+        uint32_t key_padded = (key_len + 1 + 3) & ~3;
+        pos += key_padded;
+        if (pos + 4 > xpc_len) break;
+        uint32_t val_type = *(uint32_t *)(xpc_data + pos);
+        pos += 4;
+        if (val_type == XPC_TYPE_INT64 || val_type == XPC_TYPE_UINT64) {
+            if (pos + 8 > xpc_len) break;
+            if (strcmp(key, wanted_key) == 0) {
+                return *(uint64_t *)(xpc_data + pos);
+            }
+            pos += 8;
+        } else if (val_type == XPC_TYPE_STRING) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t str_len = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            uint32_t str_padded = (str_len + 3) & ~3;
+            pos += str_padded;
+        } else if (val_type == XPC_TYPE_BOOL) {
+            if (pos + 4 > xpc_len) break;
+            pos += 4;
+        } else if (val_type == XPC_TYPE_DICT) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t dict_size = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            pos += dict_size;
+        } else {
+            if (pos + 4 > xpc_len) break;
+            uint32_t skip = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            if (skip < 0x10000) pos += skip;
+            else break;
+        }
+    }
+    return 0;
+}
+
+/* Extract the "routine" int64 value from XPC dict. Returns 0 if not found. */
+static uint64_t xpc_extract_routine(const uint8_t *xpc_data, uint32_t xpc_len) {
+    return xpc_extract_int64_key(xpc_data, xpc_len, "routine");
+}
+
+/* Extract the "handle" int64 value from XPC dict. Returns 0 if not found. */
+static uint64_t xpc_extract_handle(const uint8_t *xpc_data, uint32_t xpc_len) {
+    return xpc_extract_int64_key(xpc_data, xpc_len, "handle");
+}
+
+/* Send a proper XPC-formatted reply (non-complex, no ports).
+ * Used for non-check-in launchd routines and error cases on XPC pipe.
+ *
+ * NOTE: libxpc's _xpc_pipe_routine expects replies to use a fixed Mach
+ * message ID (XPC_PIPE_REPLY_MSG_ID = 0x20000000). If we echo the request
+ * ID (0x10000000), libxpc will not unpack the reply dictionary.
+ *
+ * NEVER use send_error_reply (MIG format) for XPC pipe messages. */
+static void send_xpc_pipe_reply(mach_port_t reply_port, uint32_t msg_id,
+                                 uint64_t routine, int64_t error_code) {
+    if (reply_port == MACH_PORT_NULL) return;
+
+    /* Build minimal XPC dict: { subsystem=3, error=<code>, routine=<routine> } */
+    uint8_t xpc_buf[256];
+    uint32_t xpc_pos = 20; /* skip header (magic+version+type+size) + entry_count */
+    uint32_t entries = 0;
+
+    /* "subsystem" → int64(3) */
+    {
+        const char *k = "subsystem";
+        uint32_t kpad = ((uint32_t)strlen(k) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, strlen(k));
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = 3; xpc_pos += 8;
+        entries++;
+    }
+    /* "error" → int64(error_code) */
+    {
+        const char *k = "error";
+        uint32_t kpad = ((uint32_t)strlen(k) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, strlen(k));
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = (uint64_t)error_code; xpc_pos += 8;
+        entries++;
+    }
+    /* "routine" → int64(routine) */
+    {
+        const char *k = "routine";
+        uint32_t kpad = ((uint32_t)strlen(k) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, strlen(k));
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = routine; xpc_pos += 8;
+        entries++;
+    }
+
+    /* Fill XPC header */
+    *(uint32_t *)(xpc_buf + 0) = XPC_MAGIC;
+    *(uint32_t *)(xpc_buf + 4) = XPC_VERSION;
+    *(uint32_t *)(xpc_buf + 8) = XPC_TYPE_DICT;
+    *(uint32_t *)(xpc_buf + 12) = xpc_pos - 16;
+    *(uint32_t *)(xpc_buf + 16) = entries;
+
+    uint32_t xpc_padded = (xpc_pos + 3) & ~3;
+
+    /* Build non-complex Mach message with XPC payload */
+    struct {
+        mach_msg_header_t head;
+        uint8_t data[256];
+    } reply;
+    memset(&reply, 0, sizeof(reply));
+
+    reply.head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply.head.msgh_size = sizeof(mach_msg_header_t) + xpc_padded;
+    reply.head.msgh_remote_port = reply_port;
+    reply.head.msgh_local_port = MACH_PORT_NULL;
+    (void)msg_id; /* Requests use XPC_LAUNCH_MSG_ID; libxpc expects a fixed reply ID. */
+    reply.head.msgh_id = XPC_PIPE_REPLY_MSG_ID;
+
+    memcpy(reply.data, xpc_buf, xpc_pos);
+
+    kern_return_t kr = mach_msg(&reply.head, MACH_SEND_MSG, reply.head.msgh_size,
+                                 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker] send_xpc_pipe_reply failed: 0x%x\n", kr);
+    }
+}
+
+/* Send routine=100 (GetJobs) reply with a jobs dict containing
+ * assertiond's MachServices. assertiond calls launch_msg("GetJobs")
+ * via _xpc_pipe_routine early in init; "Error getting job dictionaries.
+ * Error: Input/output error (5)" fires when this returns empty/error.
+ * The response must include: { subsystem=3, error=0, routine=100,
+ *   jobs → { "com.apple.assertiond" → { MachServices → { svc → true, ... } } } } */
+static void send_xpc_pipe_getjobs_reply(mach_port_t reply_port, uint32_t msg_id,
+                                         uint64_t request_handle) {
+    if (reply_port == MACH_PORT_NULL) return;
+
+    uint8_t xpc_buf[2048];
+    uint32_t xpc_pos = 20;
+    uint32_t entries = 0;
+    int total_svc_count = 0;
+
+    /* Helper macro for adding an int64 entry */
+    #define ADD_INT64(key_str, val) do { \
+        const char *_k = (key_str); \
+        uint32_t _kpad = ((uint32_t)strlen(_k) + 1 + 3) & ~3; \
+        memset(xpc_buf + xpc_pos, 0, _kpad); \
+        memcpy(xpc_buf + xpc_pos, _k, strlen(_k)); \
+        xpc_pos += _kpad; \
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4; \
+        *(uint64_t *)(xpc_buf + xpc_pos) = (uint64_t)(val); xpc_pos += 8; \
+        entries++; \
+    } while(0)
+
+    ADD_INT64("subsystem", 3);
+    ADD_INT64("error", 0);
+    ADD_INT64("routine", 100);
+    ADD_INT64("handle", request_handle);
+
+    /* "jobs" → dict { "com.apple.assertiond" → dict { "MachServices" → dict { svc→true } } } */
+    {
+        const char *k = "jobs";
+        uint32_t kpad = ((uint32_t)strlen(k) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, strlen(k));
+        xpc_pos += kpad;
+
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT; xpc_pos += 4;
+        uint32_t jobs_size_pos = xpc_pos; xpc_pos += 4;
+        uint32_t jobs_start = xpc_pos;
+        *(uint32_t *)(xpc_buf + xpc_pos) = 1; xpc_pos += 4; /* 1 job entry */
+
+        /* Job key: "com.apple.assertiond" */
+        const char *job_label = "com.apple.assertiond";
+        uint32_t jpad = ((uint32_t)strlen(job_label) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, jpad);
+        memcpy(xpc_buf + xpc_pos, job_label, strlen(job_label));
+        xpc_pos += jpad;
+
+        /* Job value: dict { "Label" → string, "MachServices" → dict { svc→true, ... } } */
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT; xpc_pos += 4;
+        uint32_t job_size_pos = xpc_pos; xpc_pos += 4;
+        uint32_t job_start = xpc_pos;
+        *(uint32_t *)(xpc_buf + xpc_pos) = 2; xpc_pos += 4; /* 2 entries: Label + MachServices */
+
+        /* "Label" → string("com.apple.assertiond") */
+        {
+            const char *lk = "Label";
+            uint32_t lkpad = ((uint32_t)strlen(lk) + 1 + 3) & ~3;
+            memset(xpc_buf + xpc_pos, 0, lkpad);
+            memcpy(xpc_buf + xpc_pos, lk, strlen(lk));
+            xpc_pos += lkpad;
+            *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_STRING; xpc_pos += 4;
+            uint32_t lv_len = (uint32_t)strlen(job_label) + 1; /* include null */
+            *(uint32_t *)(xpc_buf + xpc_pos) = lv_len; xpc_pos += 4;
+            uint32_t lv_pad = (lv_len + 3) & ~3;
+            memset(xpc_buf + xpc_pos, 0, lv_pad);
+            memcpy(xpc_buf + xpc_pos, job_label, strlen(job_label));
+            xpc_pos += lv_pad;
+        }
+
+        /* "MachServices" key */
+        const char *ms_key = "MachServices";
+        uint32_t mspad = ((uint32_t)strlen(ms_key) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, mspad);
+        memcpy(xpc_buf + xpc_pos, ms_key, strlen(ms_key));
+        xpc_pos += mspad;
+
+        /* MachServices value: dict of assertiond services → bool(true) */
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT; xpc_pos += 4;
+        uint32_t ms_size_pos = xpc_pos; xpc_pos += 4;
+        uint32_t ms_start = xpc_pos;
+
+        /* Count assertiond services */
+        for (int i = 0; i < MAX_SERVICES; i++) {
+            if (g_services[i].active && strstr(g_services[i].name, "assertiond")) {
+                total_svc_count++;
+            }
+        }
+        *(uint32_t *)(xpc_buf + xpc_pos) = (uint32_t)total_svc_count; xpc_pos += 4;
+
+        /* Add each assertiond service as bool(true) */
+        for (int i = 0; i < MAX_SERVICES; i++) {
+            if (g_services[i].active && strstr(g_services[i].name, "assertiond")) {
+                uint32_t slen = (uint32_t)strlen(g_services[i].name);
+                uint32_t spad_n = (slen + 1 + 3) & ~3;
+                memset(xpc_buf + xpc_pos, 0, spad_n);
+                memcpy(xpc_buf + xpc_pos, g_services[i].name, slen);
+                xpc_pos += spad_n;
+                *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_BOOL; xpc_pos += 4;
+                *(uint32_t *)(xpc_buf + xpc_pos) = 1; xpc_pos += 4; /* true */
+            }
+        }
+
+        *(uint32_t *)(xpc_buf + ms_size_pos) = xpc_pos - ms_start;
+        *(uint32_t *)(xpc_buf + job_size_pos) = xpc_pos - job_start;
+        *(uint32_t *)(xpc_buf + jobs_size_pos) = xpc_pos - jobs_start;
+        entries++;
+    }
+
+    /* ALSO add root-level "com.apple.assertiond" → job dict.
+     * Legacy GetJobs callers may look for job-label keys at root level
+     * rather than inside "jobs" sub-dict. Include both for compatibility. */
+    {
+        const char *jk = "com.apple.assertiond";
+        uint32_t jkpad = ((uint32_t)strlen(jk) + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, jkpad);
+        memcpy(xpc_buf + xpc_pos, jk, strlen(jk));
+        xpc_pos += jkpad;
+
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT; xpc_pos += 4;
+        uint32_t rj_size_pos = xpc_pos; xpc_pos += 4;
+        uint32_t rj_start = xpc_pos;
+        *(uint32_t *)(xpc_buf + xpc_pos) = 2; xpc_pos += 4; /* Label + MachServices */
+
+        /* Label */
+        {
+            const char *lk = "Label";
+            uint32_t lkp = ((uint32_t)strlen(lk) + 1 + 3) & ~3;
+            memset(xpc_buf + xpc_pos, 0, lkp);
+            memcpy(xpc_buf + xpc_pos, lk, strlen(lk));
+            xpc_pos += lkp;
+            *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_STRING; xpc_pos += 4;
+            uint32_t lv_len = (uint32_t)strlen(jk) + 1;
+            *(uint32_t *)(xpc_buf + xpc_pos) = lv_len; xpc_pos += 4;
+            uint32_t lv_pad = (lv_len + 3) & ~3;
+            memset(xpc_buf + xpc_pos, 0, lv_pad);
+            memcpy(xpc_buf + xpc_pos, jk, strlen(jk));
+            xpc_pos += lv_pad;
+        }
+
+        /* MachServices */
+        {
+            const char *mk = "MachServices";
+            uint32_t mkp = ((uint32_t)strlen(mk) + 1 + 3) & ~3;
+            memset(xpc_buf + xpc_pos, 0, mkp);
+            memcpy(xpc_buf + xpc_pos, mk, strlen(mk));
+            xpc_pos += mkp;
+            *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT; xpc_pos += 4;
+            uint32_t rms_size_pos = xpc_pos; xpc_pos += 4;
+            uint32_t rms_start = xpc_pos;
+            *(uint32_t *)(xpc_buf + xpc_pos) = (uint32_t)total_svc_count; xpc_pos += 4;
+            for (int i = 0; i < MAX_SERVICES; i++) {
+                if (g_services[i].active && strstr(g_services[i].name, "assertiond")) {
+                    uint32_t sl = (uint32_t)strlen(g_services[i].name);
+                    uint32_t sp = (sl + 1 + 3) & ~3;
+                    memset(xpc_buf + xpc_pos, 0, sp);
+                    memcpy(xpc_buf + xpc_pos, g_services[i].name, sl);
+                    xpc_pos += sp;
+                    *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_BOOL; xpc_pos += 4;
+                    *(uint32_t *)(xpc_buf + xpc_pos) = 1; xpc_pos += 4;
+                }
+            }
+            *(uint32_t *)(xpc_buf + rms_size_pos) = xpc_pos - rms_start;
+        }
+
+        *(uint32_t *)(xpc_buf + rj_size_pos) = xpc_pos - rj_start;
+        entries++;
+    }
+
+    #undef ADD_INT64
+
+    /* Fill XPC header */
+    *(uint32_t *)(xpc_buf + 0) = XPC_MAGIC;
+    *(uint32_t *)(xpc_buf + 4) = XPC_VERSION;
+    *(uint32_t *)(xpc_buf + 8) = XPC_TYPE_DICT;
+    *(uint32_t *)(xpc_buf + 12) = xpc_pos - 16;
+    *(uint32_t *)(xpc_buf + 16) = entries;
+
+    uint32_t xpc_padded = (xpc_pos + 3) & ~3;
+
+    struct {
+        mach_msg_header_t head;
+        uint8_t data[2048];
+    } reply;
+    memset(&reply, 0, sizeof(reply));
+
+    reply.head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply.head.msgh_size = sizeof(mach_msg_header_t) + xpc_padded;
+    reply.head.msgh_remote_port = reply_port;
+    reply.head.msgh_local_port = MACH_PORT_NULL;
+    (void)msg_id;
+    reply.head.msgh_id = XPC_PIPE_REPLY_MSG_ID;
+
+    memcpy(reply.data, xpc_buf, xpc_pos);
+
+    kern_return_t kr = mach_msg(&reply.head, MACH_SEND_MSG, reply.head.msgh_size,
+                                 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker] send_xpc_pipe_getjobs_reply failed: 0x%x\n", kr);
+    } else {
+        broker_log("[broker] sent GetJobs reply (%u bytes xpc, %d assertiond services)\n",
+                   xpc_pos, total_svc_count);
+    }
+}
+
+/* Build an XPC pipe check-in response (routine 805).
  * The response is a complex Mach message with:
  *   - Port descriptor (MOVE_RECEIVE for the service port)
  *   - XPC wire data containing a dictionary with:
- *     - "MachServices" → { service_name → mach_recv(descriptor_index=0) }
+ *     - "port" → mach_recv (consumes the port descriptor)
  */
 static void handle_xpc_checkin(mach_msg_header_t *request,
                                 const char *service_name,
-                                mach_port_t service_port) {
-    broker_log("[broker] XPC check-in: building response for '%s' port=0x%x\n",
-               service_name, service_port);
+                                mach_port_t service_port,
+                                uint64_t request_handle) {
+    broker_log("[broker] XPC check-in: building response for '%s' port=0x%x handle=%llu\n",
+               service_name, service_port, request_handle);
 
     /* Build the XPC response payload:
      * Dictionary {
      *   "subsystem" → int64(3)
-     *   "MachServices" → Dictionary {
-     *     service_name → mach_recv (port descriptor ref)
-     *   }
+     *   "error" → int64(0)
+     *   "routine" → int64(805)
+     *   "handle" → int64(request_handle)
+     *   "port" → mach_recv
      * }
      */
     uint8_t xpc_buf[512];
@@ -558,106 +945,42 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
 
     uint32_t root_entries = 0;
 
-    /* Entry: "subsystem" → int64(3) */
+    /* Helper: add int64 entry inline */
+    #define CHECKIN_INT64(key_str, val) do { \
+        const char *_ck = (key_str); \
+        uint32_t _ckp = ((uint32_t)strlen(_ck) + 1 + 3) & ~3; \
+        memset(xpc_buf + xpc_pos, 0, _ckp); \
+        memcpy(xpc_buf + xpc_pos, _ck, strlen(_ck)); \
+        xpc_pos += _ckp; \
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4; \
+        *(uint64_t *)(xpc_buf + xpc_pos) = (uint64_t)(val); xpc_pos += 8; \
+        root_entries++; \
+    } while(0)
+
+    CHECKIN_INT64("subsystem", 3);
+    CHECKIN_INT64("error", 0);
+    CHECKIN_INT64("routine", 805);
+
+    /* Entry: \"port\" → mach_recv (no inline payload; consumes next descriptor)
+     * Place before "handle" to match potential libxpc expectations */
     {
-        const char *k = "subsystem";
+        const char *k = "port";
         uint32_t klen = (uint32_t)strlen(k);
         uint32_t kpad = (klen + 1 + 3) & ~3;
         memset(xpc_buf + xpc_pos, 0, kpad);
         memcpy(xpc_buf + xpc_pos, k, klen);
         xpc_pos += kpad;
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_MACH_RECV;
         xpc_pos += 4;
-        *(uint64_t *)(xpc_buf + xpc_pos) = 3;
-        xpc_pos += 8;
         root_entries++;
     }
 
-    /* Entry: "error" → int64(0) — success */
-    {
-        const char *k = "error";
-        uint32_t klen = (uint32_t)strlen(k);
-        uint32_t kpad = (klen + 1 + 3) & ~3;
-        memset(xpc_buf + xpc_pos, 0, kpad);
-        memcpy(xpc_buf + xpc_pos, k, klen);
-        xpc_pos += kpad;
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
-        xpc_pos += 4;
-        *(uint64_t *)(xpc_buf + xpc_pos) = 0;
-        xpc_pos += 8;
-        root_entries++;
-    }
+    CHECKIN_INT64("handle", request_handle);
 
-    /* Entry: "handle" → int64(0) */
-    {
-        const char *k = "handle";
-        uint32_t klen = (uint32_t)strlen(k);
-        uint32_t kpad = (klen + 1 + 3) & ~3;
-        memset(xpc_buf + xpc_pos, 0, kpad);
-        memcpy(xpc_buf + xpc_pos, k, klen);
-        xpc_pos += kpad;
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
-        xpc_pos += 4;
-        *(uint64_t *)(xpc_buf + xpc_pos) = 0;
-        xpc_pos += 8;
-        root_entries++;
-    }
+    #undef CHECKIN_INT64
 
-    /* Entry: "routine" → int64(805) — check-in routine */
-    {
-        const char *k = "routine";
-        uint32_t klen = (uint32_t)strlen(k);
-        uint32_t kpad = (klen + 1 + 3) & ~3;
-        memset(xpc_buf + xpc_pos, 0, kpad);
-        memcpy(xpc_buf + xpc_pos, k, klen);
-        xpc_pos += kpad;
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
-        xpc_pos += 4;
-        *(uint64_t *)(xpc_buf + xpc_pos) = 805; /* 0x325 = check-in */
-        xpc_pos += 8;
-        root_entries++;
-    }
-
-    /* Entry: "MachServices" → dict { service_name → mach_recv } */
-    {
-        const char *k = "MachServices";
-        uint32_t klen = (uint32_t)strlen(k);
-        uint32_t kpad = (klen + 1 + 3) & ~3;
-        memset(xpc_buf + xpc_pos, 0, kpad);
-        memcpy(xpc_buf + xpc_pos, k, klen);
-        xpc_pos += kpad;
-
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT;
-        xpc_pos += 4;
-        /* Inner dict size placeholder */
-        uint32_t inner_size_pos = xpc_pos;
-        xpc_pos += 4;
-        uint32_t inner_start = xpc_pos;
-
-        /* Inner dict entry count */
-        *(uint32_t *)(xpc_buf + xpc_pos) = 1; /* one service */
-        xpc_pos += 4;
-
-        /* Inner entry: service_name → mach_recv(descriptor index 0) */
-        uint32_t slen = (uint32_t)strlen(service_name);
-        uint32_t spad = (slen + 1 + 3) & ~3;
-        memset(xpc_buf + xpc_pos, 0, spad);
-        memcpy(xpc_buf + xpc_pos, service_name, slen);
-        xpc_pos += spad;
-
-        /* XPC always uses mach_send type (0x0000c000) in the wire format.
-         * The ACTUAL disposition (send vs receive) comes from the Mach
-         * message descriptor, not the XPC type code.
-         * xpc_dictionary_copy_mach_send checks for __xpc_type_mach_send. */
-        *(uint32_t *)(xpc_buf + xpc_pos) = 0x0000c000; /* XPC_TYPE_MACH_SEND */
-        xpc_pos += 4;
-        *(uint32_t *)(xpc_buf + xpc_pos) = 0; /* wire port index 0 */
-        xpc_pos += 4;
-
-        /* Fill inner dict size */
-        *(uint32_t *)(xpc_buf + inner_size_pos) = xpc_pos - inner_start;
-        root_entries++;
-    }
+    broker_log("[broker] 805-reply: '%s' handle=%llu entries=%u port=0x%x\n",
+               service_name, request_handle, root_entries, service_port);
 
     /* Fill root dict size and entry count.
      * Size includes count(4) + entries — matches the request format
@@ -666,16 +989,17 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
     *(uint32_t *)(xpc_buf + 16) = root_entries;
     *(uint32_t *)(xpc_buf + 12) = xpc_pos - 16; /* count + entries */
 
-    /* Build the Mach message with port descriptor + XPC payload */
+    /* Build the Mach message with ONE port descriptor + XPC payload.
+     * desc[0] = service receive right (MOVE_RECEIVE) — consumed by the
+     * XPC \"port\" mach_recv value above. */
     uint32_t xpc_data_len = xpc_pos;
-    /* Pad XPC data to 4-byte boundary */
     uint32_t xpc_padded = (xpc_data_len + 3) & ~3;
 
 #pragma pack(4)
     struct {
         mach_msg_header_t head;
         mach_msg_body_t body;
-        mach_msg_port_descriptor_t port_desc[2];
+        mach_msg_port_descriptor_t port_desc[1];
         uint8_t xpc_data[512];
     } reply;
 #pragma pack()
@@ -685,25 +1009,15 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
     reply.head.msgh_bits = MACH_MSGH_BITS_COMPLEX |
         MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
     reply.head.msgh_size = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) +
-        2 * sizeof(mach_msg_port_descriptor_t) + xpc_padded;
+        1 * sizeof(mach_msg_port_descriptor_t) + xpc_padded;
     reply.head.msgh_remote_port = request->msgh_remote_port;
     reply.head.msgh_local_port = MACH_PORT_NULL;
-    /* XPC pipe replies use the SAME message ID as the request (not +100) */
-    reply.head.msgh_id = request->msgh_id;
-
-    /* Two port descriptors:
-     * 1. Service receive right (MOVE_RECEIVE) — the listener port
-     * 2. Broker send right (COPY_SEND) — for the listener's registration message.
-     *    _xpc_connection_check_in sends a registration message to this port. */
-    reply.body.msgh_descriptor_count = 2;
+    reply.head.msgh_id = XPC_PIPE_REPLY_MSG_ID;
+    reply.body.msgh_descriptor_count = 1;
 
     reply.port_desc[0].name = service_port;
     reply.port_desc[0].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
     reply.port_desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
-
-    reply.port_desc[1].name = g_broker_port;
-    reply.port_desc[1].disposition = MACH_MSG_TYPE_COPY_SEND;
-    reply.port_desc[1].type = MACH_MSG_PORT_DESCRIPTOR;
 
     memcpy(reply.xpc_data, xpc_buf, xpc_data_len);
 
@@ -726,6 +1040,104 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
         broker_log("[broker] XPC check-in response FAILED: 0x%x\n", kr);
     }
 }
+/* Build an XPC pipe endpoint lookup response (routine 804).
+ * The response is a complex Mach message with:
+ *   - Port descriptor (MOVE_SEND for the service port)
+ *   - XPC wire data containing a dictionary with:
+ *     - "port" → mach_send (consumes the port descriptor) */
+static void handle_xpc_endpoint_lookup(mach_msg_header_t *request,
+                                        const char *service_name,
+                                        mach_port_t service_port,
+                                        uint64_t request_handle) {
+    broker_log("[broker] XPC endpoint lookup: building response for '%s' port=0x%x handle=%llu\n",
+               service_name, service_port, request_handle);
+
+    /* We must send MOVE_SEND (0x11) to satisfy libxpc's serializer.
+     * Retain one extra send right so the broker keeps its original right. */
+    kern_return_t kr = mach_port_mod_refs(mach_task_self(), service_port, MACH_PORT_RIGHT_SEND, 1);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker] XPC endpoint lookup '%s': mach_port_mod_refs(+send) failed: 0x%x\n",
+                   service_name, kr);
+        send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, 804, 5 /* EIO */);
+        return;
+    }
+
+    uint8_t xpc_buf[512];
+    uint32_t xpc_pos = 20;
+    uint32_t root_entries = 0;
+
+    #define LOOKUP_INT64(key_str, val) do { \
+        const char *_lk = (key_str); \
+        uint32_t _lkp = ((uint32_t)strlen(_lk) + 1 + 3) & ~3; \
+        memset(xpc_buf + xpc_pos, 0, _lkp); \
+        memcpy(xpc_buf + xpc_pos, _lk, strlen(_lk)); \
+        xpc_pos += _lkp; \
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64; xpc_pos += 4; \
+        *(uint64_t *)(xpc_buf + xpc_pos) = (uint64_t)(val); xpc_pos += 8; \
+        root_entries++; \
+    } while(0)
+
+    LOOKUP_INT64("subsystem", 3);
+    LOOKUP_INT64("error", 0);
+    LOOKUP_INT64("routine", 804);
+    LOOKUP_INT64("handle", request_handle);
+
+    /* "port" → mach_send (no inline payload; consumes next descriptor) */
+    {
+        const char *k = "port";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_MACH_SEND;
+        xpc_pos += 4;
+        root_entries++;
+    }
+
+    #undef LOOKUP_INT64
+
+    *(uint32_t *)(xpc_buf + 0) = XPC_MAGIC;
+    *(uint32_t *)(xpc_buf + 4) = XPC_VERSION;
+    *(uint32_t *)(xpc_buf + 8) = XPC_TYPE_DICT; /* root type */
+    *(uint32_t *)(xpc_buf + 16) = root_entries;
+    *(uint32_t *)(xpc_buf + 12) = xpc_pos - 16;
+
+    uint32_t xpc_padded = (xpc_pos + 3) & ~3;
+
+#pragma pack(4)
+    struct {
+        mach_msg_header_t head;
+        mach_msg_body_t body;
+        mach_msg_port_descriptor_t port_desc[1];
+        uint8_t xpc_data[512];
+    } reply;
+#pragma pack()
+
+    memset(&reply, 0, sizeof(reply));
+    reply.head.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+        MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply.head.msgh_size = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) +
+        1 * sizeof(mach_msg_port_descriptor_t) + xpc_padded;
+    reply.head.msgh_remote_port = request->msgh_remote_port;
+    reply.head.msgh_local_port = MACH_PORT_NULL;
+    reply.head.msgh_id = XPC_PIPE_REPLY_MSG_ID;
+    reply.body.msgh_descriptor_count = 1;
+
+    reply.port_desc[0].name = service_port;
+    reply.port_desc[0].disposition = MACH_MSG_TYPE_MOVE_SEND;
+    reply.port_desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
+
+    memcpy(reply.xpc_data, xpc_buf, xpc_pos);
+
+    kr = mach_msg(&reply.head, MACH_SEND_MSG, reply.head.msgh_size,
+                   0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    if (kr == KERN_SUCCESS) {
+        broker_log("[broker] XPC endpoint lookup response sent for '%s'\n", service_name);
+    } else {
+        broker_log("[broker] XPC endpoint lookup response FAILED: 0x%x\n", kr);
+    }
+}
 
 /* Handle XPC pipe message (msg_id 0x10000000) */
 static void handle_xpc_launch_msg(mach_msg_header_t *request) {
@@ -733,53 +1145,114 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
     uint32_t total = request->msgh_size;
     int is_complex = (request->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
     uint32_t data_offset = sizeof(mach_msg_header_t);
+    uint32_t desc_count = 0;
 
     if (is_complex) {
         mach_msg_body_t *body = (mach_msg_body_t *)(raw + data_offset);
-        uint32_t desc_count = body->msgh_descriptor_count;
+        desc_count = body->msgh_descriptor_count;
         data_offset += sizeof(mach_msg_body_t) + desc_count * sizeof(mach_msg_port_descriptor_t);
     }
 
-    /* Extract service name from XPC data */
+    /* Extract XPC fields from inline data */
     const char *service_name = NULL;
+    uint64_t routine = 0;
+    uint64_t handle = 0;
     if (data_offset < total) {
-        service_name = xpc_extract_service_name(raw + data_offset, total - data_offset);
+        const uint8_t *xpc_data = raw + data_offset;
+        uint32_t xpc_len = total - data_offset;
+        service_name = xpc_extract_service_name(xpc_data, xpc_len);
+        routine = xpc_extract_routine(xpc_data, xpc_len);
+        handle = xpc_extract_handle(xpc_data, xpc_len);
     }
 
-    if (service_name) {
-        broker_log("[broker] XPC pipe check-in for service: '%s'\n", service_name);
+    broker_log("[broker] XPC pipe msg: size=%u routine=%llu handle=%llu name='%s'\n",
+               total, routine, handle, service_name ? service_name : "(none)");
+    broker_log("[broker] XPC pipe hdr: id=%u bits=0x%x complex=%d desc_count=%u remote=0x%x local=0x%x data_off=%u\n",
+               request->msgh_id, request->msgh_bits, is_complex, desc_count,
+               request->msgh_remote_port, request->msgh_local_port, data_offset);
 
+    if (routine == 805 && service_name &&
+        strncmp(service_name, "com.apple.assertiond.", 21) == 0) {
+        uint32_t dump_len = total < 160 ? total : 160;
+        broker_log("[broker] XPC 805 request dump '%s' (%u bytes):", service_name, total);
+        for (uint32_t d = 0; d < dump_len; d++) {
+            if (d % 16 == 0) broker_log("\n[broker]   %04x: ", d);
+            broker_log("%02x ", raw[d]);
+        }
+        broker_log("\n");
+    }
+
+    /* Routine 804 = endpoint lookup (used by _xpc_look_up_endpoint). */
+    if (routine == 804 && service_name) {
+        mach_port_t service_port = lookup_service(service_name);
+        if (service_port == MACH_PORT_NULL) {
+            broker_log("[broker] XPC endpoint lookup: service '%s' not found\n", service_name);
+            send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 2 /* ENOENT */);
+            return;
+        }
+        handle_xpc_endpoint_lookup(request, service_name, service_port, handle);
+        return;
+    }
+    /* Routine 805 = check-in (LAUNCH_ROUTINE_CHECKIN) */
+    if (routine == 805 && service_name) {
         /* Find the pre-created port for this service */
         mach_port_t service_port = MACH_PORT_NULL;
+        int slot = -1;
         for (int i = 0; i < MAX_SERVICES; i++) {
             if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
-                service_port = g_services[i].port;
+                slot = i;
                 break;
             }
         }
 
-        if (service_port != MACH_PORT_NULL) {
-            handle_xpc_checkin(request, service_name, service_port);
+        /* GUARD: block repeat MOVE_RECEIVE via XPC pipe path too */
+        if (slot >= 0 && g_services[slot].receive_moved) {
+            broker_log("[broker] XPC check-in '%s': repeat-blocked (receive already moved for 0x%x)\n",
+                       service_name, g_services[slot].port);
+            send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 17 /* EEXIST */);
+            return;
+        }
+
+        if (slot >= 0) {
+            service_port = g_services[slot].port;
+            handle_xpc_checkin(request, service_name, service_port, handle);
+            g_services[slot].receive_moved = 1;
             return;
         }
 
         broker_log("[broker] XPC check-in: service '%s' not found, creating\n", service_name);
-        /* Create a new port for unknown services */
         kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service_port);
         if (kr == KERN_SUCCESS) {
             mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
             register_service(service_name, service_port);
-            handle_xpc_checkin(request, service_name, service_port);
+            handle_xpc_checkin(request, service_name, service_port, handle);
+            for (int i = 0; i < MAX_SERVICES; i++) {
+                if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
+                    g_services[i].receive_moved = 1;
+                    break;
+                }
+            }
             return;
         }
+        /* Port alloc failed — send XPC error reply */
+        send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 12 /* ENOMEM */);
+        return;
     }
 
-    /* Fallback: couldn't parse or no service found */
-    broker_log("[broker] XPC pipe msg: unparseable (size=%u), sending error reply\n", total);
-    if (request->msgh_remote_port != MACH_PORT_NULL) {
-        send_error_reply(request->msgh_remote_port,
-                         request->msgh_id + MIG_REPLY_OFFSET, 0);
+    /* Routine 100 = GetJobs (LAUNCH_ROUTINE_GETJOBS).
+     * assertiond calls this early to get its job dictionary with MachServices.
+     * Without proper response, assertiond logs "Error getting job dictionaries.
+     * Error: Input/output error (5)". */
+    if (routine == 100) {
+        broker_log("[broker] XPC pipe: routine=100 (GetJobs), sending jobs reply\n");
+        send_xpc_pipe_getjobs_reply(request->msgh_remote_port, request->msgh_id, handle);
+        return;
     }
+
+    /* Other non-check-in XPC launchd routines — generic XPC success reply.
+     * CRITICAL: never use send_error_reply (MIG format) here. */
+    broker_log("[broker] XPC pipe: non-checkin routine=%llu, sending XPC success reply\n", routine);
+    send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 0);
 }
 
 /* Message dispatch loop */
@@ -813,18 +1286,11 @@ static void message_loop(void) {
         broker_log("[broker] received message: id=%d size=%d local=0x%x\n",
                    request->msgh_id, request->msgh_size, request->msgh_local_port);
 
-        /* Check if message arrived on the rendezvous port (XPC pipe protocol) */
+        /* Check if message arrived on the rendezvous port (XPC pipe protocol).
+         * Route ALL rendezvous messages to handle_xpc_launch_msg which sends
+         * proper XPC-formatted replies. NEVER send MIG replies on this port. */
         if (request->msgh_local_port == g_rendezvous_port) {
-            broker_log("[broker] XPC pipe message on rendezvous port: id=%d size=%d\n",
-                       request->msgh_id, request->msgh_size);
-            /* XPC pipe messages use xpc_pipe_routine protocol.
-             * For now, log and dump for analysis. */
-            /* TODO: Implement XPC check-in reply */
-            if (request->msgh_remote_port != MACH_PORT_NULL) {
-                /* Send a minimal reply to prevent timeout */
-                send_error_reply(request->msgh_remote_port,
-                                 request->msgh_id + MIG_REPLY_OFFSET, 0);
-            }
+            handle_xpc_launch_msg(request);
             continue;
         }
 
@@ -859,8 +1325,52 @@ static void message_loop(void) {
                 handle_xpc_launch_msg(request);
                 break;
 
+            case XPC_LISTENER_REG_ID: {
+                /* Listener registration handshake from _xpc_connection_check_in.
+                 * Contract: 52-byte complex message with 2 port descriptors.
+                 *   desc[0]: service recv port (MAKE_SEND disposition)
+                 *   desc[1]: extra port (COPY_SEND disposition)
+                 * No reply needed — registration is fire-and-forget. */
+                int valid = 1;
+                if (request->msgh_size != 52) {
+                    broker_log("[broker] listener-reg: WARN size=%u (expected 52)\n", request->msgh_size);
+                    valid = 0;
+                }
+                if (!(request->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+                    broker_log("[broker] listener-reg: WARN not complex\n");
+                    valid = 0;
+                }
+                if (valid) {
+                    mach_msg_body_t *body = (mach_msg_body_t *)((uint8_t *)request + sizeof(mach_msg_header_t));
+                    if (body->msgh_descriptor_count != 2) {
+                        broker_log("[broker] listener-reg: WARN desc_count=%u (expected 2)\n",
+                                   body->msgh_descriptor_count);
+                        valid = 0;
+                    } else {
+                        mach_msg_port_descriptor_t *d0 = (mach_msg_port_descriptor_t *)(body + 1);
+                        mach_msg_port_descriptor_t *d1 = d0 + 1;
+                        broker_log("[broker] listener-reg: OK desc0=0x%x(disp=%u) desc1=0x%x(disp=%u)\n",
+                                   d0->name, d0->disposition, d1->name, d1->disposition);
+                    }
+                }
+                if (!valid) {
+                    broker_log("[broker] listener-reg: accepted with warnings (size=%u)\n", request->msgh_size);
+                }
+                /* No reply — registration is acknowledged by consuming the message */
+                break;
+            }
+
             default:
-                broker_log("[broker] unknown message id: %d\n", request->msgh_id);
+                broker_log("[broker] unknown msg: id=%d (0x%x) size=%u complex=%d local=0x%x\n",
+                           request->msgh_id, request->msgh_id, request->msgh_size,
+                           (request->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0,
+                           request->msgh_local_port);
+                /* Check if this looks structurally like a listener-reg (complex, ~52 bytes, 2 descs) */
+                if ((request->msgh_bits & MACH_MSGH_BITS_COMPLEX) && request->msgh_size >= 48 && request->msgh_size <= 64) {
+                    mach_msg_body_t *ub = (mach_msg_body_t *)((uint8_t *)request + sizeof(mach_msg_header_t));
+                    broker_log("[broker] unknown msg: possible listener-reg alias (desc_count=%u)\n",
+                               ub->msgh_descriptor_count);
+                }
                 if (request->msgh_remote_port != MACH_PORT_NULL) {
                     send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, MIG_BAD_ID);
                 }
@@ -1017,7 +1527,7 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
 
     char cwd[1024];
     getcwd(cwd, sizeof(cwd));
-    /* bootstrap_fix.dylib first, then springboard_shim */
+    /* All daemons get both bootstrap_fix.dylib + springboard_shim.dylib */
     snprintf(env_dyld_insert, sizeof(env_dyld_insert),
              "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib:%s/src/bridge/springboard_shim.dylib",
              cwd, cwd);
@@ -1457,6 +1967,17 @@ int main(int argc, char *argv[]) {
 
             broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
 
+            /* Route XPC pipe messages before bootstrap dispatch */
+            if (tmp_req->msgh_local_port == g_rendezvous_port ||
+                tmp_req->msgh_id == XPC_LAUNCH_MSG_ID) {
+                handle_xpc_launch_msg(tmp_req);
+                goto ca_check;
+            }
+            if (tmp_req->msgh_id == XPC_LISTENER_REG_ID) {
+                broker_log("[broker] pre-app: listener-reg consumed\n");
+                goto ca_check;
+            }
+
             /* Dispatch the message */
             switch (tmp_req->msgh_id) {
                 case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
@@ -1474,6 +1995,7 @@ int main(int argc, char *argv[]) {
                     break;
             }
 
+            ca_check: ;
             /* Check if CARenderServer AND all critical services are registered.
              * display.services is required by the app's BKSDisplayServicesStart(). */
             int has_ca = 0, has_event = 0, has_workspace = 0, has_display = 0;
@@ -1497,8 +2019,7 @@ int main(int argc, char *argv[]) {
 
         /* Phase 2: Spawn assertiond (process assertion daemon).
          * Must start BEFORE SpringBoard — SpringBoard's AssertionServices
-         * framework connects to assertiond's XPC services during bootstrap.
-         * Without assertiond, SpringBoard fails with "Bootstrap failed". */
+         * framework connects to assertiond's XPC services during bootstrap. */
         broker_log("[broker] spawning assertiond...\n");
         if (spawn_assertiond(sdk_path) != 0) {
             broker_log("[broker] WARNING: failed to spawn assertiond\n");
@@ -1518,6 +2039,18 @@ int main(int argc, char *argv[]) {
                 }
                 if (msg_kr != KERN_SUCCESS) break;
                 broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
+
+                /* Route XPC pipe messages */
+                if (tmp_req->msgh_local_port == g_rendezvous_port ||
+                    tmp_req->msgh_id == XPC_LAUNCH_MSG_ID) {
+                    handle_xpc_launch_msg(tmp_req);
+                    goto assertiond_svc_check;
+                }
+                if (tmp_req->msgh_id == XPC_LISTENER_REG_ID) {
+                    broker_log("[broker] assertiond-wait: listener-reg consumed\n");
+                    goto assertiond_svc_check;
+                }
+
                 switch (tmp_req->msgh_id) {
                     case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
                     case BOOTSTRAP_REGISTER: handle_register(tmp_req); break;
@@ -1533,6 +2066,7 @@ int main(int argc, char *argv[]) {
                             send_error_reply(tmp_req->msgh_remote_port, tmp_req->msgh_id + MIG_REPLY_OFFSET, MIG_BAD_ID);
                         break;
                 }
+                assertiond_svc_check:
                 /* Check if assertiond registered any services */
                 for (int i = 0; i < MAX_SERVICES; i++) {
                     if (g_services[i].active && strstr(g_services[i].name, "assertiond")) {
@@ -1545,10 +2079,7 @@ int main(int argc, char *argv[]) {
             broker_log("[broker] assertiond init phase complete\n");
         }
 
-        /* Phase 3: Spawn SpringBoard.
-         * SpringBoard connects to backboardd's services (CARenderServer,
-         * PurpleSystemEventPort, etc.) and assertiond. It becomes the
-         * system app and manages app lifecycle and display assignment. */
+        /* Phase 3: Spawn SpringBoard. */
         broker_log("[broker] spawning SpringBoard...\n");
         if (spawn_springboard(sdk_path) != 0) {
             broker_log("[broker] WARNING: failed to spawn SpringBoard, spawning app directly\n");
@@ -1574,6 +2105,17 @@ int main(int argc, char *argv[]) {
 
                 broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
 
+                /* Route XPC pipe messages */
+                if (tmp_req->msgh_local_port == g_rendezvous_port ||
+                    tmp_req->msgh_id == XPC_LAUNCH_MSG_ID) {
+                    handle_xpc_launch_msg(tmp_req);
+                    goto sb_svc_check;
+                }
+                if (tmp_req->msgh_id == XPC_LISTENER_REG_ID) {
+                    broker_log("[broker] sb-wait: listener-reg consumed\n");
+                    goto sb_svc_check;
+                }
+
                 switch (tmp_req->msgh_id) {
                     case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
                     case BOOTSTRAP_REGISTER: handle_register(tmp_req); break;
@@ -1590,6 +2132,7 @@ int main(int argc, char *argv[]) {
                         break;
                 }
 
+                sb_svc_check:
                 /* Check if SpringBoard registered its key services */
                 for (int i = 0; i < MAX_SERVICES; i++) {
                     if (g_services[i].active &&
