@@ -495,10 +495,10 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
                             bridge_log("CARenderServerGetServerPort: GetClientPort(%u)=%u (after early ctx)", g_ca_server_port, rcp);
                         }
                         ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("retain"));
-                        /* Store globally for UIWindow to use later */
+                        /* Store globally for UIWindow to use later.
+                         * DON'T write context_id file here — UIKit will create
+                         * the real window context later with a different ID. */
                         _bridge_pre_created_context = ctx;
-                        int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                        if (fd >= 0) { char b[32]; int l = snprintf(b,32,"%u",cid); write(fd,b,l); close(fd); }
                     }
                 } @catch (id ex) {
                     bridge_log("CARenderServerGetServerPort: early ctx threw: %s",
@@ -1060,8 +1060,8 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
                                     unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                                         ctx, sel_registerName("contextId"));
                                     bridge_log("  Pre-created REMOTE context: ID=%u (before didFinishLaunching)", cid);
-                                    int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                                    if (fd >= 0) { char b[32]; int l = snprintf(b,32,"%u",cid); write(fd,b,l); close(fd); }
+                                    /* DON'T write context_id file here — UIKit's _createContextAttached
+                                     * creates the real window context with a different ID. */
                                 }
                             } @catch (id ex) {
                                 bridge_log("  Pre-create context threw: %s", [[ex description] UTF8String] ?: "?");
@@ -4776,6 +4776,20 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                 }
                 bridge_log("  UIKit created _layerContext: contextId=%u renderContext=%p (%s)",
                            cid, rc, rc ? "REMOTE" : "LOCAL");
+
+                /* Write the CORRECT contextId to the IPC file so backboardd's
+                 * CALayerHost uses this context for compositing.
+                 * This is the critical link: app's layer tree → CARenderServer display. */
+                if (cid != 0) {
+                    int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                    if (fd >= 0) {
+                        char buf[32];
+                        int len = snprintf(buf, sizeof(buf), "%u", cid);
+                        write(fd, buf, len);
+                        close(fd);
+                        bridge_log("  Wrote contextId=%u to %s for CALayerHost", cid, ROSETTASIM_FB_CONTEXT_PATH);
+                    }
+                }
             } else {
                 bridge_log("  UIKit's _createContextAttached: returned nil _layerContext!");
             }
@@ -5946,17 +5960,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                     if ([(id)remoteCtx respondsToSelector:ctxIdSel]) {
                                                         unsigned int ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
                                                             remoteCtx, ctxIdSel);
-                                                        bridge_log("Display Pipeline: Displayable context ID = %u", ctxId);
-
-                                                        /* Write context ID for backboardd's CALayerHost */
-                                                        int ctxFd = open(ROSETTASIM_FB_CONTEXT_PATH,
-                                                            O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                                                        if (ctxFd >= 0) {
-                                                            char buf[32];
-                                                            int len = snprintf(buf, sizeof(buf), "%u", ctxId);
-                                                            write(ctxFd, buf, len);
-                                                            close(ctxFd);
-                                                        }
+                                                        bridge_log("Display Pipeline: Displayable context ID = %u (NOT writing to file — UIKit contextId already written)", ctxId);
                                                     }
 
                                                     /* Flush to push the context creation to server */
