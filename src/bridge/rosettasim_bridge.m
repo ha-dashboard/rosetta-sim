@@ -517,13 +517,17 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
                    bkr, g_bridge_broker_port);
     }
 
-    /* Try to look up real CARenderServer from broker via custom protocol.
-     * We can't use bootstrap_look_up because the iOS SDK implementation
-     * uses mach_msg2/XPC internally on macOS 26, which the broker can't handle. */
+    /* With bootstrap_fix.dylib active, standard bootstrap_look_up works through the broker.
+     * Try the standard path first (goes through bootstrap_fix → broker MIG protocol). */
     if (g_bridge_broker_port != MACH_PORT_NULL) {
-        bridge_log("CARenderServerGetServerPort: looking up via broker port 0x%x",
-                   g_bridge_broker_port);
-        mach_port_t port = bridge_broker_lookup("com.apple.CARenderServer");
+        bridge_log("CARenderServerGetServerPort: looking up via bootstrap_look_up");
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t lkr = bootstrap_look_up(bootstrap_port, "com.apple.CARenderServer", &port);
+        if (lkr != KERN_SUCCESS || port == MACH_PORT_NULL) {
+            /* Fall back to custom broker protocol */
+            bridge_log("CARenderServerGetServerPort: bootstrap_look_up failed (kr=%d), trying broker custom", lkr);
+            port = bridge_broker_lookup("com.apple.CARenderServer");
+        }
         if (port != MACH_PORT_NULL) {
             g_ca_server_port = port;
             g_ca_server_connected = 1;
@@ -4420,8 +4424,14 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
         } else if (mode && strcmp(mode, "server") == 0) {
             _ca_mode_server = 1;
         } else {
-            /* Auto-detect: enable server mode when running under broker */
-            _ca_mode_server = (g_bridge_broker_port != MACH_PORT_NULL) ? 1 : 0;
+            /* Auto-detect: enable server mode when running under broker.
+             * Check TASK_BOOTSTRAP_PORT which is set by posix_spawnattr_setspecialport_np. */
+            mach_port_t bp = MACH_PORT_NULL;
+            task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+            _ca_mode_server = (bp != MACH_PORT_NULL) ? 1 : 0;
+            if (_ca_mode_server && g_bridge_broker_port == MACH_PORT_NULL) {
+                g_bridge_broker_port = bp;
+            }
         }
         _ca_mode_checked = 1;
         if (_ca_mode_server) {
@@ -7247,6 +7257,61 @@ static void rosettasim_bridge_init(void) {
     }
     if (bootstrap_port != MACH_PORT_NULL) {
         bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
+    }
+
+    /* With bootstrap_fix.dylib active, look up CARenderServer via standard path.
+     * This MUST happen early (before UIKit creates windows) so g_ca_server_port
+     * is set and the Display Pipeline uses GPU mode.
+     * bootstrap_look_up goes through bootstrap_fix → broker → returns real port. */
+    if (g_bridge_broker_port != MACH_PORT_NULL) {
+        mach_port_t ca_port = MACH_PORT_NULL;
+        kern_return_t ca_kr = bootstrap_look_up(bootstrap_port,
+                                                 "com.apple.CARenderServer", &ca_port);
+        if (ca_kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
+            g_ca_server_port = ca_port;
+            g_ca_server_connected = 1;
+            bridge_log("  CARenderServer found via bootstrap: port=0x%x", ca_port);
+
+            /* Set client port IMMEDIATELY — BEFORE UIKit creates any windows.
+             * This tells CoreAnimation to use IOSurface-backed backing stores
+             * for server compositing instead of vm_allocate LOCAL stores.
+             * Without this, UIKit creates LOCAL contexts and static content
+             * (text, images, backgrounds) never reaches CARenderServer. */
+            @try {
+                Class caCtxCls = objc_getClass("CAContext");
+                if (caCtxCls) {
+                    /* Create a receive port for the client connection */
+                    mach_port_t client_port = MACH_PORT_NULL;
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                                       &client_port);
+                    if (client_port != MACH_PORT_NULL) {
+                        mach_port_insert_right(mach_task_self(), client_port,
+                                               client_port, MACH_MSG_TYPE_MAKE_SEND);
+                        /* Set the client port globally on CAContext */
+                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
+                            (id)caCtxCls,
+                            sel_registerName("setClientPort:"),
+                            client_port);
+                        bridge_log("  CAContext.setClientPort(%u) — EARLY (before window creation)",
+                                   client_port);
+
+                        /* Verify it was set */
+                        typedef mach_port_t (*GetCPFn)(mach_port_t);
+                        GetCPFn gcp = (GetCPFn)dlsym(RTLD_DEFAULT,
+                                                      "CARenderServerGetClientPort");
+                        if (gcp) {
+                            mach_port_t cp = gcp(ca_port);
+                            bridge_log("  CARenderServerGetClientPort()=%u (should be non-zero)", cp);
+                        }
+                    }
+                }
+            } @catch (id ex) {
+                bridge_log("  setClientPort threw: %s",
+                           [[ex description] UTF8String] ?: "unknown");
+            }
+        } else {
+            bridge_log("  CARenderServer bootstrap_look_up failed: kr=0x%x", ca_kr);
+        }
     }
 
     /* Swizzle BackBoardServices methods that crash without backboardd */
