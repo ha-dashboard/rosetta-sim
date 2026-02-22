@@ -356,6 +356,98 @@ static mach_port_t replacement_GSGetPurpleApplicationPort(void) {
     return GSGetPurpleApplicationPort();
 }
 
+/* launch_msg interposition.
+ *
+ * The XPC library uses launch_msg (NOT bootstrap_check_in) for service
+ * check-in when creating LISTENER connections. launch_msg talks to launchd
+ * which we don't have. We interpose it to handle "CheckIn" requests by
+ * returning MachServices ports from our broker.
+ *
+ * launch_data_t is an opaque type. We use the public launch.h API to
+ * create response objects. */
+typedef void *launch_data_t;
+extern launch_data_t launch_msg(launch_data_t);
+extern launch_data_t launch_data_new_string(const char *);
+extern launch_data_t launch_data_alloc(unsigned int);
+extern launch_data_t launch_data_dict_lookup(launch_data_t, const char *);
+extern int launch_data_get_type(launch_data_t);
+extern const char *launch_data_get_string(launch_data_t);
+extern mach_port_t launch_data_get_machport(launch_data_t);
+extern launch_data_t launch_data_new_machport(mach_port_t);
+extern void launch_data_dict_insert(launch_data_t, launch_data_t, const char *);
+extern void launch_data_free(launch_data_t);
+
+#define LAUNCH_DATA_DICTIONARY 1
+#define LAUNCH_DATA_STRING     2
+#define LAUNCH_DATA_MACHPORT   10
+
+#define LAUNCH_KEY_CHECKIN     "CheckIn"
+#define LAUNCH_JOBKEY_MACHSERVICES "MachServices"
+
+static launch_data_t replacement_launch_msg(launch_data_t msg) {
+    /* Only intercept check-in requests */
+    if (msg && launch_data_get_type(msg) == LAUNCH_DATA_STRING) {
+        const char *cmd = launch_data_get_string(msg);
+        if (cmd && strcmp(cmd, LAUNCH_KEY_CHECKIN) == 0) {
+            bfix_log("[bfix] launch_msg('CheckIn') intercepted\n");
+
+            /* Build a check-in response dictionary with MachServices.
+             * For each service we have in the broker, do bootstrap_check_in
+             * and put the port in the response. */
+            launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+            launch_data_t mach_services = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+
+            /* Check in known service patterns for the current process.
+             * We check_in dynamically — the broker will give us the pre-created port. */
+            const char *service_prefixes[] = {
+                "com.apple.assertiond.",
+                "com.apple.frontboard.",
+                "com.apple.backboard.",
+                NULL
+            };
+
+            /* Try common service names */
+            const char *all_services[] = {
+                "com.apple.assertiond.applicationstateconnection",
+                "com.apple.assertiond.appwatchdog",
+                "com.apple.assertiond.expiration",
+                "com.apple.assertiond.processassertionconnection",
+                "com.apple.assertiond.processinfoservice",
+                "com.apple.frontboard.systemappservices",
+                "com.apple.frontboard.workspace",
+                NULL
+            };
+
+            mach_port_t bp = get_bootstrap_port();
+            int found = 0;
+            for (int i = 0; all_services[i]; i++) {
+                mach_port_t svc_port = MACH_PORT_NULL;
+                kern_return_t kr = replacement_bootstrap_check_in(bp, all_services[i], &svc_port);
+                if (kr == KERN_SUCCESS && svc_port != MACH_PORT_NULL) {
+                    launch_data_t port_data = launch_data_new_machport(svc_port);
+                    launch_data_dict_insert(mach_services, port_data, all_services[i]);
+                    bfix_log("[bfix] launch_msg CheckIn: %s → port 0x%x\n", all_services[i], svc_port);
+                    found++;
+                }
+            }
+
+            if (found > 0) {
+                launch_data_dict_insert(resp, mach_services, LAUNCH_JOBKEY_MACHSERVICES);
+                bfix_log("[bfix] launch_msg CheckIn: returning %d services\n", found);
+                return resp;
+            }
+
+            /* No services found — fall through to original */
+            launch_data_free(mach_services);
+            launch_data_free(resp);
+            bfix_log("[bfix] launch_msg CheckIn: no services, falling through\n");
+        }
+    }
+
+    /* Pass through to original for non-check-in messages */
+    return launch_msg(msg);
+}
+
 /* Forward declarations for interposition targets */
 extern kern_return_t bootstrap_look_up(mach_port_t, const name_t, mach_port_t *);
 extern kern_return_t bootstrap_check_in(mach_port_t, const name_t, mach_port_t *);
@@ -371,6 +463,7 @@ static const struct {
     { (void *)replacement_bootstrap_check_in,  (void *)bootstrap_check_in },
     { (void *)replacement_bootstrap_register,  (void *)bootstrap_register },
     { (void *)replacement_GSGetPurpleApplicationPort, (void *)GSGetPurpleApplicationPort },
+    { (void *)replacement_launch_msg,          (void *)launch_msg },
 };
 
 /* Find and patch the _user_client_port static variable inside CoreAnimation.
