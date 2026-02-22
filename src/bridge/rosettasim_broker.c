@@ -147,7 +147,13 @@ static void sigchld_handler(int sig) {
             g_backboardd_pid = -1;
             g_shutdown = 1;
         } else {
-            broker_log("[broker] child process (pid %d) terminated\n", pid);
+            if (WIFEXITED(status)) {
+                broker_log("[broker] child process (pid %d) exited with status %d\n", pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                broker_log("[broker] child process (pid %d) killed by signal %d\n", pid, WTERMSIG(status));
+            } else {
+                broker_log("[broker] child process (pid %d) terminated (raw status 0x%x)\n", pid, status);
+            }
         }
     }
 }
@@ -1251,7 +1257,21 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
 
     /* Other non-check-in XPC launchd routines — generic XPC success reply.
      * CRITICAL: never use send_error_reply (MIG format) here. */
-    broker_log("[broker] XPC pipe: non-checkin routine=%llu, sending XPC success reply\n", routine);
+    broker_log("[broker] XPC pipe: non-checkin routine=%llu handle=%llu, sending XPC success reply\n",
+               routine, handle);
+
+    /* Hex dump raw Mach message for unknown routines */
+    {
+        uint8_t *rraw = (uint8_t *)request;
+        uint32_t dump_len = total < 256 ? total : 256;
+        broker_log("[broker] XPC pipe routine=%llu raw msg (%u bytes):\n", routine, total);
+        for (uint32_t d = 0; d < dump_len; d++) {
+            if (d % 16 == 0) broker_log("[broker]   %04x: ", d);
+            broker_log("%02x ", rraw[d]);
+            if (d % 16 == 15 || d == dump_len - 1) broker_log("\n");
+        }
+    }
+
     send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 0);
 }
 

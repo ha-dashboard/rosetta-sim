@@ -707,6 +707,7 @@ static __thread int _abort_guard_active = 0;
  * Returning from abort() is UB but works in practice on x86_64 -
  * the caller's code after `call abort` runs normally.
  */
+
 static int _abort_count = 0;
 
 static void replacement_abort(void) {
@@ -7459,11 +7460,264 @@ static void _rsim_exception_handler(id exception) {
     bridge_log("  (known-safe, continuing)");
 }
 
+/* Global crash signal handler — logs backtrace for SIGSEGV/SIGBUS/SIGABRT */
+#include <execinfo.h>
+static void _crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
+    const char *sig_name = (sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGBUS) ? "SIGBUS" : (sig == SIGABRT) ? "SIGABRT" : "UNKNOWN";
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "\n[RosettaSim] CRASH: signal %d (%s) addr=%p\n",
+                     sig, sig_name, info ? info->si_addr : NULL);
+    if (n > 0) write(STDERR_FILENO, buf, n);
+
+    void *bt[32];
+    int count = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, count, STDERR_FILENO);
+
+    /* Re-raise to get default handler (core dump) */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void _install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = _crash_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+}
+/* ================================================================
+ * NSBundle / Info.plist fallback
+ *
+ * Some apps crash extremely early inside UIKit at:
+ *   -[UIApplication _fetchInfoPlistFlags]
+ *
+ * That method assumes the main bundle's Info.plist dictionary is non-NULL.
+ * On modern macOS while running legacy iOS simulator binaries outside of
+ * launchd/simctl, CoreFoundation sometimes fails to populate it.
+ *
+ * Mitigation: install small NSBundle swizzles (mainBundle/infoDictionary/
+ * objectForInfoDictionaryKey:) and a safety guard around _fetchInfoPlistFlags
+ * so a nil infoDictionary never becomes a hard SIGSEGV.
+ * ================================================================ */
+
+static volatile int g_rsim_bundle_fix_installed = 0;
+static NSBundle     *g_rsim_forced_main_bundle = nil;
+static NSDictionary *g_rsim_forced_main_info = nil;
+static NSString     *g_rsim_forced_bundle_path = nil;
+
+static IMP g_orig_NSBundle_mainBundle = NULL;
+static IMP g_orig_NSBundle_infoDictionary = NULL;
+static IMP g_orig_NSBundle_objectForInfoDictionaryKey = NULL;
+static IMP g_orig_UIApplication_fetchInfoPlistFlags = NULL;
+
+static int rsim_bundle_matches_main(id bundle) {
+    if (!bundle) return 0;
+    if (g_rsim_forced_main_bundle && bundle == g_rsim_forced_main_bundle) return 1;
+    if (g_rsim_forced_bundle_path && [bundle respondsToSelector:sel_registerName("bundlePath")]) {
+        NSString *bp = ((id(*)(id, SEL))objc_msgSend)(bundle, sel_registerName("bundlePath"));
+        if (bp && [bp isEqualToString:g_rsim_forced_bundle_path]) return 1;
+    }
+    if (g_orig_NSBundle_mainBundle) {
+        Class bundleClass = objc_getClass("NSBundle");
+        id origMain = ((id(*)(id, SEL))g_orig_NSBundle_mainBundle)((id)bundleClass,
+                                                                   sel_registerName("mainBundle"));
+        if (origMain && bundle == origMain) return 1;
+    }
+    return 0;
+}
+
+static id rsim_NSBundle_mainBundle(id self, SEL _cmd) {
+    id mb = nil;
+    if (g_orig_NSBundle_mainBundle) {
+        mb = ((id(*)(id, SEL))g_orig_NSBundle_mainBundle)(self, _cmd);
+    }
+    if (mb) return mb;
+    if (g_rsim_forced_main_bundle) return g_rsim_forced_main_bundle;
+    return mb;
+}
+
+static id rsim_NSBundle_infoDictionary(id self, SEL _cmd) {
+    id info = nil;
+    if (g_orig_NSBundle_infoDictionary) {
+        info = ((id(*)(id, SEL))g_orig_NSBundle_infoDictionary)(self, _cmd);
+    }
+    if (info && [info respondsToSelector:sel_registerName("count")]) {
+        unsigned long c = ((unsigned long(*)(id, SEL))objc_msgSend)(info, sel_registerName("count"));
+        if (c > 0) return info;
+    } else if (info) {
+        return info;
+    }
+
+    if (rsim_bundle_matches_main(self) && g_rsim_forced_main_info) {
+        return g_rsim_forced_main_info;
+    }
+    return info;
+}
+
+static id rsim_NSBundle_objectForInfoDictionaryKey(id self, SEL _cmd, id key) {
+    id val = nil;
+    if (g_orig_NSBundle_objectForInfoDictionaryKey) {
+        val = ((id(*)(id, SEL, id))g_orig_NSBundle_objectForInfoDictionaryKey)(self, _cmd, key);
+    }
+    if (val) return val;
+
+    if (rsim_bundle_matches_main(self) && g_rsim_forced_main_info && key) {
+        return ((id(*)(id, SEL, id))objc_msgSend)(g_rsim_forced_main_info,
+                                                  sel_registerName("objectForKey:"), key);
+    }
+    return nil;
+}
+
+static void rsim_UIApplication_fetchInfoPlistFlags(id self, SEL _cmd) {
+    /* Try to ensure main bundle is realized before UIKit reads it */
+    @autoreleasepool {
+        NSBundle *mb = [NSBundle mainBundle];
+        NSDictionary *info = mb ? [mb infoDictionary] : nil;
+        if (!info || [info count] == 0) {
+            bridge_log("UIApplication._fetchInfoPlistFlags: main bundle infoDictionary is nil/empty — skipping to avoid crash");
+            return;
+        }
+    }
+    if (g_orig_UIApplication_fetchInfoPlistFlags) {
+        ((void(*)(id, SEL))g_orig_UIApplication_fetchInfoPlistFlags)(self, _cmd);
+    }
+}
+
+static void rsim_install_bundle_info_fallback(void) {
+    if (!__sync_bool_compare_and_swap(&g_rsim_bundle_fix_installed, 0, 1)) return;
+
+    @autoreleasepool {
+        const char *env_bundle = getenv("NSBundlePath");
+        const char *env_proc = getenv("CFProcessPath");
+
+        NSString *bundlePath = nil;
+        if (env_bundle && env_bundle[0]) {
+            bundlePath = [NSString stringWithUTF8String:env_bundle];
+        } else if (env_proc && env_proc[0]) {
+            NSString *procPath = [NSString stringWithUTF8String:env_proc];
+            if (procPath && [procPath length] > 0) {
+                NSString *dir = [procPath stringByDeletingLastPathComponent];
+                if (dir && [dir hasSuffix:@".app"]) bundlePath = dir;
+            }
+        }
+
+        if (bundlePath && [bundlePath length] > 0) {
+            g_rsim_forced_bundle_path = [bundlePath retain];
+            NSBundle *forced = [NSBundle bundleWithPath:bundlePath];
+            if (forced) g_rsim_forced_main_bundle = [forced retain];
+
+            NSDictionary *info = forced ? [forced infoDictionary] : nil;
+            if (!info || [info count] == 0) {
+                NSString *plistPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *direct = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+                if (direct && [direct count] > 0) {
+                    info = direct;
+                }
+            }
+            if (!info) info = [NSDictionary dictionary];
+            g_rsim_forced_main_info = [info retain];
+        } else {
+            g_rsim_forced_main_info = [[NSDictionary dictionary] retain];
+        }
+
+        Class bundleClass = objc_getClass("NSBundle");
+        if (bundleClass) {
+            /* +[NSBundle mainBundle] */
+            Method mMain = class_getClassMethod(bundleClass, sel_registerName("mainBundle"));
+            if (mMain) {
+                g_orig_NSBundle_mainBundle = method_getImplementation(mMain);
+                method_setImplementation(mMain, (IMP)rsim_NSBundle_mainBundle);
+            }
+            /* -[NSBundle infoDictionary] */
+            Method mInfo = class_getInstanceMethod(bundleClass, sel_registerName("infoDictionary"));
+            if (mInfo) {
+                g_orig_NSBundle_infoDictionary = method_getImplementation(mInfo);
+                method_setImplementation(mInfo, (IMP)rsim_NSBundle_infoDictionary);
+            }
+            /* -[NSBundle objectForInfoDictionaryKey:] */
+            Method mObj = class_getInstanceMethod(bundleClass, sel_registerName("objectForInfoDictionaryKey:"));
+            if (mObj) {
+                g_orig_NSBundle_objectForInfoDictionaryKey = method_getImplementation(mObj);
+                method_setImplementation(mObj, (IMP)rsim_NSBundle_objectForInfoDictionaryKey);
+            }
+        }
+
+        /* Safety swizzle for UIKit's crash site */
+        Class uiAppClass = objc_getClass("UIApplication");
+        if (uiAppClass) {
+            Method mFetch = class_getInstanceMethod(uiAppClass, sel_registerName("_fetchInfoPlistFlags"));
+            if (mFetch) {
+                g_orig_UIApplication_fetchInfoPlistFlags = method_getImplementation(mFetch);
+                method_setImplementation(mFetch, (IMP)rsim_UIApplication_fetchInfoPlistFlags);
+            }
+        }
+
+        bridge_log("  NSBundle fallback installed: NSBundlePath=%s CFProcessPath=%s forcedBundle=%p infoCount=%lu",
+                   env_bundle ? env_bundle : "(null)",
+                   env_proc ? env_proc : "(null)",
+                   (void *)g_rsim_forced_main_bundle,
+                   (unsigned long)(g_rsim_forced_main_info ? [g_rsim_forced_main_info count] : 0));
+    }
+}
+
 __attribute__((constructor))
 static void rosettasim_bridge_init(void) {
+    _install_crash_handler();
     bridge_log("========================================");
     bridge_log("RosettaSim Bridge loaded");
     bridge_log("PID: %d", getpid());
+    /* Install bundle/Info.plist fallback BEFORE UIKit initialization. */
+    rsim_install_bundle_info_fallback();
+
+    /* Diagnostic: check bundle availability before UIKit init */
+    {
+        NSBundle *mb = [NSBundle mainBundle];
+        bridge_log("  mainBundle=%p path=%s", mb, mb ? [[mb bundlePath] UTF8String] : "(nil)");
+        if (mb) {
+            NSDictionary *info = [mb infoDictionary];
+            bridge_log("  infoDictionary=%p count=%lu", info, (unsigned long)[info count]);
+            if (!info || [info count] == 0) {
+                bridge_log("  WARNING: infoDictionary is nil/empty — _fetchInfoPlistFlags will crash");
+                /* Try to load Info.plist from known bundle path */
+                NSString *bundlePath = [NSString stringWithUTF8String:getenv("NSBundlePath") ?: ""];
+                if ([bundlePath length] > 0) {
+                    NSBundle *forced = [NSBundle bundleWithPath:bundlePath];
+                    bridge_log("  Trying forced bundle from NSBundlePath=%s → %p", [bundlePath UTF8String], forced);
+                    if (forced) {
+                        bridge_log("  forced infoDictionary=%p count=%lu",
+                                   [forced infoDictionary], (unsigned long)[[forced infoDictionary] count]);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Swizzle [UIApplication _fetchInfoPlistFlags] to prevent SIGSEGV.
+     * The original calls _xpc_copy_bootstrap() which returns NULL in our
+     * environment (no launchd). The NULL result causes a crash at offset 0x18.
+     * Our replacement is a safe no-op that reads infoDictionary only. */
+    {
+        Class uiAppClass = objc_getClass("UIApplication");
+        if (uiAppClass) {
+            SEL sel = sel_registerName("_fetchInfoPlistFlags");
+            Method m = class_getInstanceMethod(uiAppClass, sel);
+            if (m) {
+                /* Replace with a no-op implementation that just returns.
+                 * The original sets internal flags from Info.plist + XPC bootstrap.
+                 * Without XPC bootstrap, the flags (classic mode, vending) are just 0 = safe defaults. */
+                IMP noopIMP = imp_implementationWithBlock(^(id self_arg) {
+                    /* Safe no-op — all plist flags default to 0/NO */
+                });
+                method_setImplementation(m, noopIMP);
+                bridge_log("  Swizzled [UIApplication _fetchInfoPlistFlags] → safe no-op");
+            } else {
+                bridge_log("  WARNING: _fetchInfoPlistFlags method not found on UIApplication");
+            }
+        }
+    }
 
     /* Configure device profile from env vars (ITEM 15) */
     _configure_device_profile();

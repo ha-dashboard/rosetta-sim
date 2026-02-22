@@ -20,6 +20,7 @@ SDK="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.
 BROKER="$PROJECT_ROOT/src/bridge/rosettasim_broker"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 BRIDGE="$PROJECT_ROOT/src/bridge/rosettasim_bridge.dylib"
+BFIX="$PROJECT_ROOT/src/bridge/bootstrap_fix.dylib"
 HOST_APP="$PROJECT_ROOT/src/host/RosettaSimApp/build/RosettaSim"
 
 # Default app
@@ -32,6 +33,8 @@ APP_FB="/tmp/rosettasim_app_framebuffer"
 echo "========================================"
 echo " RosettaSim — Full Pipeline"
 echo "========================================"
+echo "Ensuring bootstrap_fix.dylib is fresh..."
+bash "$SCRIPT_DIR/build_bootstrap_fix.sh"
 
 for bin in "$BROKER" "$PFB" "$BRIDGE"; do
     if [[ ! -f "$bin" ]]; then
@@ -51,6 +54,7 @@ fi
 echo "SDK:       $SDK"
 echo "App:       $APP_PATH"
 echo "Host App:  $HOST_APP"
+echo "Bootstrap: $BFIX"
 echo "App FB:    $APP_FB"
 echo "========================================"
 echo ""

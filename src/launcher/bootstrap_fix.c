@@ -379,15 +379,30 @@ extern mach_port_t launch_data_get_machport(launch_data_t);
 extern launch_data_t launch_data_new_machport(mach_port_t);
 extern void launch_data_dict_insert(launch_data_t, launch_data_t, const char *);
 extern void launch_data_free(launch_data_t);
+extern launch_data_t launch_data_new_bool(int);
 
 #define LAUNCH_DATA_DICTIONARY 1
-#define LAUNCH_DATA_STRING     2
+#define LAUNCH_DATA_ARRAY      2
+#define LAUNCH_DATA_FD         3
+#define LAUNCH_DATA_INTEGER    4
+#define LAUNCH_DATA_REAL       5
+#define LAUNCH_DATA_BOOL       6
+#define LAUNCH_DATA_STRING     7
+#define LAUNCH_DATA_OPAQUE     8
+#define LAUNCH_DATA_ERRNO      9
 #define LAUNCH_DATA_MACHPORT   10
 
 #define LAUNCH_KEY_CHECKIN     "CheckIn"
+#define LAUNCH_KEY_GETJOBS     "GetJobs"
+#define LAUNCH_JOBKEY_LABEL    "Label"
 #define LAUNCH_JOBKEY_MACHSERVICES "MachServices"
 
 static launch_data_t replacement_launch_msg(launch_data_t msg) {
+    int msg_type = msg ? launch_data_get_type(msg) : -1;
+    const char *prog = getprogname();
+    bfix_log("[bfix] launch_msg enter: type=%d process=%s\n",
+             msg_type, prog ? prog : "unknown");
+
     /* Only intercept check-in requests */
     if (msg && launch_data_get_type(msg) == LAUNCH_DATA_STRING) {
         const char *cmd = launch_data_get_string(msg);
@@ -457,9 +472,106 @@ static launch_data_t replacement_launch_msg(launch_data_t msg) {
             launch_data_free(resp);
             bfix_log("[bfix] launch_msg CheckIn: no services found, falling through\n");
         }
+
+        /* Handle GetJobs — assertiond calls this to get its job dictionary.
+         * Without a proper response, assertiond logs "Error getting job
+         * dictionaries. Error: Input/output error (5)". */
+        if (cmd && strcmp(cmd, LAUNCH_KEY_GETJOBS) == 0) {
+            const char *progname = getprogname();
+            bfix_log("[bfix] launch_msg('GetJobs') intercepted (process: %s)\n",
+                     progname ? progname : "unknown");
+
+            static const char *assertiond_services[] = {
+                "com.apple.assertiond.applicationstateconnection",
+                "com.apple.assertiond.appwatchdog",
+                "com.apple.assertiond.expiration",
+                "com.apple.assertiond.processassertionconnection",
+                "com.apple.assertiond.processinfoservice",
+                NULL
+            };
+
+            const char *job_label = NULL;
+            const char **svc_list = NULL;
+            if (progname && strstr(progname, "assertiond")) {
+                job_label = "com.apple.assertiond";
+                svc_list = assertiond_services;
+            }
+
+            if (job_label && svc_list) {
+                /* Build: { job_label → { Label → job_label, MachServices → { svc → true } } } */
+                launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+                launch_data_t job_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+                launch_data_t ms_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+
+                int count = 0;
+                for (int i = 0; svc_list[i]; i++) {
+                    launch_data_dict_insert(ms_dict, launch_data_new_bool(1), svc_list[i]);
+                    count++;
+                }
+
+                launch_data_dict_insert(job_dict, launch_data_new_string(job_label), LAUNCH_JOBKEY_LABEL);
+                launch_data_dict_insert(job_dict, ms_dict, LAUNCH_JOBKEY_MACHSERVICES);
+                launch_data_dict_insert(resp, job_dict, job_label);
+
+                bfix_log("[bfix] launch_msg GetJobs: returning %d MachServices for %s\n",
+                         count, job_label);
+                return resp;
+            }
+
+            bfix_log("[bfix] launch_msg GetJobs: no job data for '%s', falling through\n",
+                     progname ? progname : "unknown");
+        }
     }
 
-    /* Pass through to original for non-check-in messages */
+    /* Handle DICTIONARY form of GetJobs: { LAUNCH_KEY_GETJOBS → ... } */
+    if (msg && launch_data_get_type(msg) == LAUNCH_DATA_DICTIONARY) {
+        if (launch_data_dict_lookup(msg, LAUNCH_KEY_GETJOBS) != NULL) {
+            const char *progname = getprogname();
+            bfix_log("[bfix] launch_msg(dict GetJobs) intercepted (process: %s)\n",
+                     progname ? progname : "unknown");
+
+            static const char *assertiond_services_d[] = {
+                "com.apple.assertiond.applicationstateconnection",
+                "com.apple.assertiond.appwatchdog",
+                "com.apple.assertiond.expiration",
+                "com.apple.assertiond.processassertionconnection",
+                "com.apple.assertiond.processinfoservice",
+                NULL
+            };
+
+            const char *job_label = NULL;
+            const char **svc_list = NULL;
+            if (progname && strstr(progname, "assertiond")) {
+                job_label = "com.apple.assertiond";
+                svc_list = assertiond_services_d;
+            }
+
+            if (job_label && svc_list) {
+                launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+                launch_data_t job_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+                launch_data_t ms_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+
+                int count = 0;
+                for (int i = 0; svc_list[i]; i++) {
+                    launch_data_dict_insert(ms_dict, launch_data_new_bool(1), svc_list[i]);
+                    count++;
+                }
+
+                launch_data_dict_insert(job_dict, launch_data_new_string(job_label), LAUNCH_JOBKEY_LABEL);
+                launch_data_dict_insert(job_dict, ms_dict, LAUNCH_JOBKEY_MACHSERVICES);
+                launch_data_dict_insert(resp, job_dict, job_label);
+
+                bfix_log("[bfix] launch_msg dict GetJobs: returning %d MachServices for %s\n",
+                         count, job_label);
+                return resp;
+            }
+
+            bfix_log("[bfix] launch_msg dict GetJobs: no job data for '%s', falling through\n",
+                     progname ? progname : "unknown");
+        }
+    }
+
+    /* Pass through to original for unhandled messages */
     return launch_msg(msg);
 }
 
@@ -736,9 +848,87 @@ typedef void (*dispatch_mach_connect_fn)(void *channel, mach_port_t port1,
                                           mach_port_t port2, void *msg);
 static dispatch_mach_connect_fn g_dispatch_mach_connect = NULL;
 
+/* dispatch_mach_msg types */
+typedef void *dispatch_mach_msg_t;
+extern dispatch_mach_msg_t dispatch_mach_msg_create(void *header,
+    size_t size, void *destructor, mach_msg_header_t **msg_ptr);
+#define BFIX_PORT_NAME_SLOTS 128
+typedef struct {
+    mach_port_t port;
+    char name[128];
+} bfix_port_name_entry_t;
+static bfix_port_name_entry_t g_bfix_port_names[BFIX_PORT_NAME_SLOTS];
+
+static void bfix_remember_port_name(mach_port_t port, const char *name) {
+    if (!name || !name[0] || port == MACH_PORT_NULL) return;
+    for (int i = 0; i < BFIX_PORT_NAME_SLOTS; i++) {
+        if (g_bfix_port_names[i].port == port) {
+            strncpy(g_bfix_port_names[i].name, name, sizeof(g_bfix_port_names[i].name) - 1);
+            g_bfix_port_names[i].name[sizeof(g_bfix_port_names[i].name) - 1] = '\0';
+            return;
+        }
+    }
+    for (int i = 0; i < BFIX_PORT_NAME_SLOTS; i++) {
+        if (g_bfix_port_names[i].port == MACH_PORT_NULL) {
+            g_bfix_port_names[i].port = port;
+            strncpy(g_bfix_port_names[i].name, name, sizeof(g_bfix_port_names[i].name) - 1);
+            g_bfix_port_names[i].name[sizeof(g_bfix_port_names[i].name) - 1] = '\0';
+            return;
+        }
+    }
+}
+
+static const char *bfix_lookup_port_name(mach_port_t port) {
+    if (port == MACH_PORT_NULL) return NULL;
+    for (int i = 0; i < BFIX_PORT_NAME_SLOTS; i++) {
+        if (g_bfix_port_names[i].port == port && g_bfix_port_names[i].name[0]) {
+            return g_bfix_port_names[i].name;
+        }
+    }
+    return NULL;
+}
+
 static void replacement_xpc_connection_check_in(void *conn) {
     uint8_t *obj = (uint8_t *)conn;
     int is_listener = (obj[0xd9] & 0x2) != 0;
+    mach_port_t port1_hint = *(mach_port_t *)(obj + 0x34);
+
+    /* Try to identify service name from connection object for logging.
+     * XPC connection name is typically a pointer at offset +0x70 or +0x78. */
+    const char *conn_name = NULL;
+    {
+        void *name_ptr = *(void **)(obj + 0x70);
+        if (name_ptr && (uintptr_t)name_ptr > 0x1000 && (uintptr_t)name_ptr < 0x7fffffffffff) {
+            const char *try_name = (const char *)name_ptr;
+            if (try_name[0] == 'c' && try_name[1] == 'o' && try_name[2] == 'm')
+                conn_name = try_name;
+        }
+        if (!conn_name) {
+            name_ptr = *(void **)(obj + 0x78);
+            if (name_ptr && (uintptr_t)name_ptr > 0x1000 && (uintptr_t)name_ptr < 0x7fffffffffff) {
+                const char *try_name = (const char *)name_ptr;
+                if (try_name[0] == 'c' && try_name[1] == 'o' && try_name[2] == 'm')
+                    conn_name = try_name;
+            }
+        }
+    }
+    if (!conn_name) {
+        conn_name = bfix_lookup_port_name(port1_hint);
+    }
+    int is_assertiond = (conn_name && strncmp(conn_name, "com.apple.assertiond.", 21) == 0);
+
+    if (is_assertiond) {
+        bfix_log("[bfix] CHECK_IN ASSERTIOND '%s' conn=%p listener=%d\n",
+                 conn_name, conn, is_listener);
+        bfix_log("[bfix]   state=0x%x port1=0x%x port2=0x%x send=0x%x channel=%p flags_d8=0x%x flags_d9=0x%x\n",
+                 *(uint32_t *)(obj + 0x28),
+                 *(mach_port_t *)(obj + 0x34),
+                 *(mach_port_t *)(obj + 0x3c),
+                 *(mach_port_t *)(obj + 0x38),
+                 *(void **)(obj + 0x58),
+                 (unsigned)*(uint8_t *)(obj + 0xd8),
+                 (unsigned)*(uint8_t *)(obj + 0xd9));
+    }
 
     /* Set state to 6 (success) */
     *(uint32_t *)(obj + 0x28) = 6;
@@ -747,24 +937,127 @@ static void replacement_xpc_connection_check_in(void *conn) {
     void *channel = *(void **)(obj + 0x58);
     mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
     mach_port_t port2 = *(mach_port_t *)(obj + 0x3c);
+    mach_port_t send_right = *(mach_port_t *)(obj + 0x38);
 
-    /* Resolve dispatch_mach_connect on first call */
+    /* If send_right is 0 (not populated by _xpc_look_up_endpoint), use the
+     * bootstrap port as the registration target. The broker will receive and
+     * handle the listener registration message. */
+    if (send_right == MACH_PORT_NULL) {
+        send_right = get_bootstrap_port();
+        *(mach_port_t *)(obj + 0x38) = send_right;
+        if (is_assertiond)
+            bfix_log("[bfix]   ASSERTIOND send_right was NULL, set to broker 0x%x\n", send_right);
+    }
+
     if (!g_dispatch_mach_connect) {
         g_dispatch_mach_connect = (dispatch_mach_connect_fn)
             dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
     }
 
-    if (g_dispatch_mach_connect && channel) {
-        /* Call dispatch_mach_connect WITHOUT the registration message.
-         * For non-listener: same as original code.
-         * For listener: skips the 52-byte Mach message to launchd.
-         * This works because our broker handles service routing directly
-         * via bootstrap_look_up — no launchd registration needed. */
-        g_dispatch_mach_connect(channel, port1, port2, NULL);
+    if (!g_dispatch_mach_connect || !channel) {
+        if (is_assertiond)
+            bfix_log("[bfix]   ASSERTIOND ABORT: dispatch_mach_connect=%p channel=%p\n",
+                     g_dispatch_mach_connect, channel);
+        return;
     }
 
-    bfix_log("[bfix] _xpc_connection_check_in: %s state=6 channel=%p port1=0x%x port2=0x%x\n",
-             is_listener ? "LISTENER" : "CLIENT", channel, port1, port2);
+    if (!is_listener) {
+        /* CLIENT: same as original — no registration message */
+        g_dispatch_mach_connect(channel, port1, port2, NULL);
+        bfix_log("[bfix] _xpc_connection_check_in: CLIENT channel=%p port1=0x%x\n",
+                 channel, port1);
+    } else {
+        /* LISTENER: build the 52-byte registration message.
+         * Format from libxpc disassembly:
+         *   header: msgh_bits=0x80000013 (COMPLEX|MAKE_SEND+COPY_SEND)
+         *           msgh_size=0x34 (52)
+         *           msgh_remote_port=[obj+0x38] (send_right to launchd/broker)
+         *           msgh_local_port=0, msgh_voucher_port=0
+         *           msgh_id=0x77303074 (extracted from literal pool)
+         *   body:   descriptor_count=2
+         *   desc0:  port=[obj+0x34] (recv_right), disposition=MAKE_SEND (0x14)
+         *   desc1:  port=[obj+0x3c] (extra_port), disposition=COPY_SEND (0x10) */
+
+        /* Step 1: Set up port notification (MACH_NOTIFY_PORT_DESTROYED).
+         * The original code calls _xpc_mach_port_setup_port_destroyed(port2, port1, &result)
+         * BEFORE dispatch_mach_connect. Without this, the dispatch_mach system
+         * cannot properly monitor the listener port. */
+        {
+            typedef int (*setup_port_destroyed_fn)(mach_port_t, mach_port_t, int *);
+            static setup_port_destroyed_fn g_setup_fn = NULL;
+            if (!g_setup_fn) {
+                g_setup_fn = (setup_port_destroyed_fn)
+                    dlsym(RTLD_DEFAULT, "_xpc_mach_port_setup_port_destroyed");
+                /* Private symbol — try Mach-O walking */
+                if (!g_setup_fn)
+                    g_setup_fn = (setup_port_destroyed_fn)
+                        find_original_function("_xpc_mach_port_setup_port_destroyed");
+            }
+            if (g_setup_fn) {
+                int result = 0;
+                int kr_setup = g_setup_fn(port2, port1, &result);
+                if (is_assertiond)
+                    bfix_log("[bfix]   ASSERTIOND port_destroyed_setup(port2=0x%x, port1=0x%x) → %d result=%d\n",
+                             port2, port1, kr_setup, result);
+                else
+                    bfix_log("[bfix] _xpc_mach_port_setup_port_destroyed(%x,%x) = %d\n",
+                             port2, port1, kr_setup);
+            }
+        }
+
+        /* Step 2: Set flag 0x40 at offset 0xd8 (original sets this before connect) */
+        {
+            uint16_t flags_d8 = *(uint16_t *)(obj + 0xd8);
+            flags_d8 |= 0x40;
+            *(uint16_t *)(obj + 0xd8) = flags_d8;
+        }
+
+        /* Step 3: Build 52-byte registration message and connect */
+        mach_msg_header_t *msg_ptr = NULL;
+        dispatch_mach_msg_t dmsg = dispatch_mach_msg_create(NULL, 0x34, NULL, &msg_ptr);
+        if (dmsg && msg_ptr) {
+            uint8_t *m = (uint8_t *)msg_ptr;
+            *(uint32_t *)(m + 0x00) = 0x80000013; /* msgh_bits */
+            *(uint32_t *)(m + 0x04) = 0x34;       /* msgh_size */
+            *(uint32_t *)(m + 0x08) = send_right;  /* msgh_remote_port */
+            *(uint32_t *)(m + 0x0c) = 0;           /* msgh_local_port */
+            *(uint32_t *)(m + 0x10) = 0;           /* msgh_voucher_port */
+            *(uint32_t *)(m + 0x14) = 0x77303074;  /* msgh_id */
+            *(uint32_t *)(m + 0x18) = 2;           /* descriptor_count */
+            /* desc0: port1 → MAKE_SEND */
+            *(uint32_t *)(m + 0x1c) = port1;
+            *(uint32_t *)(m + 0x20) = 0;
+            *(uint16_t *)(m + 0x24) = 0;
+            *(uint8_t *)(m + 0x26) = 0x14;
+            *(uint8_t *)(m + 0x27) = 0x00;
+            /* desc1: port2 → COPY_SEND */
+            *(uint32_t *)(m + 0x28) = port2;
+            *(uint32_t *)(m + 0x2c) = 0;
+            *(uint16_t *)(m + 0x30) = 0;
+            *(uint8_t *)(m + 0x32) = 0x10;
+            *(uint8_t *)(m + 0x33) = 0x00;
+
+            if (is_assertiond)
+                bfix_log("[bfix]   ASSERTIOND pre-connect: channel=%p port1=0x%x port2=0x%x send=0x%x dmsg=%p\n",
+                         channel, port1, port2, send_right, dmsg);
+            g_dispatch_mach_connect(channel, port1, port2, dmsg);
+            if (is_assertiond)
+                bfix_log("[bfix]   ASSERTIOND post-connect: '%s' DONE\n", conn_name ? conn_name : "?");
+            else
+                bfix_log("[bfix] _xpc_connection_check_in: LISTENER channel=%p port1=0x%x send=0x%x\n",
+                         channel, port1, send_right);
+        } else {
+            if (is_assertiond)
+                bfix_log("[bfix]   ASSERTIOND LISTENER no-msg fallback: channel=%p port1=0x%x\n",
+                         channel, port1);
+            g_dispatch_mach_connect(channel, port1, port2, NULL);
+            if (is_assertiond)
+                bfix_log("[bfix]   ASSERTIOND post-connect (no-msg): '%s' DONE\n", conn_name ? conn_name : "?");
+            else
+                bfix_log("[bfix] _xpc_connection_check_in: LISTENER (no msg) channel=%p port1=0x%x\n",
+                         channel, port1);
+        }
+    }
 }
 
 /* Replacement for xpc_connection_send_message_with_reply_sync.
@@ -835,16 +1128,30 @@ static mach_port_t replacement_xpc_look_up_endpoint(
     mach_port_t port = MACH_PORT_NULL;
     mach_port_t bp = get_bootstrap_port();
 
-    bfix_log("[bfix] _xpc_look_up_endpoint('%s', type=%d)\n",
-             name ? name : "(null)", type);
+    int is_assertiond = (name && strncmp(name, "com.apple.assertiond.", 21) == 0);
+    if (is_assertiond) {
+        bfix_log("[bfix] _xpc_look_up_endpoint ASSERTIOND '%s' type=%d handle=%llu bp=0x%x\n",
+                 name, type, handle, bp);
+    } else {
+        bfix_log("[bfix] _xpc_look_up_endpoint('%s', type=%d)\n",
+                 name ? name : "(null)", type);
+    }
 
     if (!name || bp == MACH_PORT_NULL) return MACH_PORT_NULL;
 
     if (type == 7) {
         /* LISTENER check-in: get receive right from broker */
         kern_return_t kr = replacement_bootstrap_check_in(bp, name, &port);
-        bfix_log("[bfix] _xpc_look_up_endpoint LISTENER '%s': port=0x%x (kr=%d)\n",
-                 name, port, kr);
+        if (kr == KERN_SUCCESS && port != MACH_PORT_NULL) {
+            bfix_remember_port_name(port, name);
+        }
+        if (is_assertiond) {
+            bfix_log("[bfix] _xpc_look_up_endpoint ASSERTIOND LISTENER '%s': port=0x%x kr=%d\n",
+                     name, port, kr);
+        } else {
+            bfix_log("[bfix] _xpc_look_up_endpoint LISTENER '%s': port=0x%x (kr=%d)\n",
+                     name, port, kr);
+        }
     } else {
         /* CLIENT look-up: get send right from broker */
         kern_return_t kr = replacement_bootstrap_look_up(bp, name, &port);
@@ -889,10 +1196,15 @@ static void patch_bootstrap_functions(void) {
          * _xpc_look_up_endpoint would send an XPC pipe message to launchd
          * and parse the response. We replace it with direct broker calls. */
         { "_xpc_look_up_endpoint", (void *)replacement_xpc_look_up_endpoint },
-        /* Bypass the launchd registration in _xpc_connection_check_in */
+        /* Listener registration: builds proper 52-byte registration message
+         * for dispatch_mach_connect (required for LISTENER mode to work). */
         { "_xpc_connection_check_in", (void *)replacement_xpc_connection_check_in },
-        /* Timeout for synchronous XPC sends to unresponsive services */
-        { "xpc_connection_send_message_with_reply_sync", (void *)replacement_xpc_send_sync },
+        /* NOTE: xpc_connection_send_message_with_reply_sync timeout REMOVED.
+         * It caused backboardd to crash when MobileGestalt returned NULL.
+         * The proper fix is implementing the MobileGestalt service (Service #2). */
+        /* NOTE: launch_msg runtime trampoline REMOVED — causes infinite recursion
+         * because fallthrough calls the patched function. DYLD interposition handles
+         * cross-library calls; intra-library calls need saved-original approach. */
     };
     int n_patches = sizeof(patches) / sizeof(patches[0]);
 

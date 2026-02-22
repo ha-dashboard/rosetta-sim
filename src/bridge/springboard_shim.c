@@ -59,6 +59,15 @@ static int g_init_done = 0;
  * calls through the symbol table, including calls from within our dylib. */
 typedef xpc_connection_t (*xpc_create_mach_service_fn)(const char *, dispatch_queue_t, uint64_t);
 static xpc_create_mach_service_fn g_real_xpc_create_mach_service = NULL;
+typedef void (*xpc_connection_resume_fn)(xpc_connection_t);
+static xpc_connection_resume_fn g_real_xpc_connection_resume = NULL;
+#define SB_CONN_TRACK_SLOTS 32
+typedef struct {
+    xpc_connection_t conn;
+    char name[128];
+} sb_conn_track_t;
+static sb_conn_track_t g_sb_conn_track[SB_CONN_TRACK_SLOTS];
+
 
 static void sb_log(const char *fmt, ...) {
     char buf[512];
@@ -73,6 +82,62 @@ static void sb_log(const char *fmt, ...) {
     }
 }
 
+
+/* Logging-only helper to inspect key xpc_connection object fields
+ * from libxpc disassembly offsets used in bootstrap_fix.c. */
+static void sb_log_listener_fields(const char *name, xpc_connection_t conn) {
+    if (!name || !conn) return;
+    if (strncmp(name, "com.apple.assertiond.", 21) != 0) return;
+    uint8_t *obj = (uint8_t *)conn;
+    sb_log("  ASSERTIOND conn '%s': ptr=%p state=0x%x port1=0x%x send=0x%x port2=0x%x channel=%p flags_d8=0x%x flags_d9=0x%x",
+           name, conn,
+           *(uint32_t *)(obj + 0x28),
+           *(mach_port_t *)(obj + 0x34),
+           *(mach_port_t *)(obj + 0x38),
+           *(mach_port_t *)(obj + 0x3c),
+           *(void **)(obj + 0x58),
+           (unsigned)*(uint8_t *)(obj + 0xd8),
+           (unsigned)*(uint8_t *)(obj + 0xd9));
+}
+static void sb_track_assertiond_conn(const char *name, xpc_connection_t conn) {
+    if (!name || !conn) return;
+    if (strncmp(name, "com.apple.assertiond.", 21) != 0) return;
+    for (int i = 0; i < SB_CONN_TRACK_SLOTS; i++) {
+        if (g_sb_conn_track[i].conn == conn || g_sb_conn_track[i].conn == NULL) {
+            g_sb_conn_track[i].conn = conn;
+            strncpy(g_sb_conn_track[i].name, name, sizeof(g_sb_conn_track[i].name) - 1);
+            g_sb_conn_track[i].name[sizeof(g_sb_conn_track[i].name) - 1] = '\0';
+            return;
+        }
+    }
+}
+static const char *sb_lookup_assertiond_conn(xpc_connection_t conn) {
+    if (!conn) return NULL;
+    for (int i = 0; i < SB_CONN_TRACK_SLOTS; i++) {
+        if (g_sb_conn_track[i].conn == conn) return g_sb_conn_track[i].name;
+    }
+    return NULL;
+}
+static void replacement_xpc_connection_resume(xpc_connection_t connection) {
+    if (!g_real_xpc_connection_resume) {
+        g_real_xpc_connection_resume = (xpc_connection_resume_fn)
+            dlsym(RTLD_NEXT, "xpc_connection_resume");
+    }
+    const char *name = sb_lookup_assertiond_conn(connection);
+    if (name) {
+        sb_log("xpc_connection_resume ASSERTIOND '%s' conn=%p", name, connection);
+        sb_log_listener_fields(name, connection);
+    }
+    if (g_real_xpc_connection_resume) {
+        g_real_xpc_connection_resume(connection);
+    } else {
+        xpc_connection_resume(connection);
+    }
+    if (name) {
+        sb_log("xpc_connection_resume ASSERTIOND DONE '%s' conn=%p", name, connection);
+        sb_log_listener_fields(name, connection);
+    }
+}
 static void init_broker_port(void) {
     if (g_init_done) return;
     g_init_done = 1;
@@ -341,37 +406,20 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
     }
 
     if (flags & XPC_CONNECTION_MACH_SERVICE_LISTENER) {
-        /* === LISTENER MODE ===
-         * With bootstrap_fix.dylib's binary patches in place, the real
-         * xpc_connection_create_mach_service works because its internal
-         * bootstrap_check_in and launch_msg calls are properly routed
-         * through our broker. Just call the real function. */
-        sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
+        /* === LISTENER MODE === */
 
+        /* Call real function — bootstrap_fix trampolines handle routing */
+        sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
         if (g_real_xpc_create_mach_service) {
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
-            if (conn) {
-                sb_log("  real LISTENER '%s' → %p (OK)", name, conn);
-                return conn;
-            }
-            sb_log("  real LISTENER '%s' → NULL, trying fallback", name);
+            sb_log("  real LISTENER '%s' → %p", name, conn);
+            sb_log_listener_fields(name, conn);
+            sb_track_assertiond_conn(name, conn);
+            return conn;
         }
 
-        /* Fallback: do bootstrap_check_in manually and create listener.
-         * This is needed if the real function fails (e.g., XPC pipe protocol
-         * isn't fully implemented in the broker yet). */
-        {
-            mach_port_t svc_port = MACH_PORT_NULL;
-            kern_return_t bkr = bootstrap_check_in(bootstrap_port, name, &svc_port);
-            sb_log("  fallback check_in '%s': kr=%d port=0x%x", name, bkr, svc_port);
-            if (bkr == KERN_SUCCESS && svc_port != MACH_PORT_NULL) {
-                sb_log("  fallback: got receive right for '%s' (port 0x%x)", name, svc_port);
-            }
-        }
-
-        xpc_connection_t listener = xpc_connection_create_listener(name, targetq);
-        sb_log("  fallback listener for '%s': %p", name, listener);
-        return listener;
+        sb_log("  LISTENER '%s': no real function available", name);
+        return NULL;
 
     } else {
         /* === CLIENT MODE === */
@@ -424,6 +472,8 @@ __attribute__((section("__DATA,__interpose"))) = {
       (const void *)bootstrap_register },
     { (const void *)replacement_xpc_connection_create_mach_service,
       (const void *)xpc_connection_create_mach_service },
+    { (const void *)replacement_xpc_connection_resume,
+      (const void *)xpc_connection_resume },
 };
 
 /* Constructor — runs before SpringBoard's main */
