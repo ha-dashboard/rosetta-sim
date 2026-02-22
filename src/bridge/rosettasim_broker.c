@@ -986,8 +986,9 @@ int main(int argc, char *argv[]) {
      * XPC listener may fail if the port doesn't exist yet. */
     {
         const char *precreate_services[] = {
-            /* XPC simulator launchd rendezvous — required by libxpc */
-            "com.apple.xpc.sim.launchd.rendezvous",
+            /* NOTE: com.apple.xpc.sim.launchd.rendezvous is NOT pre-created here.
+             * It's handled specially — the broker keeps the receive right and
+             * listens on it for launch_msg check-in requests. See below. */
             /* assertiond */
             "com.apple.assertiond.applicationstateconnection",
             "com.apple.assertiond.appwatchdog",
@@ -1010,6 +1011,26 @@ int main(int argc, char *argv[]) {
                 broker_log("[broker] pre-created service: %s (port 0x%x)\n",
                            precreate_services[i], svc_port);
             }
+        }
+    }
+
+    /* Create the XPC simulator launchd rendezvous port.
+     * This is the port that libxpc's _launch_msg2 connects to when
+     * XPC_SIMULATOR_LAUNCHD_NAME is set. The broker KEEPS the receive right
+     * and adds it to the broker's port set for message handling.
+     * Daemons look it up via bootstrap_look_up to get a send right. */
+    {
+        mach_port_t rdv_port = MACH_PORT_NULL;
+        kern_return_t kr2 = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rdv_port);
+        if (kr2 == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self(), rdv_port, rdv_port, MACH_MSG_TYPE_MAKE_SEND);
+            register_service("com.apple.xpc.sim.launchd.rendezvous", rdv_port);
+            /* Add to broker's port set so we receive messages on it.
+             * Messages to this port are launch_msg check-in requests. */
+            /* TODO: Add to port set and implement launch_msg protocol handler.
+             * For now, the service is registered so look_up works. The actual
+             * launch_msg messages will arrive but won't be handled yet. */
+            broker_log("[broker] rendezvous port created: 0x%x (for XPC_SIMULATOR_LAUNCHD_NAME)\n", rdv_port);
         }
     }
 
