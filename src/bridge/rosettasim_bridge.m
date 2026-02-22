@@ -7337,15 +7337,8 @@ static void rosettasim_bridge_init(void) {
                                                  "com.apple.CARenderServer", &ca_port);
         if (ca_kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
             g_ca_server_port = ca_port;
-            /* Only mark as "connected" (GPU mode) when ROSETTASIM_CA_MODE=server.
-             * Default is LOCAL/CPU mode for reliable rendering. */
-            const char *cm = getenv("ROSETTASIM_CA_MODE");
-            if (cm && strcmp(cm, "server") == 0) {
-                g_ca_server_connected = 1;
-                bridge_log("  CARenderServer found: port=0x%x (GPU mode)", ca_port);
-            } else {
-                bridge_log("  CARenderServer found: port=0x%x (CPU mode — set ROSETTASIM_CA_MODE=server for GPU)", ca_port);
-            }
+            g_ca_server_connected = 1;
+            bridge_log("  CARenderServer found via bootstrap: port=0x%x", ca_port);
 
             /* Trigger connect_remote BEFORE UIKit creates any windows.
              * Creating a remoteContextWithOptions triggers CoreAnimation's
@@ -7394,37 +7387,9 @@ static void rosettasim_bridge_init(void) {
     /* Swizzle BackBoardServices methods that crash without backboardd */
     swizzle_bks_methods();
 
-    /* Override +[UIApplication rendersLocally] to return YES.
-     * This forces UIKit's _createContextAttached: to use LOCAL CAContext
-     * instead of REMOTE. LOCAL contexts work with our CPU renderInContext
-     * path. The REMOTE path (connect_remote → CARenderServer) is proven
-     * to connect but the server-side compositing doesn't show static content.
-     * Use LOCAL until GPU compositing is fully debugged.
-     *
-     * When ROSETTASIM_CA_MODE=server, skip this override to use REMOTE. */
-    {
-        const char *ca_mode = getenv("ROSETTASIM_CA_MODE");
-        if (!ca_mode || strcmp(ca_mode, "server") != 0) {
-            Class uiAppClass = objc_getClass("UIApplication");
-            if (uiAppClass) {
-                SEL sel = sel_registerName("rendersLocally");
-                /* Replace the class method implementation */
-                Method m = class_getClassMethod(uiAppClass, sel);
-                if (m) {
-                    /* New implementation: return YES */
-                    IMP newImp = imp_implementationWithBlock(^BOOL(id _self) {
-                        return YES;
-                    });
-                    method_setImplementation(m, newImp);
-                    bridge_log("Swizzled +[UIApplication rendersLocally] → YES (LOCAL context mode)");
-                } else {
-                    bridge_log("WARNING: +[UIApplication rendersLocally] not found");
-                }
-            }
-        } else {
-            bridge_log("ROSETTASIM_CA_MODE=server — using REMOTE context (GPU compositing)");
-        }
-    }
+    /* rendersLocally override REMOVED — using REMOTE context (GPU compositing).
+     * UIKit's +[UIApplication rendersLocally] returns NO by default,
+     * which makes _createContextAttached: use the REMOTE context path. */
 
     /* Register NSURLProtocol bypass — routes HTTP requests through BSD sockets
      * instead of CFNetwork, which requires configd_sim. */
