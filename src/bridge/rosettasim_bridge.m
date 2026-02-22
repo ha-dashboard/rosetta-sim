@@ -5693,7 +5693,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             bridge_log("Display Pipeline: __CASRegisterClient not found");
                                         }
                                     }
-                                    if (0 && g_ca_server_port != MACH_PORT_NULL) { /* disabled manual msg */
+                                    if (g_ca_server_port != MACH_PORT_NULL) { /* manual RegisterClient */
                                         #pragma pack(4)
                                         struct {
                                             mach_msg_header_t header;     /* 24 bytes */
@@ -5702,13 +5702,11 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             NDR_record_t ndr;             /*  8 bytes */
                                             uint32_t priority;            /*  4 bytes */
                                         } req;
+                                        /* Reply buffer — oversized to handle complex replies
+                                         * with port descriptors and unknown fields */
                                         struct {
                                             mach_msg_header_t header;
-                                            NDR_record_t ndr;
-                                            kern_return_t retcode;
-                                            uint32_t server_port_out;
-                                            uint32_t context_id_out;
-                                            uint32_t fence_port_out;
+                                            char payload[512]; /* generous buffer */
                                         } reply;
                                         #pragma pack()
 
@@ -5743,21 +5741,48 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
 
                                         bridge_log("Display Pipeline: Sending RegisterClient (msg_id=40202) to port %u", g_ca_server_port);
 
-                                        /* First just send, to check if the message format is accepted */
+                                        /* Send RegisterClient. Try receive with retries for RCV_INTERRUPTED. */
                                         kern_return_t kr = mach_msg(&req.header,
-                                            MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
-                                            sizeof(req), sizeof(reply),
-                                            replyPort, 2000, /* 2s timeout */
+                                            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                            sizeof(req), 0,
+                                            MACH_PORT_NULL, 3000,
                                             MACH_PORT_NULL);
+                                        bridge_log("Display Pipeline: RegisterClient send: kr=%d (0x%x)", kr, kr);
+                                        if (kr == KERN_SUCCESS) {
+                                            /* Receive reply with retries for MACH_RCV_INTERRUPTED */
+                                            for (int retry = 0; retry < 5; retry++) {
+                                                memset(&reply, 0, sizeof(reply));
+                                                kr = mach_msg(&reply.header,
+                                                    MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                                    0, sizeof(reply),
+                                                    replyPort, 3000,
+                                                    MACH_PORT_NULL);
+                                                if (kr != 0x10004004) break; /* not INTERRUPTED */
+                                                bridge_log("Display Pipeline: RegisterClient recv interrupted, retrying...");
+                                            }
+                                        }
 
                                         if (kr == KERN_SUCCESS) {
-                                            bridge_log("Display Pipeline: RegisterClient reply: retcode=%d server_port=%u context_id=%u fence=%u",
-                                                       reply.retcode, reply.server_port_out,
-                                                       reply.context_id_out, reply.fence_port_out);
-                                            if (reply.retcode == 0 && reply.context_id_out != 0) {
-                                                bridge_log("Display Pipeline: CLIENT REGISTERED with context ID %u",
-                                                           reply.context_id_out);
+                                            /* Dump reply for analysis */
+                                            bridge_log("Display Pipeline: RegisterClient reply received! "
+                                                       "size=%u id=%d complex=%s",
+                                                       reply.header.msgh_size,
+                                                       reply.header.msgh_id,
+                                                       (reply.header.msgh_bits & MACH_MSGH_BITS_COMPLEX) ? "YES" : "NO");
+                                            /* Hex dump first 64 bytes of payload */
+                                            {
+                                                char hex[256] = {0};
+                                                int hlen = 0;
+                                                uint32_t dumplen = reply.header.msgh_size > 24 ?
+                                                    reply.header.msgh_size - 24 : 0;
+                                                if (dumplen > 80) dumplen = 80;
+                                                for (uint32_t i = 0; i < dumplen; i++) {
+                                                    hlen += snprintf(hex + hlen, sizeof(hex) - hlen,
+                                                                     "%02x ", (unsigned char)reply.payload[i]);
+                                                }
+                                                bridge_log("Display Pipeline: reply payload: %s", hex);
                                             }
+                                            bridge_log("Display Pipeline: CLIENT REGISTERED successfully");
                                         } else {
                                             bridge_log("Display Pipeline: RegisterClient mach_msg failed: kr=%d (0x%x)",
                                                        kr, kr);
