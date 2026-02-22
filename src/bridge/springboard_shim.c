@@ -344,6 +344,25 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
         /* === LISTENER MODE === */
         sb_log("xpc_create_mach_service LISTENER '%s'", name);
 
+        /* With bootstrap_fix.dylib handling bootstrap_check_in → broker,
+         * we can do check_in ourselves and then create the listener.
+         * The check_in gets the pre-created receive right from the broker.
+         * Then xpc_connection_create_listener creates the XPC endpoint. */
+        {
+            mach_port_t svc_port = MACH_PORT_NULL;
+            kern_return_t bkr = bootstrap_check_in(bootstrap_port, name, &svc_port);
+            sb_log("  LISTENER '%s' bootstrap_check_in: kr=%d port=0x%x", name, bkr, svc_port);
+            if (bkr == KERN_SUCCESS && svc_port != MACH_PORT_NULL) {
+                /* Got receive right from broker. Register with the broker for
+                 * look_up clients to find this service. The check_in already
+                 * registered the port, so look_up should work. */
+                sb_log("  LISTENER '%s' registered via broker (port 0x%x)", name, svc_port);
+            }
+        }
+
+        /* Now create the XPC listener. Since bootstrap_check_in succeeded
+         * and the port is in our task, the XPC listener should work. */
+
         /* Step 1: Snapshot current Mach ports */
         mach_port_name_array_t names_before = NULL;
         mach_msg_type_number_t names_before_cnt = 0;

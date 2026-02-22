@@ -261,31 +261,41 @@ static void handle_check_in(mach_msg_header_t *request) {
 
     broker_log("[broker] check_in request: %s\n", service_name);
 
-    /* Create receive port for service */
+    /* Check if service was pre-created. If so, give the existing
+     * port's receive right to the caller (this is how launchd works:
+     * the port is pre-created from the plist MachServices, and the
+     * daemon gets the receive right via check_in). */
     mach_port_t service_port = MACH_PORT_NULL;
-    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service_port);
-
-    if (kr != KERN_SUCCESS) {
-        broker_log("[broker] failed to allocate port for check_in: 0x%x\n", kr);
-        send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
-        return;
+    for (int i = 0; i < MAX_SERVICES; i++) {
+        if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
+            service_port = g_services[i].port;
+            broker_log("[broker] check_in '%s': found pre-created port 0x%x\n",
+                       service_name, service_port);
+            break;
+        }
     }
 
-    /* Insert send right (broker keeps this for look_up responses) */
-    kr = mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) {
-        broker_log("[broker] failed to insert send right: 0x%x\n", kr);
-        mach_port_deallocate(mach_task_self(), service_port);
-        send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
-        return;
-    }
-
-    /* Register service (store send right for future look_ups) */
-    int result = register_service(service_name, service_port);
-    if (result != BOOTSTRAP_SUCCESS) {
-        mach_port_deallocate(mach_task_self(), service_port);
-        send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, result);
-        return;
+    if (service_port == MACH_PORT_NULL) {
+        /* Not pre-created — create a new port */
+        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service_port);
+        if (kr != KERN_SUCCESS) {
+            broker_log("[broker] failed to allocate port for check_in: 0x%x\n", kr);
+            send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
+            return;
+        }
+        kr = mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
+        if (kr != KERN_SUCCESS) {
+            broker_log("[broker] failed to insert send right: 0x%x\n", kr);
+            mach_port_deallocate(mach_task_self(), service_port);
+            send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_NO_MEMORY);
+            return;
+        }
+        int result = register_service(service_name, service_port);
+        if (result != BOOTSTRAP_SUCCESS) {
+            mach_port_deallocate(mach_task_self(), service_port);
+            send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, result);
+            return;
+        }
     }
 
     /* Send RECEIVE right to caller (MOVE_RECEIVE transfers ownership).
@@ -965,6 +975,38 @@ int main(int argc, char *argv[]) {
 
     /* Write PID file */
     write_pid_file();
+
+    /* Pre-create MachServices from daemon plists.
+     * These must exist BEFORE daemons spawn so their XPC listeners
+     * can bootstrap_check_in and get receive rights.
+     * Without pre-creation, check_in happens on-demand but the daemon's
+     * XPC listener may fail if the port doesn't exist yet. */
+    {
+        const char *precreate_services[] = {
+            /* assertiond */
+            "com.apple.assertiond.applicationstateconnection",
+            "com.apple.assertiond.appwatchdog",
+            "com.apple.assertiond.expiration",
+            "com.apple.assertiond.processassertionconnection",
+            "com.apple.assertiond.processinfoservice",
+            /* SpringBoard's frontboard workspace */
+            "com.apple.frontboard.systemappservices",
+            "com.apple.frontboard.workspace",
+            NULL
+        };
+        for (int i = 0; precreate_services[i]; i++) {
+            mach_port_t svc_port = MACH_PORT_NULL;
+            kern_return_t kr2 = mach_port_allocate(mach_task_self(),
+                                                    MACH_PORT_RIGHT_RECEIVE, &svc_port);
+            if (kr2 == KERN_SUCCESS) {
+                mach_port_insert_right(mach_task_self(), svc_port, svc_port,
+                                        MACH_MSG_TYPE_MAKE_SEND);
+                register_service(precreate_services[i], svc_port);
+                broker_log("[broker] pre-created service: %s (port 0x%x)\n",
+                           precreate_services[i], svc_port);
+            }
+        }
+    }
 
     /* Spawn iokitsimd — IOKit simulator daemon.
      * Must start BEFORE backboardd (backboardd uses IOKit for display/HID). */
