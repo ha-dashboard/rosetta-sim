@@ -4826,16 +4826,17 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                 bridge_log("  UIKit created _layerContext: contextId=%u renderContext=%p (%s)",
                            cid, rc, rc ? "REMOTE" : "LOCAL (normal for remote context)");
 
-                /* Write the contextId that the ENCODER uses (offset 0x48) to the IPC file.
-                 * The server creates a CA::Render::Context with THIS ID in _context_table.
-                 * The CALayerHost in backboardd resolves via context_by_id(this_id).
-                 * NOTE: This might differ from [CAContext contextId] (offset 0x58). */
+                /* Write contextId to IPC file for CALayerHost.
+                 * The ObjC [CAContext contextId] returns client_id (offset 0x58),
+                 * which is set by RegisterClient. The server creates a
+                 * CA::Render::Context with this ID.
+                 * Also write the client_id from the C++ impl for comparison. */
                 {
                     Ivar implIvar2 = class_getInstanceVariable(object_getClass(layerCtx), "_impl");
                     void *impl2 = implIvar2 ? *(void **)((uint8_t *)layerCtx + ivar_getOffset(implIvar2)) : NULL;
-                    uint32_t encoder_id = impl2 ? *(uint32_t *)((uint8_t *)impl2 + 0x48) : cid;
-                    /* Use encoder_id if available, otherwise fall back to ObjC contextId */
-                    uint32_t write_id = (encoder_id != 0) ? encoder_id : cid;
+                    uint32_t c_client_id = impl2 ? *(uint32_t *)((uint8_t *)impl2 + 0x58) : 0;
+                    /* Use ObjC contextId (== client_id at 0x58) */
+                    uint32_t write_id = cid;
                     if (write_id != 0) {
                         int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_WRONLY|O_CREAT|O_TRUNC, 0644);
                         if (fd >= 0) {
@@ -4843,8 +4844,8 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                             int len = snprintf(buf, sizeof(buf), "%u", write_id);
                             write(fd, buf, len);
                             close(fd);
-                            bridge_log("  Wrote contextId=%u (encoder=%u, objc=%u) to %s for CALayerHost",
-                                       write_id, encoder_id, cid, ROSETTASIM_FB_CONTEXT_PATH);
+                            bridge_log("  Wrote contextId=%u (c_client_id=%u) to %s",
+                                       write_id, c_client_id, ROSETTASIM_FB_CONTEXT_PATH);
                         }
                     }
                 }
