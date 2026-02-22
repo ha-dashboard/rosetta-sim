@@ -7487,69 +7487,57 @@ static void rosettasim_bridge_init(void) {
      * This MUST happen early (before UIKit creates windows) so g_ca_server_port
      * is set and the Display Pipeline uses GPU mode.
      * bootstrap_look_up goes through bootstrap_fix → broker → returns real port. */
+    /* Defer CARenderServer initialization and BKS swizzles.
+     * These trigger framework loading (CoreText → GraphicsServices → MobileGestalt)
+     * which does XPC calls to system services (cfprefsd, mobilegestalt) that
+     * don't exist in our simulator. Running them in the constructor blocks forever.
+     * Defer to after the main run loop starts. */
     if (g_bridge_broker_port != MACH_PORT_NULL) {
-        mach_port_t ca_port = MACH_PORT_NULL;
-        kern_return_t ca_kr = bootstrap_look_up(bootstrap_port,
-                                                 "com.apple.CARenderServer", &ca_port);
-        if (ca_kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
-            g_ca_server_port = ca_port;
-            g_ca_server_connected = 1;
-            bridge_log("  CARenderServer found via bootstrap: port=0x%x", ca_port);
+        bridge_log("  CARenderServer + BKS swizzles: DEFERRED to run loop");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            bridge_log("  [deferred] CARenderServer initialization starting...");
+            mach_port_t ca_port = MACH_PORT_NULL;
+            kern_return_t ca_kr = bootstrap_look_up(bootstrap_port,
+                                                     "com.apple.CARenderServer", &ca_port);
+            if (ca_kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
+                g_ca_server_port = ca_port;
+                g_ca_server_connected = 1;
+                bridge_log("  [deferred] CARenderServer found: port=0x%x", ca_port);
 
-            /* Trigger connect_remote BEFORE UIKit creates any windows.
-             * Creating a remoteContextWithOptions triggers CoreAnimation's
-             * internal connect_remote() → __CASRegisterClient → sets
-             * _user_client_port. After this, CARenderServerGetClientPort()
-             * returns non-zero and UIKit creates IOSurface-backed backing stores
-             * instead of LOCAL vm_allocate stores. */
-            @try {
-                Class caCtxCls = objc_getClass("CAContext");
-                if (caCtxCls) {
-                    NSDictionary *opts = @{
-                        @"serverPort": @(ca_port),
-                    };
-                    bridge_log("  Creating early remote CAContext to trigger connect_remote...");
-                    id earlyCtx = ((id(*)(id, SEL, id))objc_msgSend)(
-                        (id)caCtxCls,
-                        sel_registerName("remoteContextWithOptions:"),
-                        opts);
-                    if (earlyCtx) {
-                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                            earlyCtx, sel_registerName("contextId"));
-                        bridge_log("  Early remote CAContext: id=%u (connect_remote should have fired)", cid);
-
-                        /* Check if CARenderServerGetClientPort now returns non-zero */
-                        typedef mach_port_t (*GetCPFn)(mach_port_t);
-                        GetCPFn gcp = (GetCPFn)dlsym(RTLD_DEFAULT,
-                                                      "CARenderServerGetClientPort");
-                        if (gcp) {
-                            mach_port_t cp = gcp(ca_port);
-                            bridge_log("  CARenderServerGetClientPort()=%u %s", cp,
-                                       cp ? "✓ IOSurface mode enabled" : "✗ still zero");
+                @try {
+                    Class caCtxCls = objc_getClass("CAContext");
+                    if (caCtxCls) {
+                        NSDictionary *opts = @{@"serverPort": @(ca_port)};
+                        id earlyCtx = ((id(*)(id, SEL, id))objc_msgSend)(
+                            (id)caCtxCls,
+                            sel_registerName("remoteContextWithOptions:"),
+                            opts);
+                        if (earlyCtx) {
+                            unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                earlyCtx, sel_registerName("contextId"));
+                            bridge_log("  [deferred] Remote CAContext: id=%u", cid);
                         }
-                    } else {
-                        bridge_log("  Early remote CAContext: creation returned nil");
                     }
+                } @catch (id ex) {
+                    bridge_log("  [deferred] remoteContextWithOptions threw");
                 }
-            } @catch (id ex) {
-                bridge_log("  remoteContextWithOptions threw: %s",
-                           [[ex description] UTF8String] ?: "unknown");
             }
-        } else {
-            bridge_log("  CARenderServer bootstrap_look_up failed: kr=0x%x", ca_kr);
-        }
+            swizzle_bks_methods();
+            bridge_log("  [deferred] CARenderServer + BKS init complete");
+        });
     }
-
-    /* Swizzle BackBoardServices methods that crash without backboardd */
-    swizzle_bks_methods();
 
     /* rendersLocally override REMOVED — using REMOTE context (GPU compositing).
      * UIKit's +[UIApplication rendersLocally] returns NO by default,
      * which makes _createContextAttached: use the REMOTE context path. */
 
-    /* Register NSURLProtocol bypass — routes HTTP requests through BSD sockets
-     * instead of CFNetwork, which requires configd_sim. */
-    _register_url_protocol();
+    /* Defer NSURLProtocol registration to after the run loop starts.
+     * CFNetwork initialization during the constructor blocks on cfprefsd.daemon
+     * XPC connection (which doesn't exist in our simulator). By deferring,
+     * we let UIApplicationMain proceed and register the protocol later. */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        _register_url_protocol();
+    });
 
     /* Set global exception handler — configurable via ROSETTASIM_EXCEPTION_MODE */
     {
@@ -7579,11 +7567,10 @@ static void rosettasim_bridge_init(void) {
                gsWidth ? *gsWidth : 0, gsHeight ? *gsHeight : 0,
                gsScale ? *gsScale : 0);
 
-    /* Register SDK system fonts with CTFontManager so they're available
-       regardless of bundle context. Without this, .app bundles fail to
-       render text because CoreText looks for fontd/font cache instead of
-       direct file enumeration. */
-    {
+    /* Defer font registration — CTFontManagerRegisterFontsForURL triggers
+     * CoreText → GraphicsServices → MobileGestalt → XPC (blocks on
+     * mobilegestalt.xpc service that doesn't exist). Register after run loop. */
+    dispatch_async(dispatch_get_main_queue(), ^{
         const char *root = getenv("IPHONE_SIMULATOR_ROOT");
         if (!root) root = getenv("DYLD_ROOT_PATH");
         if (root) {
@@ -7616,10 +7603,10 @@ static void rosettasim_bridge_init(void) {
                         CFRelease(url);
                     }
                 }
-                bridge_log("Registered %d font directories for process", registered);
+                bridge_log("[deferred] Registered %d font directories", registered);
             }
         }
-    }
+    });
 
     bridge_log("========================================");
 }
