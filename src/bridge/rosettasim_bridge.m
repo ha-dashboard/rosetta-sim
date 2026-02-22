@@ -4802,8 +4802,18 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                             uint32_t f4C = *(uint32_t *)((uint8_t *)impl + 0x4C);
                             uint32_t f50 = *(uint32_t *)((uint8_t *)impl + 0x50);
                             uint32_t f54 = *(uint32_t *)((uint8_t *)impl + 0x54);
-                            bridge_log("  CA::Context: rootLayer=%p f40=%u f44=%u f4C=%u f50=%u f54=%u",
-                                       root_layer, f40, f44, f50, f50, f54);
+                            bridge_log("  CA::Context: rootLayer=%p", root_layer);
+                            /* Hex dump offsets 0x50-0xA0 to find real contextId and verify server_port */
+                            {
+                                char hex[512] = {0};
+                                int hlen = 0;
+                                for (int off = 0x50; off < 0xA0 && hlen < 480; off += 4) {
+                                    uint32_t v = *(uint32_t *)((uint8_t *)impl + off);
+                                    hlen += snprintf(hex + hlen, sizeof(hex) - hlen,
+                                                     "+%02x=%08x ", off, v);
+                                }
+                                bridge_log("  CA::Context hex: %s", hex);
+                            }
                             bridge_log("  CA::Context fields: encoder_ctxId=0x%08x(%u) client_id=0x%08x(%u) "
                                        "slot=%u renderCtx=%p server_port=%u flags=0x%x commits=%u",
                                        encoder_ctx_id, encoder_ctx_id,
@@ -6114,10 +6124,28 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                         kw, sel_registerName("setRootViewController:"), nil);
                                                     ((void(*)(id, SEL, id))objc_msgSend)(
                                                         kw, sel_registerName("setRootViewController:"), rvc);
+                                                    /* DETACH and RE-ATTACH the root layer to force
+                                                     * CoreAnimation to treat ALL properties as new.
+                                                     * The context tracks which layers have been committed.
+                                                     * Re-attaching resets this tracking. */
+                                                    Ivar lcIvar2 = class_getInstanceVariable(object_getClass(kw), "_layerContext");
+                                                    id lc2 = lcIvar2 ? *(id *)((uint8_t *)kw + ivar_getOffset(lcIvar2)) : nil;
+                                                    if (lc2) {
+                                                        id rootLayer = ((id(*)(id, SEL))objc_msgSend)(kw, sel_registerName("layer"));
+                                                        SEL setLayerSel = sel_registerName("setLayer:");
+                                                        if ([(id)lc2 respondsToSelector:setLayerSel] && rootLayer) {
+                                                            /* Detach */
+                                                            ((void(*)(id, SEL, id))objc_msgSend)(lc2, setLayerSel, nil);
+                                                            /* Re-attach — triggers full layer tree sync */
+                                                            ((void(*)(id, SEL, id))objc_msgSend)(lc2, setLayerSel, rootLayer);
+                                                            bridge_log("Display Pipeline [delayed]: Detached+re-attached rootLayer on _layerContext");
+                                                        }
+                                                    }
+
                                                     /* Force layout */
                                                     ((void(*)(id, SEL))objc_msgSend)(
                                                         kw, sel_registerName("layoutIfNeeded"));
-                                                    bridge_log("Display Pipeline [delayed]: Root VC re-set complete");
+                                                    bridge_log("Display Pipeline [delayed]: Root VC re-set + layout complete");
                                                 } else {
                                                     bridge_log("Display Pipeline [delayed]: No rootViewController");
                                                 }
@@ -6128,6 +6156,23 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 (id)objc_getClass("CATransaction"),
                                                 sel_registerName("flush"));
                                             bridge_log("Display Pipeline [delayed]: Flushed after invalidation");
+
+                                            /* Post-flush: check if commits happened */
+                                            {
+                                                Ivar li3 = class_getInstanceVariable(object_getClass(kw), "_layerContext");
+                                                id lc3 = li3 ? *(id *)((uint8_t *)kw + ivar_getOffset(li3)) : nil;
+                                                if (lc3) {
+                                                    Ivar ii3 = class_getInstanceVariable(object_getClass(lc3), "_impl");
+                                                    void *impl3 = ii3 ? *(void **)((uint8_t *)lc3 + ivar_getOffset(ii3)) : NULL;
+                                                    if (impl3) {
+                                                        uint32_t cc = *(uint32_t *)((uint8_t *)impl3 + 0x90);
+                                                        uint32_t fl = *(uint32_t *)((uint8_t *)impl3 + 0xD0);
+                                                        uint32_t sp = *(uint32_t *)((uint8_t *)impl3 + 0x98);
+                                                        bridge_log("Display Pipeline [delayed]: POST-FLUSH commits=%u flags=0x%x server_port=%u",
+                                                                   cc, fl, sp);
+                                                    }
+                                                }
+                                            }
 
                                             /* Diagnostic: Use CARenderServerCaptureDisplay to see
                                              * what the server renders. If this shows content, the
