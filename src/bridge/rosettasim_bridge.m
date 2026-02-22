@@ -4774,8 +4774,27 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                 if ([(id)layerCtx respondsToSelector:rcSel]) {
                     rc = ((void *(*)(id, SEL))objc_msgSend)(layerCtx, rcSel);
                 }
+                /* Read connect_remote output fields from the CA::Context C++ object.
+                 * Layout from disassembly: client_id at +0x58, field_0x60 at +0x60,
+                 * renderContext at +0x70, server_port at +0x98 */
+                {
+                    /* Get the C++ impl pointer from the ObjC wrapper */
+                    Ivar implIvar = class_getInstanceVariable(object_getClass(layerCtx), "_impl");
+                    if (implIvar) {
+                        void *impl = *(void **)((uint8_t *)layerCtx + ivar_getOffset(implIvar));
+                        if (impl) {
+                            uint32_t client_id = *(uint32_t *)((uint8_t *)impl + 0x58);
+                            uint32_t field_60 = *(uint32_t *)((uint8_t *)impl + 0x60);
+                            void *render_ctx = *(void **)((uint8_t *)impl + 0x70);
+                            uint32_t srv_port = *(uint32_t *)((uint8_t *)impl + 0x98);
+                            bridge_log("  CA::Context fields: client_id=%u slot/field60=%u renderCtx=%p server_port=%u",
+                                       client_id, field_60, render_ctx, srv_port);
+                        }
+                    }
+                }
+
                 bridge_log("  UIKit created _layerContext: contextId=%u renderContext=%p (%s)",
-                           cid, rc, rc ? "REMOTE" : "LOCAL");
+                           cid, rc, rc ? "REMOTE" : "LOCAL (normal for remote context)");
 
                 /* Write the CORRECT contextId to the IPC file so backboardd's
                  * CALayerHost uses this context for compositing.
