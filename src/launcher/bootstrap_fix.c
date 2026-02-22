@@ -23,6 +23,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdarg.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#import <Foundation/Foundation.h>
 
 /* bootstrap types */
 typedef char name_t[128];
@@ -295,6 +298,32 @@ kern_return_t replacement_bootstrap_register(mach_port_t bp,
     return ret;
 }
 
+/* CARenderServerGetClientPort interposition.
+ *
+ * Problem: CoreAnimation's internal connect_remote() populates a per-server
+ * client port cache. Since we call RegisterClient manually (not through
+ * connect_remote), the cache is empty and CARenderServerGetClientPort returns 0.
+ * When UIKit checks this (cross-library call → CAN be interposed), it decides
+ * to use LOCAL backing stores (vm_allocate) instead of IOSurface.
+ *
+ * Fix: Return a non-zero port when a CARenderServer connection exists.
+ * The actual port value is stored by the bridge after RegisterClient succeeds. */
+extern mach_port_t CARenderServerGetClientPort(mach_port_t server_port);
+
+/* Shared state: set by the bridge after RegisterClient reply */
+static mach_port_t g_bfix_client_port = MACH_PORT_NULL;
+
+/* Called by the bridge to store the client port from RegisterClient reply */
+void bfix_set_client_port(mach_port_t port) {
+    g_bfix_client_port = port;
+    bfix_log("[bfix] client port set to 0x%x\n", port);
+}
+
+/* CARenderServerGetClientPort interposition DISABLED.
+ * The interposition interfered with connect_remote by making it think
+ * there was already a client connection. Instead, we patch the static
+ * variable directly after giving connect_remote a chance to work. */
+
 /* Forward declarations for interposition targets */
 extern kern_return_t bootstrap_look_up(mach_port_t, const name_t, mach_port_t *);
 extern kern_return_t bootstrap_check_in(mach_port_t, const name_t, mach_port_t *);
@@ -311,6 +340,106 @@ static const struct {
     { (void *)replacement_bootstrap_register,  (void *)bootstrap_register },
 };
 
+/* Find and patch the _user_client_port static variable inside CoreAnimation.
+ *
+ * CARenderServerGetClientPort is a C function in QuartzCore that reads a
+ * static variable via a RIP-relative MOV. We disassemble the function to
+ * find the variable's address and write to it directly. This works for
+ * both intra-library and cross-library calls.
+ *
+ * Typical x86_64 pattern:
+ *   mov eax, dword ptr [rip + offset]  ; 8B 05 xx xx xx xx
+ *   ret                                 ; C3
+ */
+#include <dlfcn.h>
+#include <mach/vm_map.h>
+
+static void patch_client_port(mach_port_t port_value) {
+    /* Find the real CARenderServerGetClientPort function */
+    void *fn = dlsym(RTLD_DEFAULT, "CARenderServerGetClientPort");
+    if (!fn) {
+        bfix_log("[bfix] patch: CARenderServerGetClientPort not found\n");
+        return;
+    }
+    bfix_log("[bfix] patch: CARenderServerGetClientPort at %p\n", fn);
+
+    /* Read the x86_64 code to find the RIP-relative reference to the static var.
+     * We look for:
+     *   8B 05 xx xx xx xx  = mov eax, [rip + disp32]
+     *   48 8B 05 xx xx xx xx = mov rax, [rip + disp32]
+     *   Any instruction with a [rip + disp32] pattern
+     */
+    const uint8_t *code = (const uint8_t *)fn;
+    mach_port_t *var_addr = NULL;
+
+    /* Scan first 256 bytes for RIP-relative mov patterns */
+    for (int i = 0; i < 256; i++) {
+        /* Check for: 8B 05 xx xx xx xx (mov eax, [rip+disp32]) */
+        if (code[i] == 0x8B && code[i+1] == 0x05) {
+            int32_t disp = *(int32_t *)(code + i + 2);
+            uintptr_t target = (uintptr_t)(code + i + 6) + disp;
+            var_addr = (mach_port_t *)target;
+            bfix_log("[bfix] patch: found mov eax,[rip+0x%x] at +%d → var at %p\n",
+                     disp, i, (void *)var_addr);
+            break;
+        }
+        /* Check for: 48 8B 05 xx xx xx xx (mov rax, [rip+disp32]) */
+        if (code[i] == 0x48 && code[i+1] == 0x8B && code[i+2] == 0x05) {
+            int32_t disp = *(int32_t *)(code + i + 3);
+            uintptr_t target = (uintptr_t)(code + i + 7) + disp;
+            var_addr = (mach_port_t *)target;
+            bfix_log("[bfix] patch: found mov rax,[rip+0x%x] at +%d → var at %p\n",
+                     disp, i, (void *)var_addr);
+            break;
+        }
+    }
+
+    if (var_addr) {
+        /* Found a simple variable reference — try data patch */
+        mach_port_t old_val = *var_addr;
+        bfix_log("[bfix] patch: var value = 0x%x (might be pointer, not port)\n", old_val);
+        if (old_val == 0) {
+            *var_addr = port_value;
+            bfix_log("[bfix] patch: set variable = 0x%x\n", port_value);
+        }
+    }
+
+    /* More reliable approach: REWRITE the function to always return our port.
+     * Overwrite first bytes with: mov eax, <port_value>; ret
+     * x86_64: B8 xx xx xx xx C3 (6 bytes) */
+    bfix_log("[bfix] patch: rewriting function at %p to return 0x%x\n", fn, port_value);
+
+    /* Make the code page writable */
+    vm_address_t page = (vm_address_t)fn & ~0xFFF;
+    kern_return_t pkr = vm_protect(mach_task_self(), page, 0x1000,
+                                    FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (pkr != KERN_SUCCESS) {
+        bfix_log("[bfix] patch: vm_protect failed: 0x%x\n", pkr);
+        return;
+    }
+
+    /* Write: mov eax, <port_value>  (B8 + 4-byte immediate) */
+    uint8_t *fn_bytes = (uint8_t *)fn;
+    fn_bytes[0] = 0xB8; /* mov eax, imm32 */
+    fn_bytes[1] = (port_value) & 0xFF;
+    fn_bytes[2] = (port_value >> 8) & 0xFF;
+    fn_bytes[3] = (port_value >> 16) & 0xFF;
+    fn_bytes[4] = (port_value >> 24) & 0xFF;
+    fn_bytes[5] = 0xC3; /* ret */
+
+    /* Restore page protections */
+    vm_protect(mach_task_self(), page, 0x1000,
+               FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    bfix_log("[bfix] patch: function rewritten — CARenderServerGetClientPort() now returns 0x%x\n",
+             port_value);
+
+    /* Verify by calling the function */
+    mach_port_t verify = CARenderServerGetClientPort(0);
+    bfix_log("[bfix] patch: verify call = 0x%x %s\n", verify,
+             verify == port_value ? "OK" : "FAILED (Rosetta may cache old translation)");
+}
+
 /* Also set the global for any code that reads it directly */
 __attribute__((constructor))
 static void bootstrap_fix_constructor(void) {
@@ -318,5 +447,67 @@ static void bootstrap_fix_constructor(void) {
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
     if (bp != MACH_PORT_NULL) {
         bootstrap_port = bp;
+
+        /* Look up CARenderServer and patch the client port.
+         * This must happen BEFORE UIKit creates any windows. */
+        mach_port_t ca_port = MACH_PORT_NULL;
+        kern_return_t kr = replacement_bootstrap_look_up(bp, "com.apple.CARenderServer", &ca_port);
+        if (kr == KERN_SUCCESS && ca_port != MACH_PORT_NULL) {
+            bfix_log("[bfix] constructor: CARenderServer port = 0x%x\n", ca_port);
+
+            /* Check _user_client_port BEFORE any context creation */
+            void *fn = dlsym(RTLD_DEFAULT, "CARenderServerGetClientPort");
+            mach_port_t pre_cp = 0;
+            if (fn) {
+                pre_cp = ((mach_port_t(*)(mach_port_t))fn)(ca_port);
+                bfix_log("[bfix] constructor: GetClientPort BEFORE = 0x%x\n", pre_cp);
+            }
+
+            /* DON'T patch _user_client_port yet — let connect_remote try naturally.
+             * Create a remote context which triggers connect_remote internally. */
+            @try {
+                Class caCtxCls = (Class)objc_getClass("CAContext");
+                if (caCtxCls) {
+                    id opts = @{@"displayable": @YES, @"display": @(1)};
+                    bfix_log("[bfix] constructor: creating remote context...\n");
+                    id ctx = ((id(*)(id, SEL, id))objc_msgSend)(
+                        (id)caCtxCls,
+                        sel_registerName("remoteContextWithOptions:"),
+                        opts);
+                    if (ctx) {
+                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                            ctx, sel_registerName("contextId"));
+                        bfix_log("[bfix] constructor: remote context id=%u\n", cid);
+                    } else {
+                        bfix_log("[bfix] constructor: remoteContextWithOptions returned nil\n");
+                    }
+                }
+            } @catch (id ex) {
+                bfix_log("[bfix] constructor: remote context threw\n");
+            }
+
+            /* Check _user_client_port AFTER remote context creation */
+            if (fn) {
+                mach_port_t post_cp = ((mach_port_t(*)(mach_port_t))fn)(ca_port);
+                bfix_log("[bfix] constructor: GetClientPort AFTER = 0x%x\n", post_cp);
+
+                if (post_cp == MACH_PORT_NULL) {
+                    /* connect_remote didn't set it. Patch with a created port as fallback. */
+                    mach_port_t cp = MACH_PORT_NULL;
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
+                    if (cp != MACH_PORT_NULL) {
+                        mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
+                        patch_client_port(cp);
+                        g_bfix_client_port = cp;
+                        bfix_log("[bfix] constructor: patched _user_client_port = 0x%x (fallback)\n", cp);
+                    }
+                } else {
+                    g_bfix_client_port = post_cp;
+                    bfix_log("[bfix] constructor: connect_remote set _user_client_port = 0x%x!\n", post_cp);
+                }
+            }
+        } else {
+            bfix_log("[bfix] constructor: CARenderServer not found (kr=0x%x) — app process?\n", kr);
+        }
     }
 }
