@@ -6979,48 +6979,20 @@ static void swizzle_bks_methods(void) {
     }
 
     /* FBSWorkspace / FBSScene / FBSWorkspaceClient (ITEM 14).
-
-       FBSWorkspace connects to SpringBoard via XPC for scene lifecycle.
-       Without SpringBoard, this connection fails and calls exit(0).
-
-       Strategy:
-       - FBSWorkspaceClient init → nil (prevents XPC connection)
-       - FBSWorkspace.init → nil (prevents workspace creation)
-       - FBSScene: We DON'T stub this. _callInitializationDelegatesForMainScene:
-         crashes with nil scene (SIGILL), which is why replacement_runWithMainScene
-         bypasses it. If we ever need scene-based lifecycle, we'd create a minimal
-         FBSScene subclass here.
-
-       For now, the storyboard loading in replacement_runWithMainScene handles
-       the main interface file loading that _callInitializationDelegatesForMainScene:
-       would have done, making a minimal FBSScene unnecessary for most apps. */
+     *
+     * With proper bootstrap_fix.dylib + broker providing all services,
+     * and SpringBoard registering com.apple.frontboard.workspace,
+     * FBSWorkspaceClient should now connect NATURALLY to SpringBoard.
+     *
+     * REMOVED: FBSWorkspaceClient nil swizzle (was preventing natural lifecycle)
+     * REMOVED: FBSWorkspace.init nil swizzle
+     *
+     * Let the natural FBSWorkspace connection flow:
+     * App → FBSWorkspaceClient → SpringBoard's FBWorkspaceConnectionListener
+     * → FBSScene creation → UIKit receives scene → natural display lifecycle
+     */
+    bridge_log("  FBSWorkspace: allowing natural connection (no swizzle)");
     {
-        Class fbsWsClientClass = objc_getClass("FBSWorkspaceClient");
-        if (fbsWsClientClass) {
-            const char *initSelNames[] = {
-                "initWithServiceName:endpoint:",
-                "initWithDelegate:",
-                NULL
-            };
-            for (int s = 0; initSelNames[s]; s++) {
-                SEL sel = sel_registerName(initSelNames[s]);
-                Method m = class_getInstanceMethod(fbsWsClientClass, sel);
-                if (m) {
-                    method_setImplementation(m, (IMP)_noopMethod);
-                    bridge_log("  Swizzled FBSWorkspaceClient.%s → nil", initSelNames[s]);
-                }
-            }
-        }
-
-        Class fbsWsClass = objc_getClass("FBSWorkspace");
-        if (fbsWsClass) {
-            SEL initSel = sel_registerName("init");
-            Method m = class_getInstanceMethod(fbsWsClass, initSel);
-            if (m) {
-                method_setImplementation(m, (IMP)_noopMethod);
-                bridge_log("  Swizzled FBSWorkspace.init → nil");
-            }
-        }
 
         /* FBSSceneImpl — if it exists, no-op methods that contact SpringBoard.
            This prevents crashes during scene queries without requiring a
