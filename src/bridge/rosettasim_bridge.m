@@ -4803,16 +4803,28 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                             uint32_t f50 = *(uint32_t *)((uint8_t *)impl + 0x50);
                             uint32_t f54 = *(uint32_t *)((uint8_t *)impl + 0x54);
                             bridge_log("  CA::Context: rootLayer=%p", root_layer);
-                            /* Hex dump offsets 0x50-0xA0 to find real contextId and verify server_port */
+                            /* Hex dump offsets 0x50-0xB0 to include 0xa4 (commit_root local_id check) */
                             {
-                                char hex[512] = {0};
+                                char hex[768] = {0};
                                 int hlen = 0;
-                                for (int off = 0x50; off < 0xA0 && hlen < 480; off += 4) {
+                                for (int off = 0x50; off < 0xB0 && hlen < 700; off += 4) {
                                     uint32_t v = *(uint32_t *)((uint8_t *)impl + off);
                                     hlen += snprintf(hex + hlen, sizeof(hex) - hlen,
                                                      "+%02x=%08x ", off, v);
                                 }
                                 bridge_log("  CA::Context hex: %s", hex);
+                                /* commit_root gate: compares LAYER->0xa4 with CONTEXT->0x5c.
+                                 * Root layer is at context offset 0x68 (a CFTypeRef/CALayerRef).
+                                 * Need CALayerGetLayer() to get the C++ CA::Layer* from it. */
+                                uint32_t ctx_local_id = *(uint32_t *)((uint8_t *)impl + 0x5c);
+                                void *layer_ref = *(void **)((uint8_t *)impl + 0x68);
+                                bridge_log("  commit_root: ctx->0x5c(local_id)=%u rootLayerRef=%p",
+                                           ctx_local_id, layer_ref);
+                                /* Also check context 0xa0 (encoder_cache) and 0xa4 */
+                                void *encoder_cache = *(void **)((uint8_t *)impl + 0xA0);
+                                uint32_t ctx_0xa4 = *(uint32_t *)((uint8_t *)impl + 0xA4);
+                                bridge_log("  commit: ctx->0xA0(encoder_cache)=%p ctx->0xA4=%u",
+                                           encoder_cache, ctx_0xa4);
                             }
                             bridge_log("  CA::Context fields: encoder_ctxId=0x%08x(%u) client_id=0x%08x(%u) "
                                        "slot=%u renderCtx=%p server_port=%u flags=0x%x commits=%u",
