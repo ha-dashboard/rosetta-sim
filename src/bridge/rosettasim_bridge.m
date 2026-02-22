@@ -4749,21 +4749,41 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
             *(BOOL *)((uint8_t *)self + ivar_getOffset(attachIvar)) = YES;
             bridge_log("  Set UIWindow._attachable=YES");
         }
-        /* Create a REMOTE (server-connected) CAContext manually and set
-         * it as the UIWindow's _layerContext. UIKit's _createContextAttached:
-         * creates a LOCAL context because the display doesn't report as
-         * server-backed. By creating a REMOTE context with displayable=YES,
-         * we ensure the window's layer tree renders through CARenderServer. */
+        /* Let UIKit's _createContextAttached: handle context creation naturally.
+         * With GSGetPurpleApplicationPort returning a valid port (via bootstrap_fix),
+         * UIKit's REMOTE path should work:
+         *   1. _shouldUseRemoteContext → YES (rendersLocally=NO)
+         *   2. setClientPort(GSGetPurpleApplicationPort())
+         *   3. remoteContextWithOptions: → connect_remote()
+         */
         {
-            Class caCtxClass = objc_getClass("CAContext");
-            SEL remCtxSel = sel_registerName("remoteContextWithOptions:");
-            if (caCtxClass && class_respondsToSelector(object_getClass((id)caCtxClass), remCtxSel)) {
-                NSDictionary *ctxOpts = @{
-                    @"displayable": @YES,
-                    @"display": @(1)
-                };
-                id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
-                    (id)caCtxClass, remCtxSel, ctxOpts);
+            bridge_log("  Calling UIKit's _createContextAttached:YES (natural path)");
+            SEL createCtxSel = sel_registerName("_createContextAttached:");
+            if ([(id)self respondsToSelector:createCtxSel]) {
+                ((void(*)(id, SEL, BOOL))objc_msgSend)(self, createCtxSel, YES);
+            }
+            /* Check what UIKit created */
+            Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
+            id layerCtx = lcIvar ? *(id *)((uint8_t *)self + ivar_getOffset(lcIvar)) : nil;
+            if (layerCtx) {
+                unsigned int cid = [(id)layerCtx respondsToSelector:sel_registerName("contextId")] ?
+                    ((unsigned int(*)(id, SEL))objc_msgSend)(layerCtx, sel_registerName("contextId")) : 0;
+                /* Check renderContext */
+                void *rc = nil;
+                SEL rcSel = sel_registerName("renderContext");
+                if ([(id)layerCtx respondsToSelector:rcSel]) {
+                    rc = ((void *(*)(id, SEL))objc_msgSend)(layerCtx, rcSel);
+                }
+                bridge_log("  UIKit created _layerContext: contextId=%u renderContext=%p (%s)",
+                           cid, rc, rc ? "REMOTE" : "LOCAL");
+            } else {
+                bridge_log("  UIKit's _createContextAttached: returned nil _layerContext!");
+            }
+            if (0) { /* DISABLED: manual context creation */
+                Class caCtxClass = objc_getClass("CAContext");
+                SEL remCtxSel = sel_registerName("remoteContextWithOptions:");
+                (void)caCtxClass; (void)remCtxSel;
+                id remoteCtx = nil;
                 if (remoteCtx) {
                     /* Set the window's root layer as the context's layer */
                     id rootLayer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));

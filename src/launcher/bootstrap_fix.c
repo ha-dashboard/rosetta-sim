@@ -319,10 +319,42 @@ void bfix_set_client_port(mach_port_t port) {
     bfix_log("[bfix] client port set to 0x%x\n", port);
 }
 
-/* CARenderServerGetClientPort interposition DISABLED.
- * The interposition interfered with connect_remote by making it think
- * there was already a client connection. Instead, we patch the static
- * variable directly after giving connect_remote a chance to work. */
+/* GSGetPurpleApplicationPort interposition.
+ *
+ * UIKit's _createContextAttached: calls:
+ *   [CAContext setClientPort:GSGetPurpleApplicationPort()];
+ *   _layerContext = [CAContext remoteContextWithOptions:opts];
+ *
+ * If GSGetPurpleApplicationPort returns 0, setClientPort:0 makes connect_remote
+ * fail, and no remote context is created. UIKit falls back to no rendering.
+ *
+ * Fix: Return a valid Mach port so connect_remote can establish the connection
+ * to CARenderServer via the broker's bootstrap namespace. */
+extern mach_port_t GSGetPurpleApplicationPort(void);
+
+static mach_port_t g_purple_app_port = MACH_PORT_NULL;
+
+static mach_port_t replacement_GSGetPurpleApplicationPort(void) {
+    if (g_purple_app_port != MACH_PORT_NULL) {
+        return g_purple_app_port;
+    }
+
+    /* Create a port for the app's Purple registration.
+     * This is used by CAContext setClientPort: before connect_remote. */
+    mach_port_t bp = get_bootstrap_port();
+    if (bp != MACH_PORT_NULL) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_purple_app_port);
+        if (g_purple_app_port != MACH_PORT_NULL) {
+            mach_port_insert_right(mach_task_self(), g_purple_app_port,
+                                    g_purple_app_port, MACH_MSG_TYPE_MAKE_SEND);
+            bfix_log("[bfix] GSGetPurpleApplicationPort() → 0x%x (created)\n", g_purple_app_port);
+            return g_purple_app_port;
+        }
+    }
+
+    /* Not running under broker — return 0 (original behavior) */
+    return GSGetPurpleApplicationPort();
+}
 
 /* Forward declarations for interposition targets */
 extern kern_return_t bootstrap_look_up(mach_port_t, const name_t, mach_port_t *);
@@ -338,6 +370,7 @@ static const struct {
     { (void *)replacement_bootstrap_look_up,   (void *)bootstrap_look_up },
     { (void *)replacement_bootstrap_check_in,  (void *)bootstrap_check_in },
     { (void *)replacement_bootstrap_register,  (void *)bootstrap_register },
+    { (void *)replacement_GSGetPurpleApplicationPort, (void *)GSGetPurpleApplicationPort },
 };
 
 /* Find and patch the _user_client_port static variable inside CoreAnimation.
