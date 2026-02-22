@@ -2160,7 +2160,9 @@ static int setup_shared_framebuffer(void) {
          * Even with CARenderServer connected, we use CPU rendering (renderInContext)
          * for the display framebuffer because the app's layer tree isn't directly
          * committed to CARenderServer's display surface.
-         * Note: PurpleFBServer also writes to this path from backboardd.
+         * Note: PurpleFBServer writes backboardd's composited output to
+         * ROSETTASIM_FB_GPU_PATH (/tmp/rosettasim_framebuffer_gpu). In GPU mode,
+         * we map that separately and relay/copy it into this framebuffer for the host.
          * We truncate and take ownership here — our CPU rendering includes
          * the full view hierarchy which is more complete. */
         fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -6890,6 +6892,64 @@ rowBytes, void *transform);
     /* Only reached if CFRunLoopRun returns (app shutting down) */
     bridge_log("  CFRunLoopRun returned from _runWithMainScene replacement");
 }
+/* Swizzle UIApplication run methods early enough to affect UIApplicationMain.
+ *
+ * In standalone mode (no SpringBoard / no FBSWorkspace), UIKit blocks inside
+ * -[UIApplication _run] waiting on the workspace/scene handshake.
+ * These swizzles bypass the handshake and jump directly to our replacement
+ * run loop bootstrap (replacement_runWithMainScene). */
+static void swizzle_uiapplication_run_methods(void) {
+    static int _did = 0;
+    if (_did) return;
+    _did = 1;
+
+    Class appClass = objc_getClass("UIApplication");
+    if (!appClass) {
+        bridge_log("  swizzle_uiapplication_run_methods: UIApplication class not found");
+        return;
+    }
+
+    /* Prevent hard-exit when workspace is unavailable */
+    {
+        SEL wseSel = sel_registerName("workspaceShouldExit:");
+        Method wseMethod = class_getInstanceMethod(appClass, wseSel);
+        if (wseMethod) {
+            method_setImplementation(wseMethod, (IMP)_noopMethod);
+            bridge_log("  Swizzled UIApplication.workspaceShouldExit:");
+        }
+        SEL wse2Sel = sel_registerName("workspaceShouldExit:withTransitionContext:");
+        Method wse2Method = class_getInstanceMethod(appClass, wse2Sel);
+        if (wse2Method) {
+            method_setImplementation(wse2Method, (IMP)_noopMethod);
+            bridge_log("  Swizzled UIApplication.workspaceShouldExit:withTransitionContext:");
+        }
+    }
+
+    /* Swizzle _runWithMainScene: (called by _run) */
+    {
+        SEL runSceneSel = sel_registerName("_runWithMainScene:transitionContext:completion:");
+        Method runSceneMethod = class_getInstanceMethod(appClass, runSceneSel);
+        if (runSceneMethod) {
+            method_setImplementation(runSceneMethod, (IMP)replacement_runWithMainScene);
+            bridge_log("  Swizzled UIApplication._runWithMainScene:transitionContext:completion:");
+        }
+    }
+
+    /* Swizzle _run (called directly by UIApplicationMain) */
+    {
+        SEL runSel = sel_registerName("_run");
+        Method runMethod = class_getInstanceMethod(appClass, runSel);
+        if (runMethod) {
+            method_setImplementation(runMethod, (IMP)replacement_runWithMainScene);
+            /* Note: _run has signature void(id,SEL) but replacement_runWithMainScene
+               has extra params (scene, transitionContext, completion). The extra
+               params will be garbage but we don't use them when called via _run
+               because _callInitializationDelegatesForMainScene: is called with
+               nil scene anyway. */
+            bridge_log("  Swizzled UIApplication._run");
+        }
+    }
+}
 
 static void swizzle_bks_methods(void) {
     /* UIWindow makeKeyAndVisible — crashes via BKSEventFocusManager */
@@ -6945,64 +7005,11 @@ static void swizzle_bks_methods(void) {
     }
 
     /* UIApplication.keyWindow — let UIKit manage natively. */
-    Class appClass = objc_getClass("UIApplication");
     bridge_log("  UIApplication.keyWindow NOT swizzled — using UIKit native");
-
-    /* UIApplication.workspaceShouldExit: — called when FBSWorkspace connection
-       fails (no SpringBoard). Without this swizzle, the app calls exit().
-       In RosettaSim there is no SpringBoard — this is expected, not an error. */
-    if (appClass) {
-        SEL wseSel = sel_registerName("workspaceShouldExit:");
-        Method wseMethod = class_getInstanceMethod(appClass, wseSel);
-        if (wseMethod) {
-            method_setImplementation(wseMethod, (IMP)_noopMethod);
-            bridge_log("  Swizzled UIApplication.workspaceShouldExit:");
-        }
-        SEL wse2Sel = sel_registerName("workspaceShouldExit:withTransitionContext:");
-        Method wse2Method = class_getInstanceMethod(appClass, wse2Sel);
-        if (wse2Method) {
-            method_setImplementation(wse2Method, (IMP)_noopMethod);
-            bridge_log("  Swizzled UIApplication.workspaceShouldExit:withTransitionContext:");
-        }
-    }
-
-    /* UIApplication._runWithMainScene:transitionContext:completion:
-       This is the method that connects to FBSWorkspace, requests scene creation
-       from SpringBoard, and waits on dispatch_semaphore for the reply. Without
-       SpringBoard, the semaphore never signals and UIApplicationMain hangs.
-
-       Our replacement:
-       1. Creates UIEventDispatcher (which UIKit normally creates at this point)
-       2. Calls _callInitializationDelegatesForMainScene: (triggers didFinishLaunching)
-       3. Starts CFRunLoopRun (the main event loop)
-
-       This is NOT a hack — it's what UIApplicationMain would do at this point,
-       minus the FBSWorkspace connection that requires SpringBoard. */
-    if (appClass) {
-        /* Swizzle _runWithMainScene: (called by _run) */
-        SEL runSceneSel = sel_registerName("_runWithMainScene:transitionContext:completion:");
-        Method runSceneMethod = class_getInstanceMethod(appClass, runSceneSel);
-        if (runSceneMethod) {
-            method_setImplementation(runSceneMethod, (IMP)replacement_runWithMainScene);
-            bridge_log("  Swizzled UIApplication._runWithMainScene:transitionContext:completion:");
-        }
-
-        /* Also swizzle _run — this is the method called by UIApplicationMain
-           that initiates the FBSWorkspace connection BEFORE calling
-           _runWithMainScene:. By replacing _run, we skip the workspace
-           connection entirely and jump straight to our replacement. */
-        SEL runSel = sel_registerName("_run");
-        Method runMethod = class_getInstanceMethod(appClass, runSel);
-        if (runMethod) {
-            method_setImplementation(runMethod, (IMP)replacement_runWithMainScene);
-            /* Note: _run has signature void(id,SEL) but replacement_runWithMainScene
-               has extra params (scene, transitionContext, completion). The extra
-               params will be garbage but we don't use them when called via _run
-               because _callInitializationDelegatesForMainScene: is called with
-               nil scene anyway. */
-            bridge_log("  Swizzled UIApplication._run");
-        }
-    }
+    /* NOTE: UIApplication _run/_runWithMainScene swizzles are installed EARLY
+     * (before UIApplicationMain calls _run) by swizzle_uiapplication_run_methods()
+     * in standalone/forced mode. In broker mode we prefer the natural
+     * FBSWorkspace → SpringBoard lifecycle. */
 
     /* FBSWorkspace / FBSScene / FBSWorkspaceClient (ITEM 14).
      *
@@ -7755,11 +7762,43 @@ static void rosettasim_bridge_init(void) {
         bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
     }
 
-    /* With bootstrap_fix.dylib active, look up CARenderServer via standard path.
-     * This MUST happen early (before UIKit creates windows) so g_ca_server_port
-     * is set and the Display Pipeline uses GPU mode.
-     * bootstrap_look_up goes through bootstrap_fix → broker → returns real port. */
-    /* Defer CARenderServer initialization and BKS swizzles.
+    /* CRITICAL: Swizzle UIApplication._run and _runWithMainScene EAGERLY (not deferred).
+     * UIApplicationMain calls [UIApplication _run] synchronously. If _run tries to
+     * connect to FBSWorkspace (which requires SpringBoard), it blocks forever.
+     * Our replacement skips FBSWorkspace and calls _callInitializationDelegatesForMainScene: directly.
+     * This swizzle MUST be installed before UIApplicationMain is called. */
+    {
+        Class appClass = objc_getClass("UIApplication");
+        if (appClass) {
+            SEL runSceneSel = sel_registerName("_runWithMainScene:transitionContext:completion:");
+            Method runSceneMethod = class_getInstanceMethod(appClass, runSceneSel);
+            if (runSceneMethod) {
+                method_setImplementation(runSceneMethod, (IMP)replacement_runWithMainScene);
+                bridge_log("  Swizzled UIApplication._runWithMainScene (EAGER)");
+            }
+
+            SEL runSel = sel_registerName("_run");
+            Method runMethod = class_getInstanceMethod(appClass, runSel);
+            if (runMethod) {
+                method_setImplementation(runMethod, (IMP)replacement_runWithMainScene);
+                bridge_log("  Swizzled UIApplication._run (EAGER)");
+            }
+
+            /* Also install workspaceShouldExit: early to prevent exit() on workspace failure */
+            SEL wseSel = sel_registerName("workspaceShouldExit:");
+            Method wseMethod = class_getInstanceMethod(appClass, wseSel);
+            if (wseMethod) {
+                method_setImplementation(wseMethod, (IMP)_noopMethod);
+            }
+            SEL wse2Sel = sel_registerName("workspaceShouldExit:withTransitionContext:");
+            Method wse2Method = class_getInstanceMethod(appClass, wse2Sel);
+            if (wse2Method) {
+                method_setImplementation(wse2Method, (IMP)_noopMethod);
+            }
+        }
+    }
+
+    /* Defer CARenderServer initialization and remaining BKS swizzles.
      * These trigger framework loading (CoreText → GraphicsServices → MobileGestalt)
      * which does XPC calls to system services (cfprefsd, mobilegestalt) that
      * don't exist in our simulator. Running them in the constructor blocks forever.
