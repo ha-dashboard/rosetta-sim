@@ -566,6 +566,7 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
         env_home,
         env_cffixed_home,
         env_tmpdir,
+        "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous",
         "SIMULATOR_DEVICE_NAME=iPhone 6s",
         "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1",
         "SIMULATOR_RUNTIME_VERSION=10.3",
@@ -651,6 +652,7 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
         env_home,
         env_cffixed_home,
         env_tmpdir,
+        "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous",
         "SIMULATOR_DEVICE_NAME=iPhone 6s",
         "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1",
         "SIMULATOR_RUNTIME_VERSION=10.3",
@@ -875,6 +877,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     env[ei++] = env_home;
     env[ei++] = env_cffixed_home;
     env[ei++] = env_tmpdir;
+    env[ei++] = "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous";
     env[ei++] = "SIMULATOR_DEVICE_NAME=iPhone 6s";
     env[ei++] = "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1";
     env[ei++] = "SIMULATOR_RUNTIME_VERSION=10.3";
@@ -983,6 +986,8 @@ int main(int argc, char *argv[]) {
      * XPC listener may fail if the port doesn't exist yet. */
     {
         const char *precreate_services[] = {
+            /* XPC simulator launchd rendezvous — required by libxpc */
+            "com.apple.xpc.sim.launchd.rendezvous",
             /* assertiond */
             "com.apple.assertiond.applicationstateconnection",
             "com.apple.assertiond.appwatchdog",
