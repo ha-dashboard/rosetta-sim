@@ -671,10 +671,11 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
     }
 }
 
-/* Check for context ID file and schedule CALayerHost creation on main thread */
-static void pfb_check_context_id(void) {
-    if (g_layer_host_created) return;
+/* Track the current CALayerHost contextId so we can detect changes */
+static volatile uint32_t g_current_layerhost_ctx_id = 0;
 
+/* Check for context ID file and create/update CALayerHost */
+static void pfb_check_context_id(void) {
     int fd = open(ROSETTASIM_FB_CONTEXT_PATH, O_RDONLY);
     if (fd < 0) return;
 
@@ -687,11 +688,15 @@ static void pfb_check_context_id(void) {
     uint32_t ctx_id = (uint32_t)strtoul(buf, NULL, 10);
     if (ctx_id == 0) return;
 
-    pfb_log("Found context ID %u in %s", ctx_id, ROSETTASIM_FB_CONTEXT_PATH);
+    /* Skip if already using this contextId */
+    if (ctx_id == g_current_layerhost_ctx_id) return;
 
-    /* Call directly — we're on the sync thread but dispatch_async to main queue
-     * doesn't work reliably in the simulator environment because backboardd's
-     * run loop may not drain GCD blocks from our dispatch target. */
+    pfb_log("Found context ID %u in %s (was %u)", ctx_id, ROSETTASIM_FB_CONTEXT_PATH,
+            g_current_layerhost_ctx_id);
+
+    /* Create or update the CALayerHost */
+    g_current_layerhost_ctx_id = ctx_id;
+    g_layer_host_created = 0; /* allow re-creation with new ID */
     pfb_create_layer_host((void *)(uintptr_t)ctx_id);
 }
 

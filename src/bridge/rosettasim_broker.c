@@ -1090,6 +1090,7 @@ int main(int argc, char *argv[]) {
         broker_log("[broker] spawning SpringBoard...\n");
         if (spawn_springboard(sdk_path) != 0) {
             broker_log("[broker] WARNING: failed to spawn SpringBoard, spawning app directly\n");
+            unlink("/tmp/rosettasim_context_id");
             spawn_app(app_path, sdk_path, bridge_path);
         } else {
             /* Wait for SpringBoard to register its services before spawning app.
@@ -1141,8 +1142,9 @@ int main(int argc, char *argv[]) {
             }
 
             /* Phase 3: Spawn the app.
-             * With SpringBoard running, the app should connect properly
-             * through the FBSWorkspace protocol and get display assignment. */
+             * Delete stale context ID file BEFORE spawning — the app will write
+             * its UIKit _layerContext.contextId after window creation. */
+            unlink("/tmp/rosettasim_context_id");
             spawn_app(app_path, sdk_path, bridge_path);
         }
     }
