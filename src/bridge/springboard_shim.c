@@ -341,132 +341,36 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
     }
 
     if (flags & XPC_CONNECTION_MACH_SERVICE_LISTENER) {
-        /* === LISTENER MODE === */
-        sb_log("xpc_create_mach_service LISTENER '%s'", name);
+        /* === LISTENER MODE ===
+         * With bootstrap_fix.dylib's binary patches in place, the real
+         * xpc_connection_create_mach_service works because its internal
+         * bootstrap_check_in and launch_msg calls are properly routed
+         * through our broker. Just call the real function. */
+        sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
 
-        /* With bootstrap_fix.dylib handling bootstrap_check_in → broker,
-         * we can do check_in ourselves and then create the listener.
-         * The check_in gets the pre-created receive right from the broker.
-         * Then xpc_connection_create_listener creates the XPC endpoint. */
+        if (g_real_xpc_create_mach_service) {
+            xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
+            if (conn) {
+                sb_log("  real LISTENER '%s' → %p (OK)", name, conn);
+                return conn;
+            }
+            sb_log("  real LISTENER '%s' → NULL, trying fallback", name);
+        }
+
+        /* Fallback: do bootstrap_check_in manually and create listener.
+         * This is needed if the real function fails (e.g., XPC pipe protocol
+         * isn't fully implemented in the broker yet). */
         {
             mach_port_t svc_port = MACH_PORT_NULL;
             kern_return_t bkr = bootstrap_check_in(bootstrap_port, name, &svc_port);
-            sb_log("  LISTENER '%s' bootstrap_check_in: kr=%d port=0x%x", name, bkr, svc_port);
+            sb_log("  fallback check_in '%s': kr=%d port=0x%x", name, bkr, svc_port);
             if (bkr == KERN_SUCCESS && svc_port != MACH_PORT_NULL) {
-                /* Got receive right from broker. Register with the broker for
-                 * look_up clients to find this service. The check_in already
-                 * registered the port, so look_up should work. */
-                sb_log("  LISTENER '%s' registered via broker (port 0x%x)", name, svc_port);
+                sb_log("  fallback: got receive right for '%s' (port 0x%x)", name, svc_port);
             }
         }
 
-        /* Now create the XPC listener. Since bootstrap_check_in succeeded
-         * and the port is in our task, the XPC listener should work. */
-
-        /* Step 1: Snapshot current Mach ports */
-        mach_port_name_array_t names_before = NULL;
-        mach_msg_type_number_t names_before_cnt = 0;
-        mach_port_type_array_t types_before = NULL;
-        mach_msg_type_number_t types_before_cnt = 0;
-
-        kern_return_t kr = mach_port_names(mach_task_self(),
-            &names_before, &names_before_cnt,
-            &types_before, &types_before_cnt);
-        if (kr != KERN_SUCCESS) {
-            sb_log("  mach_port_names (before) failed: %d", kr);
-            names_before_cnt = 0;
-        }
-
-        /* Step 2: Create anonymous XPC listener — no launchd interaction */
         xpc_connection_t listener = xpc_connection_create_listener(name, targetq);
-        if (!listener) {
-            sb_log("  xpc_connection_create_listener failed for '%s'", name);
-            if (names_before) {
-                vm_deallocate(mach_task_self(), (vm_address_t)names_before,
-                    names_before_cnt * sizeof(mach_port_name_t));
-                vm_deallocate(mach_task_self(), (vm_address_t)types_before,
-                    types_before_cnt * sizeof(mach_port_type_t));
-            }
-            return NULL;
-        }
-
-        sb_log("  listener created: %p", listener);
-
-        /* Step 3: Snapshot ports again and find the new RECEIVE port */
-        mach_port_name_array_t names_after = NULL;
-        mach_msg_type_number_t names_after_cnt = 0;
-        mach_port_type_array_t types_after = NULL;
-        mach_msg_type_number_t types_after_cnt = 0;
-
-        kr = mach_port_names(mach_task_self(),
-            &names_after, &names_after_cnt,
-            &types_after, &types_after_cnt);
-        if (kr != KERN_SUCCESS) {
-            sb_log("  mach_port_names (after) failed: %d", kr);
-            if (names_before) {
-                vm_deallocate(mach_task_self(), (vm_address_t)names_before,
-                    names_before_cnt * sizeof(mach_port_name_t));
-                vm_deallocate(mach_task_self(), (vm_address_t)types_before,
-                    types_before_cnt * sizeof(mach_port_type_t));
-            }
-            return listener;
-        }
-
-        /* Find new RECEIVE ports that didn't exist before */
-        mach_port_t new_recv_port = MACH_PORT_NULL;
-        for (mach_msg_type_number_t i = 0; i < names_after_cnt; i++) {
-            if (!(types_after[i] & MACH_PORT_TYPE_RECEIVE)) continue;
-
-            /* Check if this port existed before */
-            int existed = 0;
-            for (mach_msg_type_number_t j = 0; j < names_before_cnt; j++) {
-                if (names_after[i] == names_before[j]) {
-                    existed = 1;
-                    break;
-                }
-            }
-            if (!existed) {
-                new_recv_port = names_after[i];
-                sb_log("  found new receive port: 0x%x", new_recv_port);
-                break;
-            }
-        }
-
-        /* Free port name arrays */
-        if (names_before) {
-            vm_deallocate(mach_task_self(), (vm_address_t)names_before,
-                names_before_cnt * sizeof(mach_port_name_t));
-            vm_deallocate(mach_task_self(), (vm_address_t)types_before,
-                types_before_cnt * sizeof(mach_port_type_t));
-        }
-        if (names_after) {
-            vm_deallocate(mach_task_self(), (vm_address_t)names_after,
-                names_after_cnt * sizeof(mach_port_name_t));
-            vm_deallocate(mach_task_self(), (vm_address_t)types_after,
-                types_after_cnt * sizeof(mach_port_type_t));
-        }
-
-        if (new_recv_port == MACH_PORT_NULL) {
-            sb_log("  WARNING: could not find new receive port for '%s'", name);
-            return listener;
-        }
-
-        /* Step 4: Create a send right from the receive port */
-        kr = mach_port_insert_right(mach_task_self(), new_recv_port,
-            new_recv_port, MACH_MSG_TYPE_MAKE_SEND);
-        if (kr != KERN_SUCCESS) {
-            sb_log("  insert_right failed: %d", kr);
-            return listener;
-        }
-
-        /* Step 5: Register service name + send right with the broker */
-        kr = broker_register(name, new_recv_port);
-        if (kr == KERN_SUCCESS) {
-            sb_log("  registered '%s' port 0x%x with broker", name, new_recv_port);
-        } else {
-            sb_log("  WARNING: broker_register '%s' failed: %d", name, kr);
-        }
-
+        sb_log("  fallback listener for '%s': %p", name, listener);
         return listener;
 
     } else {

@@ -32,6 +32,7 @@
 #define BROKER_REGISTER_PORT    700
 #define BROKER_LOOKUP_PORT      701
 #define BROKER_SPAWN_APP        702
+#define XPC_LAUNCH_MSG_ID       0x10000000
 
 #define MIG_REPLY_OFFSET        100
 
@@ -47,6 +48,7 @@
 /* Maximum registry entries — backboardd registers ~17, SpringBoard ~35, app ~5 */
 #define MAX_SERVICES    128
 #define MAX_NAME_LEN    128
+#define BROKER_RECV_BUF_SIZE (64 * 1024)
 
 /* Service registry entry */
 typedef struct {
@@ -425,9 +427,364 @@ static void handle_broker_message(mach_msg_header_t *request) {
     }
 }
 
+/* --- XPC pipe check-in protocol handler ---
+ *
+ * libxpc's xpc_connection_create_mach_service(LISTENER) sends an XPC pipe
+ * message (ID 0x10000000) to the bootstrap port requesting check-in.
+ * We must respond with a proper XPC-formatted reply containing the
+ * MachServices dictionary with receive rights for the requested service.
+ *
+ * XPC wire format:
+ *   4 bytes: magic "!CPX" (0x58504321)
+ *   4 bytes: version (5)
+ *   4 bytes: root type (0x0000f000 = dictionary)
+ *   4 bytes: root size
+ *   4 bytes: entry count
+ *   entries: key (null-padded to 4-byte align) + type(4) + value
+ *
+ * Type codes:
+ *   0x00003000 = bool
+ *   0x00004000 = int64
+ *   0x00009000 = string (4-byte length prefix, null-terminated, padded)
+ *   0x0000f000 = dictionary
+ *   0x0000c000 = mach_send (port in descriptor, not inline)
+ *   0x0000d000 = mach_recv (port in descriptor, not inline)
+ */
+
+#define XPC_MAGIC       0x58504321  /* "!CPX" */
+#define XPC_VERSION     5
+#define XPC_TYPE_DICT   0x0000f000
+#define XPC_TYPE_INT64  0x00004000
+#define XPC_TYPE_STRING 0x00009000
+#define XPC_TYPE_BOOL   0x00003000
+#define XPC_TYPE_MACH_RECV 0x0000d000
+
+/* Extract the service name from an XPC pipe check-in request.
+ * Scans the XPC dictionary for the "name" key and returns its string value. */
+static const char *xpc_extract_service_name(const uint8_t *xpc_data, uint32_t xpc_len) {
+    if (xpc_len < 16) return NULL;
+
+    uint32_t magic = *(uint32_t *)xpc_data;
+    if (magic != XPC_MAGIC) return NULL;
+
+    uint32_t root_type = *(uint32_t *)(xpc_data + 8);
+    if (root_type != XPC_TYPE_DICT) return NULL;
+
+    uint32_t root_size = *(uint32_t *)(xpc_data + 12);
+    uint32_t entry_count = *(uint32_t *)(xpc_data + 16);
+
+    /* Walk entries starting at offset 20 */
+    uint32_t pos = 20;
+    for (uint32_t i = 0; i < entry_count && pos < xpc_len; i++) {
+        /* Key: null-terminated string, padded to 4-byte boundary */
+        const char *key = (const char *)(xpc_data + pos);
+        uint32_t key_len = (uint32_t)strnlen(key, xpc_len - pos);
+        uint32_t key_padded = (key_len + 1 + 3) & ~3; /* align to 4 */
+        pos += key_padded;
+
+        if (pos + 8 > xpc_len) break;
+
+        /* Value: type (4 bytes) + type-specific data */
+        uint32_t val_type = *(uint32_t *)(xpc_data + pos);
+        pos += 4;
+
+        if (val_type == XPC_TYPE_INT64) {
+            /* 8-byte integer */
+            if (pos + 8 > xpc_len) break;
+            pos += 8;
+        } else if (val_type == XPC_TYPE_STRING) {
+            /* 4-byte length + string data (padded) */
+            if (pos + 4 > xpc_len) break;
+            uint32_t str_len = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            if (strcmp(key, "name") == 0 && pos + str_len <= xpc_len) {
+                return (const char *)(xpc_data + pos);
+            }
+            uint32_t str_padded = (str_len + 3) & ~3;
+            pos += str_padded;
+        } else if (val_type == XPC_TYPE_BOOL) {
+            /* Bool: value is in the size field (already read as type) */
+            /* Actually bool has a 4-byte value after type */
+            if (pos + 4 > xpc_len) break;
+            pos += 4;
+        } else if (val_type == XPC_TYPE_DICT) {
+            /* Nested dictionary — skip by reading its size */
+            if (pos + 4 > xpc_len) break;
+            uint32_t dict_size = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            pos += dict_size;
+        } else {
+            /* Unknown type — try to skip using size */
+            if (pos + 4 > xpc_len) break;
+            uint32_t skip = *(uint32_t *)(xpc_data + pos);
+            pos += 4;
+            if (skip < 0x10000) pos += skip; /* sanity limit */
+            else break;
+        }
+    }
+
+    return NULL;
+}
+
+/* Build an XPC pipe check-in response with MachServices.
+ * The response is a complex Mach message with:
+ *   - Port descriptor (MOVE_RECEIVE for the service port)
+ *   - XPC wire data containing a dictionary with:
+ *     - "MachServices" → { service_name → mach_recv(descriptor_index=0) }
+ */
+static void handle_xpc_checkin(mach_msg_header_t *request,
+                                const char *service_name,
+                                mach_port_t service_port) {
+    broker_log("[broker] XPC check-in: building response for '%s' port=0x%x\n",
+               service_name, service_port);
+
+    /* Build the XPC response payload:
+     * Dictionary {
+     *   "subsystem" → int64(3)
+     *   "MachServices" → Dictionary {
+     *     service_name → mach_recv (port descriptor ref)
+     *   }
+     * }
+     */
+    uint8_t xpc_buf[512];
+    uint32_t xpc_pos = 0;
+
+    /* XPC header */
+    *(uint32_t *)(xpc_buf + 0) = XPC_MAGIC;
+    *(uint32_t *)(xpc_buf + 4) = XPC_VERSION;
+    *(uint32_t *)(xpc_buf + 8) = XPC_TYPE_DICT; /* root type */
+    /* root size and entry count filled later */
+    xpc_pos = 20; /* skip header + size + count */
+
+    uint32_t root_entries = 0;
+
+    /* Entry: "subsystem" → int64(3) */
+    {
+        const char *k = "subsystem";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
+        xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = 3;
+        xpc_pos += 8;
+        root_entries++;
+    }
+
+    /* Entry: "error" → int64(0) — success */
+    {
+        const char *k = "error";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
+        xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = 0;
+        xpc_pos += 8;
+        root_entries++;
+    }
+
+    /* Entry: "handle" → int64(0) */
+    {
+        const char *k = "handle";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
+        xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = 0;
+        xpc_pos += 8;
+        root_entries++;
+    }
+
+    /* Entry: "routine" → int64(805) — check-in routine */
+    {
+        const char *k = "routine";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_INT64;
+        xpc_pos += 4;
+        *(uint64_t *)(xpc_buf + xpc_pos) = 805; /* 0x325 = check-in */
+        xpc_pos += 8;
+        root_entries++;
+    }
+
+    /* Entry: "MachServices" → dict { service_name → mach_recv } */
+    {
+        const char *k = "MachServices";
+        uint32_t klen = (uint32_t)strlen(k);
+        uint32_t kpad = (klen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, kpad);
+        memcpy(xpc_buf + xpc_pos, k, klen);
+        xpc_pos += kpad;
+
+        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_DICT;
+        xpc_pos += 4;
+        /* Inner dict size placeholder */
+        uint32_t inner_size_pos = xpc_pos;
+        xpc_pos += 4;
+        uint32_t inner_start = xpc_pos;
+
+        /* Inner dict entry count */
+        *(uint32_t *)(xpc_buf + xpc_pos) = 1; /* one service */
+        xpc_pos += 4;
+
+        /* Inner entry: service_name → mach_recv(descriptor index 0) */
+        uint32_t slen = (uint32_t)strlen(service_name);
+        uint32_t spad = (slen + 1 + 3) & ~3;
+        memset(xpc_buf + xpc_pos, 0, spad);
+        memcpy(xpc_buf + xpc_pos, service_name, slen);
+        xpc_pos += spad;
+
+        /* XPC always uses mach_send type (0x0000c000) in the wire format.
+         * The ACTUAL disposition (send vs receive) comes from the Mach
+         * message descriptor, not the XPC type code.
+         * xpc_dictionary_copy_mach_send checks for __xpc_type_mach_send. */
+        *(uint32_t *)(xpc_buf + xpc_pos) = 0x0000c000; /* XPC_TYPE_MACH_SEND */
+        xpc_pos += 4;
+        *(uint32_t *)(xpc_buf + xpc_pos) = 0; /* wire port index 0 */
+        xpc_pos += 4;
+
+        /* Fill inner dict size */
+        *(uint32_t *)(xpc_buf + inner_size_pos) = xpc_pos - inner_start;
+        root_entries++;
+    }
+
+    /* Fill root dict size and entry count.
+     * Size includes count(4) + entries — matches the request format
+     * where magic(4)+version(4)+type(4)+size(4) = 16 byte header,
+     * and total XPC data = 16 + size. */
+    *(uint32_t *)(xpc_buf + 16) = root_entries;
+    *(uint32_t *)(xpc_buf + 12) = xpc_pos - 16; /* count + entries */
+
+    /* Build the Mach message with port descriptor + XPC payload */
+    uint32_t xpc_data_len = xpc_pos;
+    /* Pad XPC data to 4-byte boundary */
+    uint32_t xpc_padded = (xpc_data_len + 3) & ~3;
+
+#pragma pack(4)
+    struct {
+        mach_msg_header_t head;
+        mach_msg_body_t body;
+        mach_msg_port_descriptor_t port_desc[2];
+        uint8_t xpc_data[512];
+    } reply;
+#pragma pack()
+
+    memset(&reply, 0, sizeof(reply));
+
+    reply.head.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+        MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+    reply.head.msgh_size = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) +
+        2 * sizeof(mach_msg_port_descriptor_t) + xpc_padded;
+    reply.head.msgh_remote_port = request->msgh_remote_port;
+    reply.head.msgh_local_port = MACH_PORT_NULL;
+    /* XPC pipe replies use the SAME message ID as the request (not +100) */
+    reply.head.msgh_id = request->msgh_id;
+
+    /* Two port descriptors:
+     * 1. Service receive right (MOVE_RECEIVE) — the listener port
+     * 2. Broker send right (COPY_SEND) — for the listener's registration message.
+     *    _xpc_connection_check_in sends a registration message to this port. */
+    reply.body.msgh_descriptor_count = 2;
+
+    reply.port_desc[0].name = service_port;
+    reply.port_desc[0].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+    reply.port_desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
+
+    reply.port_desc[1].name = g_broker_port;
+    reply.port_desc[1].disposition = MACH_MSG_TYPE_COPY_SEND;
+    reply.port_desc[1].type = MACH_MSG_PORT_DESCRIPTOR;
+
+    memcpy(reply.xpc_data, xpc_buf, xpc_data_len);
+
+    /* Hex dump the response for debugging */
+    broker_log("[broker] XPC response for '%s' (%u bytes): ", service_name, reply.head.msgh_size);
+    uint8_t *rraw = (uint8_t *)&reply;
+    uint32_t dump = reply.head.msgh_size < 120 ? reply.head.msgh_size : 120;
+    for (uint32_t d = 0; d < dump; d++) {
+        if (d % 16 == 0) broker_log("\n[broker]   %04x: ", d);
+        broker_log("%02x ", rraw[d]);
+    }
+    broker_log("\n");
+
+    kern_return_t kr = mach_msg(&reply.head, MACH_SEND_MSG, reply.head.msgh_size,
+                                 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+
+    if (kr == KERN_SUCCESS) {
+        broker_log("[broker] XPC check-in response sent for '%s'\n", service_name);
+    } else {
+        broker_log("[broker] XPC check-in response FAILED: 0x%x\n", kr);
+    }
+}
+
+/* Handle XPC pipe message (msg_id 0x10000000) */
+static void handle_xpc_launch_msg(mach_msg_header_t *request) {
+    uint8_t *raw = (uint8_t *)request;
+    uint32_t total = request->msgh_size;
+    int is_complex = (request->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+    uint32_t data_offset = sizeof(mach_msg_header_t);
+
+    if (is_complex) {
+        mach_msg_body_t *body = (mach_msg_body_t *)(raw + data_offset);
+        uint32_t desc_count = body->msgh_descriptor_count;
+        data_offset += sizeof(mach_msg_body_t) + desc_count * sizeof(mach_msg_port_descriptor_t);
+    }
+
+    /* Extract service name from XPC data */
+    const char *service_name = NULL;
+    if (data_offset < total) {
+        service_name = xpc_extract_service_name(raw + data_offset, total - data_offset);
+    }
+
+    if (service_name) {
+        broker_log("[broker] XPC pipe check-in for service: '%s'\n", service_name);
+
+        /* Find the pre-created port for this service */
+        mach_port_t service_port = MACH_PORT_NULL;
+        for (int i = 0; i < MAX_SERVICES; i++) {
+            if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
+                service_port = g_services[i].port;
+                break;
+            }
+        }
+
+        if (service_port != MACH_PORT_NULL) {
+            handle_xpc_checkin(request, service_name, service_port);
+            return;
+        }
+
+        broker_log("[broker] XPC check-in: service '%s' not found, creating\n", service_name);
+        /* Create a new port for unknown services */
+        kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service_port);
+        if (kr == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
+            register_service(service_name, service_port);
+            handle_xpc_checkin(request, service_name, service_port);
+            return;
+        }
+    }
+
+    /* Fallback: couldn't parse or no service found */
+    broker_log("[broker] XPC pipe msg: unparseable (size=%u), sending error reply\n", total);
+    if (request->msgh_remote_port != MACH_PORT_NULL) {
+        send_error_reply(request->msgh_remote_port,
+                         request->msgh_id + MIG_REPLY_OFFSET, 0);
+    }
+}
+
 /* Message dispatch loop */
 static void message_loop(void) {
-    uint8_t recv_buffer[4096];
+    uint8_t recv_buffer[BROKER_RECV_BUF_SIZE];
     mach_msg_header_t *request = (mach_msg_header_t *)recv_buffer;
 
     broker_log("[broker] entering message loop\n");
@@ -442,6 +799,11 @@ static void message_loop(void) {
         if (kr != KERN_SUCCESS) {
             if (kr == MACH_RCV_INTERRUPTED) {
                 broker_log("[broker] mach_msg interrupted\n");
+                continue;
+            }
+            if (kr == MACH_RCV_TOO_LARGE) {
+                broker_log("[broker] mach_msg too large: needed=%u buffer=%u\n",
+                           request->msgh_size, (unsigned)sizeof(recv_buffer));
                 continue;
             }
             broker_log("[broker] mach_msg failed: 0x%x\n", kr);
@@ -492,6 +854,9 @@ static void message_loop(void) {
             case BROKER_LOOKUP_PORT:
             case BROKER_SPAWN_APP:
                 handle_broker_message(request);
+                break;
+            case XPC_LAUNCH_MSG_ID:
+                handle_xpc_launch_msg(request);
                 break;
 
             default:
@@ -721,19 +1086,10 @@ static int spawn_iokitsimd(const char *sdk_path) {
 
     broker_log("[broker] spawning iokitsimd: %s\n", iokitsimd_path);
 
-    /* iokitsimd is a macOS native binary — do NOT set DYLD_ROOT_PATH.
-     * Only set HOME and bootstrap_fix for bootstrap interception. */
-    char cwd[1024];
-    getcwd(cwd, sizeof(cwd));
-    char env_bfix[1280];
-    snprintf(env_bfix, sizeof(env_bfix),
-             "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib", cwd);
-
-    /* iokitsimd uses launch_msg for check-in, which requires bootstrap port.
-     * With bootstrap_fix, bootstrap operations go through our broker. */
+    /* iokitsimd is a macOS native binary — do NOT inject iOS-simulator dylibs. */
     char *env[] = {
-        env_bfix,
         "HOME=/tmp",
+        "TMPDIR=/tmp",
         NULL
     };
 
@@ -1083,7 +1439,7 @@ int main(int argc, char *argv[]) {
     if (app_path) {
         broker_log("[broker] waiting for CARenderServer before spawning app...\n");
         /* Process messages until CARenderServer is registered or timeout */
-        uint8_t tmp_buf[4096];
+        uint8_t tmp_buf[BROKER_RECV_BUF_SIZE];
         mach_msg_header_t *tmp_req = (mach_msg_header_t *)tmp_buf;
         int ca_found = 0;
         for (int attempt = 0; attempt < 50 && !ca_found; attempt++) {
@@ -1092,6 +1448,11 @@ int main(int argc, char *argv[]) {
                                              0, sizeof(tmp_buf), g_port_set,
                                              500, MACH_PORT_NULL);
             if (msg_kr == MACH_RCV_TIMED_OUT) continue;
+            if (msg_kr == MACH_RCV_TOO_LARGE) {
+                broker_log("[broker] pre-app loop: message too large (needed=%u)\n",
+                           tmp_req->msgh_size);
+                continue;
+            }
             if (msg_kr != KERN_SUCCESS) break;
 
             broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
@@ -1150,6 +1511,11 @@ int main(int argc, char *argv[]) {
                                                  0, sizeof(tmp_buf), g_port_set,
                                                  500, MACH_PORT_NULL);
                 if (msg_kr == MACH_RCV_TIMED_OUT) continue;
+                if (msg_kr == MACH_RCV_TOO_LARGE) {
+                    broker_log("[broker] assertiond wait: message too large (needed=%u)\n",
+                               tmp_req->msgh_size);
+                    continue;
+                }
                 if (msg_kr != KERN_SUCCESS) break;
                 broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);
                 switch (tmp_req->msgh_id) {
@@ -1199,6 +1565,11 @@ int main(int argc, char *argv[]) {
                                                  0, sizeof(tmp_buf), g_port_set,
                                                  500, MACH_PORT_NULL);
                 if (msg_kr == MACH_RCV_TIMED_OUT) continue;
+                if (msg_kr == MACH_RCV_TOO_LARGE) {
+                    broker_log("[broker] springboard wait: message too large (needed=%u)\n",
+                               tmp_req->msgh_size);
+                    continue;
+                }
                 if (msg_kr != KERN_SUCCESS) break;
 
                 broker_log("[broker] received message: id=%d size=%d\n", tmp_req->msgh_id, tmp_req->msgh_size);

@@ -26,6 +26,9 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #import <Foundation/Foundation.h>
+#include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
+#include <mach-o/loader.h>
 
 /* bootstrap types */
 typedef char name_t[128];
@@ -389,58 +392,70 @@ static launch_data_t replacement_launch_msg(launch_data_t msg) {
     if (msg && launch_data_get_type(msg) == LAUNCH_DATA_STRING) {
         const char *cmd = launch_data_get_string(msg);
         if (cmd && strcmp(cmd, LAUNCH_KEY_CHECKIN) == 0) {
-            bfix_log("[bfix] launch_msg('CheckIn') intercepted\n");
+            const char *progname = getprogname();
+            bfix_log("[bfix] launch_msg('CheckIn') intercepted (process: %s)\n",
+                     progname ? progname : "unknown");
 
-            /* Build a check-in response dictionary with MachServices.
-             * For each service we have in the broker, do bootstrap_check_in
-             * and put the port in the response. */
-            launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-            launch_data_t mach_services = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-
-            /* Check in known service patterns for the current process.
-             * We check_in dynamically — the broker will give us the pre-created port. */
-            const char *service_prefixes[] = {
-                "com.apple.assertiond.",
-                "com.apple.frontboard.",
-                "com.apple.backboard.",
-                NULL
-            };
-
-            /* Try common service names */
-            const char *all_services[] = {
+            /* Only check_in services that belong to THIS process.
+             * In real launchd, each daemon's plist lists its MachServices.
+             * launch_msg("CheckIn") returns only that daemon's services.
+             * We emulate this by matching process name to service prefix. */
+            static const char *assertiond_services[] = {
                 "com.apple.assertiond.applicationstateconnection",
                 "com.apple.assertiond.appwatchdog",
                 "com.apple.assertiond.expiration",
                 "com.apple.assertiond.processassertionconnection",
                 "com.apple.assertiond.processinfoservice",
+                NULL
+            };
+            static const char *frontboard_services[] = {
                 "com.apple.frontboard.systemappservices",
                 "com.apple.frontboard.workspace",
                 NULL
             };
 
+            const char **my_services = NULL;
+            if (progname && strstr(progname, "assertiond")) {
+                my_services = assertiond_services;
+            } else if (progname && (strstr(progname, "SpringBoard") ||
+                                     strstr(progname, "springboard"))) {
+                my_services = frontboard_services;
+            }
+
+            if (!my_services) {
+                bfix_log("[bfix] launch_msg CheckIn: no services for process '%s'\n",
+                         progname ? progname : "unknown");
+                /* Fall through to original — might be a process we don't know about */
+                return launch_msg(msg);
+            }
+
+            /* Build check-in response with only this process's services */
+            launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+            launch_data_t mach_services = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+
             mach_port_t bp = get_bootstrap_port();
             int found = 0;
-            for (int i = 0; all_services[i]; i++) {
+            for (int i = 0; my_services[i]; i++) {
                 mach_port_t svc_port = MACH_PORT_NULL;
-                kern_return_t kr = replacement_bootstrap_check_in(bp, all_services[i], &svc_port);
+                kern_return_t kr = replacement_bootstrap_check_in(bp, my_services[i], &svc_port);
                 if (kr == KERN_SUCCESS && svc_port != MACH_PORT_NULL) {
                     launch_data_t port_data = launch_data_new_machport(svc_port);
-                    launch_data_dict_insert(mach_services, port_data, all_services[i]);
-                    bfix_log("[bfix] launch_msg CheckIn: %s → port 0x%x\n", all_services[i], svc_port);
+                    launch_data_dict_insert(mach_services, port_data, my_services[i]);
+                    bfix_log("[bfix] launch_msg CheckIn: %s → port 0x%x\n", my_services[i], svc_port);
                     found++;
                 }
             }
 
             if (found > 0) {
                 launch_data_dict_insert(resp, mach_services, LAUNCH_JOBKEY_MACHSERVICES);
-                bfix_log("[bfix] launch_msg CheckIn: returning %d services\n", found);
+                bfix_log("[bfix] launch_msg CheckIn: returning %d services for %s\n",
+                         found, progname);
                 return resp;
             }
 
-            /* No services found — fall through to original */
             launch_data_free(mach_services);
             launch_data_free(resp);
-            bfix_log("[bfix] launch_msg CheckIn: no services, falling through\n");
+            bfix_log("[bfix] launch_msg CheckIn: no services found, falling through\n");
         }
     }
 
@@ -566,6 +581,283 @@ static void patch_client_port(mach_port_t port_value) {
              verify == port_value ? "OK" : "FAILED (Rosetta may cache old translation)");
 }
 
+/* --- Runtime binary patching for intra-library bootstrap calls ---
+ *
+ * DYLD interposition only catches cross-library calls. When libxpc's
+ * _xpc_pipe_create calls bootstrap_look_up internally, the call goes
+ * directly to the function body (not through GOT), bypassing interposition.
+ *
+ * Fix: Find the original function in the loaded Mach-O image and overwrite
+ * its first 12 bytes with a trampoline to our replacement. This catches
+ * ALL calls — both intra-library and cross-library.
+ */
+
+/* Find a symbol in a Mach-O 64-bit image by walking its symbol table.
+ * This bypasses DYLD interposition, which only affects GOT entries. */
+static void *find_symbol_in_macho(const struct mach_header_64 *header,
+                                   intptr_t slide,
+                                   const char *symbol_name) {
+    const uint8_t *ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+    const struct symtab_command *symtab_cmd = NULL;
+    const struct segment_command_64 *linkedit_seg = NULL;
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *cmd = (const struct load_command *)ptr;
+        if (cmd->cmd == LC_SYMTAB) {
+            symtab_cmd = (const struct symtab_command *)cmd;
+        } else if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) {
+                linkedit_seg = seg;
+            }
+        }
+        ptr += cmd->cmdsize;
+    }
+
+    if (!symtab_cmd || !linkedit_seg) return NULL;
+
+    /* Symbol and string tables live in __LINKEDIT */
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr
+                              - linkedit_seg->fileoff;
+    const struct nlist_64 *symtab =
+        (const struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab_cmd->stroff);
+
+    for (uint32_t j = 0; j < symtab_cmd->nsyms; j++) {
+        if ((symtab[j].n_type & N_TYPE) != N_SECT) continue;
+        uint32_t strx = symtab[j].n_un.n_strx;
+        if (strx == 0) continue;
+        if (strcmp(strtab + strx, symbol_name) == 0) {
+            return (void *)(symtab[j].n_value + slide);
+        }
+    }
+
+    return NULL;
+}
+
+/* Find the original (non-interposed) address of a function.
+ * Searches all loaded Mach-O images EXCEPT bootstrap_fix.dylib. */
+static void *find_original_function(const char *func_name) {
+    char mangled[256];
+    snprintf(mangled, sizeof(mangled), "_%s", func_name);
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *image_name = _dyld_get_image_name(i);
+        if (!image_name) continue;
+        if (strstr(image_name, "bootstrap_fix")) continue;
+
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        void *sym = find_symbol_in_macho(
+            (const struct mach_header_64 *)mh, slide, mangled);
+        if (sym) {
+            bfix_log("[bfix] found original '%s' at %p in %s\n",
+                     func_name, sym, image_name);
+            return sym;
+        }
+    }
+
+    bfix_log("[bfix] WARNING: original '%s' not found\n", func_name);
+    return NULL;
+}
+
+/* Write x86_64 trampoline at target address.
+ * movabs rax, <replacement_addr>   ; 48 B8 <8 bytes>
+ * jmp rax                           ; FF E0
+ * Total: 12 bytes */
+static int write_trampoline(void *target, void *replacement, const char *name) {
+    if (!target || !replacement || target == replacement) {
+        bfix_log("[bfix] trampoline '%s': skip (target=%p repl=%p)\n",
+                 name, target, replacement);
+        return -1;
+    }
+
+    bfix_log("[bfix] trampoline '%s': %p → %p\n", name, target, replacement);
+
+    /* Make code page writable (2 pages in case patch spans boundary) */
+    vm_address_t page = (vm_address_t)target & ~(vm_address_t)0xFFF;
+    kern_return_t kr = vm_protect(mach_task_self(), page, 0x2000, FALSE,
+                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        kr = vm_protect(mach_task_self(), page, 0x1000, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr != KERN_SUCCESS) {
+            bfix_log("[bfix] trampoline '%s': vm_protect failed 0x%x\n", name, kr);
+            return -1;
+        }
+    }
+
+    uint8_t *code = (uint8_t *)target;
+    uint64_t addr = (uint64_t)(uintptr_t)replacement;
+
+    code[0]  = 0x48;           /* REX.W */
+    code[1]  = 0xB8;           /* mov rax, imm64 */
+    memcpy(&code[2], &addr, 8);
+    code[10] = 0xFF;           /* jmp rax */
+    code[11] = 0xE0;
+
+    /* Verify the write by reading back */
+    if (code[0] != 0x48 || code[1] != 0xB8 || code[10] != 0xFF || code[11] != 0xE0) {
+        bfix_log("[bfix] trampoline '%s': WRITE VERIFY FAILED\n", name);
+    }
+
+    /* Restore protections — vm_protect RW→RX flushes Rosetta translation cache */
+    vm_protect(mach_task_self(), page, 0x2000, FALSE,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+
+    /* Force Rosetta to re-translate by invalidating the instruction cache.
+     * On Apple Silicon under Rosetta 2, sys_icache_invalidate signals that
+     * translated code at this address is stale. */
+    extern void sys_icache_invalidate(void *start, size_t len);
+    sys_icache_invalidate(target, 12);
+
+    bfix_log("[bfix] trampoline '%s': OK (icache invalidated)\n", name);
+    return 0;
+}
+
+/* Replacement for _xpc_connection_check_in inside libxpc.
+ *
+ * The original LISTENER path builds a 52-byte Mach registration message and
+ * sends it to launchd via dispatch_mach_connect. Since we don't have launchd,
+ * we bypass the registration message and just call dispatch_mach_connect
+ * directly with NULL message — same as the non-listener path.
+ *
+ * Connection object layout (from disassembly):
+ *   0x28: state (6 = success)
+ *   0x34: port1 (recv_right for listener, send_right for client)
+ *   0x3c: port2 (extra_port)
+ *   0x58: dispatch_mach_channel (void *)
+ *   0xd9: flags byte (bit 0x2 = LISTENER mode)
+ */
+typedef void (*dispatch_mach_connect_fn)(void *channel, mach_port_t port1,
+                                          mach_port_t port2, void *msg);
+static dispatch_mach_connect_fn g_dispatch_mach_connect = NULL;
+
+static void replacement_xpc_connection_check_in(void *conn) {
+    uint8_t *obj = (uint8_t *)conn;
+    int is_listener = (obj[0xd9] & 0x2) != 0;
+
+    /* Set state to 6 (success) */
+    *(uint32_t *)(obj + 0x28) = 6;
+
+    /* Get ports and channel from connection object */
+    void *channel = *(void **)(obj + 0x58);
+    mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
+    mach_port_t port2 = *(mach_port_t *)(obj + 0x3c);
+
+    /* Resolve dispatch_mach_connect on first call */
+    if (!g_dispatch_mach_connect) {
+        g_dispatch_mach_connect = (dispatch_mach_connect_fn)
+            dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
+    }
+
+    if (g_dispatch_mach_connect && channel) {
+        /* Call dispatch_mach_connect WITHOUT the registration message.
+         * For non-listener: same as original code.
+         * For listener: skips the 52-byte Mach message to launchd.
+         * This works because our broker handles service routing directly
+         * via bootstrap_look_up — no launchd registration needed. */
+        g_dispatch_mach_connect(channel, port1, port2, NULL);
+    }
+
+    bfix_log("[bfix] _xpc_connection_check_in: %s state=6 channel=%p port1=0x%x port2=0x%x\n",
+             is_listener ? "LISTENER" : "CLIENT", channel, port1, port2);
+}
+
+/* Replacement for _xpc_look_up_endpoint inside libxpc.
+ *
+ * This is the function that builds the XPC pipe check-in request and sends it
+ * via _xpc_domain_routine. We bypass the XPC pipe protocol entirely and use
+ * our broker's bootstrap_check_in/look_up directly.
+ *
+ * Signature (from disassembly):
+ *   mach_port_t _xpc_look_up_endpoint(
+ *     const char *name,        // rdi — service name
+ *     int type,                // esi — 5=client, 7=listener
+ *     uint64_t handle,         // rdx
+ *     uint64_t lookup_handle,  // rcx
+ *     void *something,         // r8
+ *     uint64_t flags           // r9
+ *   );
+ */
+static mach_port_t replacement_xpc_look_up_endpoint(
+    const char *name, int type, uint64_t handle,
+    uint64_t lookup_handle, void *something, uint64_t flags) {
+
+    mach_port_t port = MACH_PORT_NULL;
+    mach_port_t bp = get_bootstrap_port();
+
+    bfix_log("[bfix] _xpc_look_up_endpoint('%s', type=%d)\n",
+             name ? name : "(null)", type);
+
+    if (!name || bp == MACH_PORT_NULL) return MACH_PORT_NULL;
+
+    if (type == 7) {
+        /* LISTENER check-in: get receive right from broker */
+        kern_return_t kr = replacement_bootstrap_check_in(bp, name, &port);
+        bfix_log("[bfix] _xpc_look_up_endpoint LISTENER '%s': port=0x%x (kr=%d)\n",
+                 name, port, kr);
+    } else {
+        /* CLIENT look-up: get send right from broker */
+        kern_return_t kr = replacement_bootstrap_look_up(bp, name, &port);
+        bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': port=0x%x (kr=%d)\n",
+                 name, port, kr);
+    }
+
+    return port;
+}
+
+/* Patch bootstrap functions so intra-library calls in libxpc are redirected.
+ * We must patch ALL variants: the basic functions plus the 2/3 variants
+ * that take additional parameters (flags, instance_id). The trampoline
+ * redirects to our basic replacement — extra args are harmlessly ignored
+ * because our replacement only reads rdi/rsi/rdx (first 3 params). */
+static void patch_bootstrap_functions(void) {
+    bfix_log("[bfix] === patching bootstrap functions for intra-library calls ===\n");
+
+    struct { const char *name; void *replacement; } patches[] = {
+        { "bootstrap_look_up",   (void *)replacement_bootstrap_look_up },
+        { "bootstrap_look_up2",  (void *)replacement_bootstrap_look_up },
+        { "bootstrap_look_up3",  (void *)replacement_bootstrap_look_up },
+        { "bootstrap_check_in",  (void *)replacement_bootstrap_check_in },
+        { "bootstrap_check_in2", (void *)replacement_bootstrap_check_in },
+        { "bootstrap_check_in3", (void *)replacement_bootstrap_check_in },
+        { "bootstrap_register",  (void *)replacement_bootstrap_register },
+        /* Bypass the XPC pipe protocol entirely for endpoint lookups.
+         * _xpc_look_up_endpoint would send an XPC pipe message to launchd
+         * and parse the response. We replace it with direct broker calls. */
+        { "_xpc_look_up_endpoint", (void *)replacement_xpc_look_up_endpoint },
+        /* Bypass the launchd registration in _xpc_connection_check_in */
+        { "_xpc_connection_check_in", (void *)replacement_xpc_connection_check_in },
+    };
+    int n_patches = sizeof(patches) / sizeof(patches[0]);
+
+    for (int i = 0; i < n_patches; i++) {
+        void *orig = find_original_function(patches[i].name);
+        if (orig) {
+            write_trampoline(orig, patches[i].replacement, patches[i].name);
+        }
+    }
+
+    /* Verify trampolines work by calling the original address.
+     * If the trampoline is working, it redirects to our replacement,
+     * which logs "[bfix] look_up('__trampoline_verify__')". */
+    void *orig_look_up = find_original_function("bootstrap_look_up");
+    if (orig_look_up) {
+        typedef kern_return_t (*bootstrap_look_up_fn)(mach_port_t, const char *, mach_port_t *);
+        mach_port_t dummy = MACH_PORT_NULL;
+        bfix_log("[bfix] trampoline verify: calling original bootstrap_look_up at %p...\n", orig_look_up);
+        kern_return_t vkr = ((bootstrap_look_up_fn)orig_look_up)(
+            get_bootstrap_port(), "__trampoline_verify__", &dummy);
+        bfix_log("[bfix] trampoline verify: result=%d (expect look_up log above)\n", vkr);
+    }
+
+    bfix_log("[bfix] === bootstrap patching complete ===\n");
+}
+
 /* Also set the global for any code that reads it directly */
 __attribute__((constructor))
 static void bootstrap_fix_constructor(void) {
@@ -573,6 +865,12 @@ static void bootstrap_fix_constructor(void) {
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
     if (bp != MACH_PORT_NULL) {
         bootstrap_port = bp;
+
+        /* Patch bootstrap functions for intra-library calls.
+         * DYLD interposition catches cross-library calls, but _xpc_pipe_create
+         * in libxpc calls bootstrap_look_up as an intra-library call.
+         * This must happen BEFORE any XPC operations. */
+        patch_bootstrap_functions();
 
         /* Look up CARenderServer and patch the client port.
          * This must happen BEFORE UIKit creates any windows. */
