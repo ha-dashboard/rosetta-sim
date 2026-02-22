@@ -672,6 +672,60 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
     return 0;
 }
 
+/* Track iokitsimd PID */
+static pid_t g_iokitsimd_pid = -1;
+
+/* Spawn iokitsimd — the IOKit simulator daemon.
+ * This is a NATIVE macOS x86_64 binary (NOT against iOS SDK) that provides
+ * IOKit MIG services including IOConnectMapMemory for IOSurface sharing.
+ * The wrapper script _iokitsimd unsets DYLD_ROOT_PATH before exec'ing. */
+static int spawn_iokitsimd(const char *sdk_path) {
+    /* The actual binary path within the SDK */
+    char iokitsimd_path[1024];
+    snprintf(iokitsimd_path, sizeof(iokitsimd_path), "%s/usr/sbin/iokitsimd", sdk_path);
+
+    if (access(iokitsimd_path, X_OK) != 0) {
+        broker_log("[broker] iokitsimd not found: %s\n", iokitsimd_path);
+        return -1;
+    }
+
+    broker_log("[broker] spawning iokitsimd: %s\n", iokitsimd_path);
+
+    /* iokitsimd is a macOS native binary — do NOT set DYLD_ROOT_PATH.
+     * Only set HOME and bootstrap_fix for bootstrap interception. */
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+    char env_bfix[1280];
+    snprintf(env_bfix, sizeof(env_bfix),
+             "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib", cwd);
+
+    /* iokitsimd uses launch_msg for check-in, which requires bootstrap port.
+     * With bootstrap_fix, bootstrap operations go through our broker. */
+    char *env[] = {
+        env_bfix,
+        "HOME=/tmp",
+        NULL
+    };
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);
+
+    char *argv[] = { iokitsimd_path, NULL };
+    pid_t pid;
+    int result = posix_spawn(&pid, iokitsimd_path, NULL, &attr, argv, env);
+    posix_spawnattr_destroy(&attr);
+
+    if (result != 0) {
+        broker_log("[broker] iokitsimd spawn failed: %s\n", strerror(result));
+        return -1;
+    }
+
+    broker_log("[broker] iokitsimd spawned with pid %d\n", pid);
+    g_iokitsimd_pid = pid;
+    return 0;
+}
+
 /* Spawn assertiond — process assertion daemon.
  * Must start BEFORE SpringBoard (SpringBoard's AssertionServices
  * framework connects to assertiond's XPC services during bootstrap). */
@@ -912,6 +966,15 @@ int main(int argc, char *argv[]) {
     /* Write PID file */
     write_pid_file();
 
+    /* Spawn iokitsimd — IOKit simulator daemon.
+     * Must start BEFORE backboardd (backboardd uses IOKit for display/HID). */
+    if (spawn_iokitsimd(sdk_path) != 0) {
+        broker_log("[broker] WARNING: iokitsimd failed to spawn (IOKit stubs unavailable)\n");
+    } else {
+        /* Brief pause for iokitsimd to register its MachService */
+        usleep(200000); /* 200ms */
+    }
+
     /* Spawn backboardd */
     if (spawn_backboardd(sdk_path, shim_path) != 0) {
         broker_log("[broker] failed to spawn backboardd\n");
@@ -1106,6 +1169,12 @@ int main(int argc, char *argv[]) {
         broker_log("[broker] killing backboardd (pid %d)\n", g_backboardd_pid);
         kill(g_backboardd_pid, SIGTERM);
         waitpid(g_backboardd_pid, NULL, 0);
+    }
+
+    if (g_iokitsimd_pid > 0) {
+        broker_log("[broker] killing iokitsimd (pid %d)\n", g_iokitsimd_pid);
+        kill(g_iokitsimd_pid, SIGTERM);
+        waitpid(g_iokitsimd_pid, NULL, WNOHANG);
     }
 
     if (g_broker_port != MACH_PORT_NULL) {
