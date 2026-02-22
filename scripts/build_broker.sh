@@ -23,8 +23,8 @@ if [ ! -f "$SRC_FILE" ]; then
     exit 1
 fi
 
-# Compile as x86_64 macOS binary
-clang -arch x86_64 \
+# Compile as arm64 native macOS binary (runs natively, no Rosetta)
+clang -arch arm64 \
     -Wall -Wextra \
     -O2 \
     -o "$OUT_FILE" \

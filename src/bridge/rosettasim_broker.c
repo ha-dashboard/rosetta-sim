@@ -4,7 +4,7 @@
  * Mach port broker for RosettaSim - enables cross-process Mach port sharing
  * between backboardd and iOS app processes.
  *
- * Compiled as x86_64 macOS binary (NOT against iOS SDK).
+ * Compiled as arm64 native macOS binary (NOT against iOS SDK).
  */
 
 #include <mach/mach.h>
@@ -22,12 +22,12 @@
 #include <stdarg.h>
 #include <fcntl.h>
 
-/* Message IDs */
-#define BOOTSTRAP_CHECK_IN      400
-#define BOOTSTRAP_REGISTER      401
-#define BOOTSTRAP_LOOK_UP       402
-#define BOOTSTRAP_PARENT        404
-#define BOOTSTRAP_SUBSET        405
+/* MIG Message IDs (from bootstrap.defs subsystem 400) */
+#define BOOTSTRAP_CHECK_IN      402
+#define BOOTSTRAP_REGISTER      403
+#define BOOTSTRAP_LOOK_UP       404
+#define BOOTSTRAP_PARENT        406
+#define BOOTSTRAP_SUBSET        409
 
 #define BROKER_REGISTER_PORT    700
 #define BROKER_LOOKUP_PORT      701
@@ -63,13 +63,17 @@ static volatile sig_atomic_t g_shutdown = 0;
 
 /* Use system's NDR_record - already defined in mach/ndr.h */
 
-/* Message structures */
+/* Message structures — match actual MIG wire format:
+ * look_up/check_in request: header(24) + NDR(8) + name_t(128) = 160 bytes
+ * register request: header(24) + body(4) + port_desc(12) + NDR(8) + name_t(128) = 176 bytes
+ * port reply: header(24) + body(4) + port_desc(12) = 40 bytes
+ * error reply: header(24) + NDR(8) + retcode(4) = 36 bytes
+ */
 #pragma pack(4)
 typedef struct {
     mach_msg_header_t head;
     NDR_record_t ndr;
-    uint32_t name_len;
-    char name[MAX_NAME_LEN];
+    char name[MAX_NAME_LEN]; /* name_t: fixed 128 bytes, no length prefix */
 } bootstrap_simple_request_t;
 
 typedef struct {
@@ -77,7 +81,6 @@ typedef struct {
     mach_msg_body_t body;
     mach_msg_port_descriptor_t port_desc;
     NDR_record_t ndr;
-    uint32_t name_len;
     char name[MAX_NAME_LEN];
 } bootstrap_complex_request_t;
 
@@ -92,6 +95,24 @@ typedef struct {
     NDR_record_t ndr;
     kern_return_t ret_code;
 } bootstrap_error_reply_t;
+
+/* Legacy custom broker message format (used by purple_fb_server.c, ID 700+).
+ * These have a name_len prefix unlike the standard MIG format. */
+typedef struct {
+    mach_msg_header_t head;
+    NDR_record_t ndr;
+    uint32_t name_len;
+    char name[MAX_NAME_LEN];
+} broker_simple_request_t;
+
+typedef struct {
+    mach_msg_header_t head;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t port_desc;
+    NDR_record_t ndr;
+    uint32_t name_len;
+    char name[MAX_NAME_LEN];
+} broker_complex_request_t;
 #pragma pack()
 
 /* Logging function */
@@ -172,8 +193,11 @@ static mach_port_t lookup_service(const char *name) {
     return MACH_PORT_NULL;
 }
 
-/* Send reply with port descriptor */
-static kern_return_t send_port_reply(mach_port_t reply_port, uint32_t msg_id, mach_port_t port) {
+/* Send reply with port descriptor.
+ * disposition: MACH_MSG_TYPE_MOVE_RECEIVE for check_in,
+ *              MACH_MSG_TYPE_COPY_SEND for look_up */
+static kern_return_t send_port_reply(mach_port_t reply_port, uint32_t msg_id,
+                                      mach_port_t port, mach_msg_type_name_t disposition) {
     bootstrap_port_reply_t reply;
     memset(&reply, 0, sizeof(reply));
 
@@ -186,7 +210,7 @@ static kern_return_t send_port_reply(mach_port_t reply_port, uint32_t msg_id, ma
     reply.body.msgh_descriptor_count = 1;
 
     reply.port_desc.name = port;
-    reply.port_desc.disposition = MACH_MSG_TYPE_COPY_SEND;
+    reply.port_desc.disposition = disposition;
     reply.port_desc.type = MACH_MSG_PORT_DESCRIPTOR;
 
     kern_return_t kr = mach_msg(&reply.head, MACH_SEND_MSG, sizeof(reply), 0,
@@ -223,19 +247,17 @@ static kern_return_t send_error_reply(mach_port_t reply_port, uint32_t msg_id, k
     return kr;
 }
 
-/* Handle bootstrap_check_in */
+/* Handle bootstrap_check_in (ID 402)
+ * Creates a new port, sends RECEIVE right to caller, keeps SEND right for look_ups.
+ * This is how launchd works: the service daemon gets the receive right,
+ * and clients get send rights through look_up. */
 static void handle_check_in(mach_msg_header_t *request) {
     bootstrap_simple_request_t *req = (bootstrap_simple_request_t *)request;
     char service_name[MAX_NAME_LEN];
 
-    /* Extract service name */
-    uint32_t name_len = req->name_len;
-    if (name_len >= MAX_NAME_LEN) {
-        name_len = MAX_NAME_LEN - 1;
-    }
-
-    memcpy(service_name, req->name, name_len);
-    service_name[name_len] = '\0';
+    /* Extract service name (fixed 128-byte field, null-terminated) */
+    memcpy(service_name, req->name, MAX_NAME_LEN);
+    service_name[MAX_NAME_LEN - 1] = '\0';
 
     broker_log("[broker] check_in request: %s\n", service_name);
 
@@ -249,7 +271,7 @@ static void handle_check_in(mach_msg_header_t *request) {
         return;
     }
 
-    /* Insert send right */
+    /* Insert send right (broker keeps this for look_up responses) */
     kr = mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
     if (kr != KERN_SUCCESS) {
         broker_log("[broker] failed to insert send right: 0x%x\n", kr);
@@ -258,7 +280,7 @@ static void handle_check_in(mach_msg_header_t *request) {
         return;
     }
 
-    /* Register service */
+    /* Register service (store send right for future look_ups) */
     int result = register_service(service_name, service_port);
     if (result != BOOTSTRAP_SUCCESS) {
         mach_port_deallocate(mach_task_self(), service_port);
@@ -266,23 +288,23 @@ static void handle_check_in(mach_msg_header_t *request) {
         return;
     }
 
-    /* Send port to client */
-    send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, service_port);
+    /* Send RECEIVE right to caller (MOVE_RECEIVE transfers ownership).
+     * After this, broker has: send right. Caller has: receive right.
+     * Clients doing look_up will get send rights to the same port. */
+    send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET,
+                    service_port, MACH_MSG_TYPE_MOVE_RECEIVE);
+    broker_log("[broker] check_in '%s': sent receive right 0x%x\n", service_name, service_port);
 }
 
-/* Handle bootstrap_register */
+/* Handle bootstrap_register (ID 403)
+ * Caller sends a send right, broker stores it for look_ups. */
 static void handle_register(mach_msg_header_t *request) {
     bootstrap_complex_request_t *req = (bootstrap_complex_request_t *)request;
     char service_name[MAX_NAME_LEN];
 
-    /* Extract service name */
-    uint32_t name_len = req->name_len;
-    if (name_len >= MAX_NAME_LEN) {
-        name_len = MAX_NAME_LEN - 1;
-    }
-
-    memcpy(service_name, req->name, name_len);
-    service_name[name_len] = '\0';
+    /* Extract service name (fixed 128-byte field) */
+    memcpy(service_name, req->name, MAX_NAME_LEN);
+    service_name[MAX_NAME_LEN - 1] = '\0';
 
     mach_port_t service_port = req->port_desc.name;
 
@@ -295,19 +317,15 @@ static void handle_register(mach_msg_header_t *request) {
     send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, result);
 }
 
-/* Handle bootstrap_look_up */
+/* Handle bootstrap_look_up (ID 404)
+ * Returns a COPY_SEND right to the caller. */
 static void handle_look_up(mach_msg_header_t *request) {
     bootstrap_simple_request_t *req = (bootstrap_simple_request_t *)request;
     char service_name[MAX_NAME_LEN];
 
-    /* Extract service name */
-    uint32_t name_len = req->name_len;
-    if (name_len >= MAX_NAME_LEN) {
-        name_len = MAX_NAME_LEN - 1;
-    }
-
-    memcpy(service_name, req->name, name_len);
-    service_name[name_len] = '\0';
+    /* Extract service name (fixed 128-byte field) */
+    memcpy(service_name, req->name, MAX_NAME_LEN);
+    service_name[MAX_NAME_LEN - 1] = '\0';
 
     broker_log("[broker] look_up request: %s\n", service_name);
 
@@ -317,7 +335,8 @@ static void handle_look_up(mach_msg_header_t *request) {
     if (service_port == MACH_PORT_NULL) {
         send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_UNKNOWN_SERVICE);
     } else {
-        send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, service_port);
+        send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET,
+                        service_port, MACH_MSG_TYPE_COPY_SEND);
     }
 }
 
@@ -341,14 +360,12 @@ static void handle_subset(mach_msg_header_t *request) {
 static void handle_broker_message(mach_msg_header_t *request) {
     switch (request->msgh_id) {
         case BROKER_REGISTER_PORT: {
-            bootstrap_complex_request_t *req = (bootstrap_complex_request_t *)request;
+            /* Legacy format with name_len prefix */
+            broker_complex_request_t *req = (broker_complex_request_t *)request;
             char service_name[MAX_NAME_LEN];
 
             uint32_t name_len = req->name_len;
-            if (name_len >= MAX_NAME_LEN) {
-                name_len = MAX_NAME_LEN - 1;
-            }
-
+            if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
             memcpy(service_name, req->name, name_len);
             service_name[name_len] = '\0';
 
@@ -362,14 +379,12 @@ static void handle_broker_message(mach_msg_header_t *request) {
         }
 
         case BROKER_LOOKUP_PORT: {
-            bootstrap_simple_request_t *req = (bootstrap_simple_request_t *)request;
+            /* Legacy format with name_len prefix */
+            broker_simple_request_t *req = (broker_simple_request_t *)request;
             char service_name[MAX_NAME_LEN];
 
             uint32_t name_len = req->name_len;
-            if (name_len >= MAX_NAME_LEN) {
-                name_len = MAX_NAME_LEN - 1;
-            }
-
+            if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
             memcpy(service_name, req->name, name_len);
             service_name[name_len] = '\0';
 
@@ -380,7 +395,8 @@ static void handle_broker_message(mach_msg_header_t *request) {
             if (service_port == MACH_PORT_NULL) {
                 send_error_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, BOOTSTRAP_UNKNOWN_SERVICE);
             } else {
-                send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET, service_port);
+                send_port_reply(request->msgh_remote_port, request->msgh_id + MIG_REPLY_OFFSET,
+                                service_port, MACH_MSG_TYPE_COPY_SEND);
             }
             break;
         }
@@ -513,8 +529,15 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_hid_manager[1280];
 
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
-    snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s", shim_path);
+    /* bootstrap_fix.dylib MUST be first — it interposes bootstrap_check_in/look_up
+     * so that the iOS SDK sends MIG messages to our broker port. */
+    char bfix_path[1280];
+    snprintf(bfix_path, sizeof(bfix_path), "%s/src/bridge/bootstrap_fix.dylib", cwd);
+    snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s:%s", bfix_path, shim_path);
     snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
@@ -522,8 +545,6 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
 
     /* HID System Manager bundle path — resolve relative to cwd */
-    char cwd[1024];
-    getcwd(cwd, sizeof(cwd));
     snprintf(env_hid_manager, sizeof(env_hid_manager),
              "SIMULATOR_HID_SYSTEM_MANAGER=%s/src/bridge/RosettaSimHIDManager.bundle", cwd);
 
@@ -602,8 +623,10 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
 
     char cwd[1024];
     getcwd(cwd, sizeof(cwd));
+    /* bootstrap_fix.dylib first, then springboard_shim */
     snprintf(env_dyld_insert, sizeof(env_dyld_insert),
-             "DYLD_INSERT_LIBRARIES=%s/src/bridge/springboard_shim.dylib", cwd);
+             "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib:%s/src/bridge/springboard_shim.dylib",
+             cwd, cwd);
     snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
@@ -734,15 +757,20 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     }
 
     /* Build environment — matches run_sim.sh */
-    char env_dyld_root[1024], env_dyld_insert[1024];
+    char env_dyld_root[1024], env_dyld_insert[2048];
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_bundle_exec[256] = "", env_bundle_path[1280] = "", env_proc_path[1280] = "";
     char env_ca_mode[64] = "";
 
+    char cwd_app[1024];
+    getcwd(cwd_app, sizeof(cwd_app));
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     if (bridge_path && bridge_path[0]) {
-        snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s", bridge_path);
+        /* bootstrap_fix.dylib first, then bridge */
+        snprintf(env_dyld_insert, sizeof(env_dyld_insert),
+                 "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib:%s",
+                 cwd_app, bridge_path);
     } else {
         env_dyld_insert[0] = '\0';
     }
@@ -926,9 +954,8 @@ int main(int argc, char *argv[]) {
                     break;
             }
 
-            /* Check if CARenderServer AND Purple services are registered.
-             * SpringBoard needs: CARenderServer, PurpleSystemEventPort,
-             * PurpleWorkspacePort, and backboard services to bootstrap. */
+            /* Check if CARenderServer AND all critical services are registered.
+             * display.services is required by the app's BKSDisplayServicesStart(). */
             int has_ca = 0, has_event = 0, has_workspace = 0, has_display = 0;
             for (int i = 0; i < MAX_SERVICES; i++) {
                 if (!g_services[i].active) continue;

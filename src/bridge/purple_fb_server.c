@@ -1467,6 +1467,11 @@ static void pfb_init(void) {
 
     pfb_log("PurpleFBServer port created: recv=%u send=%u", g_server_port, g_send_port);
 
+    /* Register PurpleFBServer with the broker so cross-process look_ups work.
+     * With bootstrap_fix.dylib active, bootstrap_look_up goes through the broker,
+     * so PurpleFBServer must be registered there. */
+    pfb_notify_broker("PurpleFBServer", g_send_port);
+
     /* Start the server thread */
     g_running = 1;
 
