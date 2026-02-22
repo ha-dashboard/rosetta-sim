@@ -767,6 +767,51 @@ static void replacement_xpc_connection_check_in(void *conn) {
              is_listener ? "LISTENER" : "CLIENT", channel, port1, port2);
 }
 
+/* Replacement for xpc_connection_send_message_with_reply_sync.
+ *
+ * The original function blocks forever waiting for a reply. In our simulator,
+ * many system services exist (have listener ports) but don't actually process
+ * messages (e.g., mobilegestalt.xpc, cfprefsd.daemon). The original blocks
+ * on mach_msg waiting for a reply that never comes.
+ *
+ * Fix: Use the async xpc_connection_send_message_with_reply + dispatch_semaphore
+ * with a 2-second timeout. If the service doesn't reply in time, return an
+ * XPC error object instead of blocking forever. */
+/* Use dispatch/xpc headers properly — compiled as ObjC with ARC */
+#include <dispatch/dispatch.h>
+typedef void *xpc_object_t_bfix;
+typedef void *xpc_connection_t_bfix;
+extern void xpc_connection_send_message_with_reply(xpc_connection_t_bfix connection,
+    xpc_object_t_bfix message, dispatch_queue_t replyq,
+    void (^handler)(xpc_object_t_bfix));
+extern xpc_object_t_bfix xpc_connection_send_message_with_reply_sync(
+    xpc_connection_t_bfix connection, xpc_object_t_bfix message);
+
+static xpc_object_t_bfix replacement_xpc_send_sync(
+    xpc_connection_t_bfix connection, xpc_object_t_bfix message) {
+
+    __block xpc_object_t_bfix reply = NULL;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    xpc_connection_send_message_with_reply(connection, message, NULL,
+        ^(xpc_object_t_bfix response) {
+            reply = response;
+            dispatch_semaphore_signal(sem);
+        });
+
+    /* Wait with 2-second timeout instead of blocking forever */
+    long result = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
+
+    if (result != 0) {
+        /* Timeout — service didn't respond. Return NULL (XPC treats as error). */
+        bfix_log("[bfix] xpc_send_sync: TIMEOUT (2s) — service unresponsive\n");
+        return NULL;
+    }
+
+    return reply;
+}
+
 /* Replacement for _xpc_look_up_endpoint inside libxpc.
  *
  * This is the function that builds the XPC pipe check-in request and sends it
@@ -846,6 +891,8 @@ static void patch_bootstrap_functions(void) {
         { "_xpc_look_up_endpoint", (void *)replacement_xpc_look_up_endpoint },
         /* Bypass the launchd registration in _xpc_connection_check_in */
         { "_xpc_connection_check_in", (void *)replacement_xpc_connection_check_in },
+        /* Timeout for synchronous XPC sends to unresponsive services */
+        { "xpc_connection_send_message_with_reply_sync", (void *)replacement_xpc_send_sync },
     };
     int n_patches = sizeof(patches) / sizeof(patches[0]);
 
