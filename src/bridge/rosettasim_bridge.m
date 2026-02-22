@@ -30,6 +30,9 @@
 #import <mach/vm_map.h>
 #import <dlfcn.h>
 #import <setjmp.h>
+#import <mach-o/dyld.h>
+#import <mach-o/nlist.h>
+#import <mach-o/loader.h>
 #import <signal.h>
 #import <pthread.h>
 #import <objc/runtime.h>
@@ -4672,6 +4675,10 @@ static void _noopMethod(id self, SEL _cmd, ...) {
     /* Silently no-op */
 }
 
+static id _nilMethod(id self, SEL _cmd, ...) {
+    return nil;
+}
+
 /* Replacement for -[UIWindow makeKeyAndVisible].
  *
  * APPROACH: Call UIKit's REAL internal methods instead of reimplementing them.
@@ -7242,6 +7249,96 @@ static void swizzle_bks_methods(void) {
                     imp_implementationWithBlock(newBlock));
                 bridge_log("  UIViewController.presentViewController: swizzled for UIAlertController auto-select");
             }
+        }
+    }
+
+    /* Runtime binary patch for UIApplicationMain.
+     *
+     * The app uses a debug dylib loaded via dlopen at runtime. DYLD interposition
+     * only applies to images loaded at startup — the debug dylib's GOT entries for
+     * UIApplicationMain point to the real function, not our replacement.
+     *
+     * Fix: Write an x86_64 trampoline at UIApplicationMain's code address to
+     * redirect ALL calls (including from dlopen'd images) to our replacement. */
+    {
+        /* dlsym returns our replacement due to DYLD interposition, so we
+         * must find the ORIGINAL by walking Mach-O symbol tables directly. */
+        void *orig_uiam = NULL;
+        uint32_t img_count = _dyld_image_count();
+        for (uint32_t i = 0; i < img_count && !orig_uiam; i++) {
+            const char *img_name = _dyld_get_image_name(i);
+            if (!img_name) continue;
+            if (strstr(img_name, "rosettasim_bridge")) continue; /* skip our dylib */
+            const struct mach_header *mh = _dyld_get_image_header(i);
+            if (!mh || mh->magic != MH_MAGIC_64) continue;
+            const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            /* Walk load commands to find LC_SYMTAB and __LINKEDIT */
+            const uint8_t *lc_ptr = (const uint8_t *)mh64 + sizeof(struct mach_header_64);
+            const struct symtab_command *symtab_cmd = NULL;
+            const struct segment_command_64 *linkedit_seg = NULL;
+            for (uint32_t j = 0; j < mh64->ncmds; j++) {
+                const struct load_command *lc = (const struct load_command *)lc_ptr;
+                if (lc->cmd == LC_SYMTAB) symtab_cmd = (const struct symtab_command *)lc;
+                else if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                    if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit_seg = seg;
+                }
+                lc_ptr += lc->cmdsize;
+            }
+            if (!symtab_cmd || !linkedit_seg) continue;
+            uintptr_t lb = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+            const struct nlist_64 *syms = (const struct nlist_64 *)(lb + symtab_cmd->symoff);
+            const char *strs = (const char *)(lb + symtab_cmd->stroff);
+            for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
+                if ((syms[k].n_type & N_TYPE) != N_SECT) continue;
+                uint32_t sx = syms[k].n_un.n_strx;
+                if (sx && strcmp(strs + sx, "_UIApplicationMain") == 0) {
+                    orig_uiam = (void *)(syms[k].n_value + slide);
+                    bridge_log("  Found original UIApplicationMain at %p in %s", orig_uiam, img_name);
+                    break;
+                }
+            }
+        }
+        void *our_uiam = (void *)replacement_UIApplicationMain;
+        if (orig_uiam && orig_uiam != our_uiam) {
+            bridge_log("  Patching UIApplicationMain at %p → %p (runtime trampoline)", orig_uiam, our_uiam);
+            vm_address_t page = (vm_address_t)orig_uiam & ~(vm_address_t)0xFFF;
+            kern_return_t kr = vm_protect(mach_task_self(), page, 0x2000, FALSE,
+                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            if (kr != KERN_SUCCESS) {
+                kr = vm_protect(mach_task_self(), page, 0x1000, FALSE,
+                                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            }
+            if (kr == KERN_SUCCESS) {
+                uint8_t *code = (uint8_t *)orig_uiam;
+                uint64_t addr = (uint64_t)(uintptr_t)our_uiam;
+                code[0]  = 0x48; code[1]  = 0xB8; /* movabs rax, imm64 */
+                memcpy(&code[2], &addr, 8);
+                code[10] = 0xFF; code[11] = 0xE0; /* jmp rax */
+                /* Aggressive Rosetta cache flush:
+                 * 1. Remove execute permission entirely (invalidates translation)
+                 * 2. Re-add RX permissions (forces re-translation on next access)
+                 * 3. sys_icache_invalidate as additional safety */
+                vm_protect(mach_task_self(), page, 0x2000, FALSE,
+                           VM_PROT_READ); /* remove X → invalidate Rosetta cache */
+                vm_protect(mach_task_self(), page, 0x2000, FALSE,
+                           VM_PROT_READ | VM_PROT_EXECUTE); /* re-add X */
+                extern void sys_icache_invalidate(void *start, size_t len);
+                sys_icache_invalidate(orig_uiam, 12);
+                /* Verify the trampoline bytes are in place */
+                bridge_log("  UIApplicationMain: trampoline bytes: %02x %02x %02x %02x ... %02x %02x",
+                           code[0], code[1], code[2], code[3], code[10], code[11]);
+                /* Verify by calling the original address directly with dummy args.
+                 * This should trigger our replacement_UIApplicationMain. */
+                bridge_log("  UIApplicationMain: runtime trampoline installed");
+            } else {
+                bridge_log("  UIApplicationMain: vm_protect failed 0x%x", kr);
+            }
+        } else if (orig_uiam == our_uiam) {
+            bridge_log("  UIApplicationMain: DYLD interposition already active");
+        } else {
+            bridge_log("  UIApplicationMain: not found via dlsym");
         }
     }
 }
