@@ -58,6 +58,8 @@ typedef struct {
 /* Global state */
 static service_entry_t g_services[MAX_SERVICES];
 static mach_port_t g_broker_port = MACH_PORT_NULL;
+static mach_port_t g_rendezvous_port = MACH_PORT_NULL; /* XPC sim launchd rendezvous */
+static mach_port_t g_port_set = MACH_PORT_NULL;        /* Port set for receiving */
 static pid_t g_backboardd_pid = -1;
 static volatile sig_atomic_t g_shutdown = 0;
 
@@ -434,7 +436,7 @@ static void message_loop(void) {
         memset(recv_buffer, 0, sizeof(recv_buffer));
 
         kern_return_t kr = mach_msg(request, MACH_RCV_MSG | MACH_RCV_LARGE,
-                                     0, sizeof(recv_buffer), g_broker_port,
+                                     0, sizeof(recv_buffer), g_port_set,
                                      MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 
         if (kr != KERN_SUCCESS) {
@@ -446,9 +448,25 @@ static void message_loop(void) {
             break;
         }
 
-        broker_log("[broker] received message: id=%d size=%d\n", request->msgh_id, request->msgh_size);
+        broker_log("[broker] received message: id=%d size=%d local=0x%x\n",
+                   request->msgh_id, request->msgh_size, request->msgh_local_port);
 
-        /* Dispatch message */
+        /* Check if message arrived on the rendezvous port (XPC pipe protocol) */
+        if (request->msgh_local_port == g_rendezvous_port) {
+            broker_log("[broker] XPC pipe message on rendezvous port: id=%d size=%d\n",
+                       request->msgh_id, request->msgh_size);
+            /* XPC pipe messages use xpc_pipe_routine protocol.
+             * For now, log and dump for analysis. */
+            /* TODO: Implement XPC check-in reply */
+            if (request->msgh_remote_port != MACH_PORT_NULL) {
+                /* Send a minimal reply to prevent timeout */
+                send_error_reply(request->msgh_remote_port,
+                                 request->msgh_id + MIG_REPLY_OFFSET, 0);
+            }
+            continue;
+        }
+
+        /* Dispatch bootstrap message */
         switch (request->msgh_id) {
             case BOOTSTRAP_CHECK_IN:
                 handle_check_in(request);
@@ -1017,20 +1035,30 @@ int main(int argc, char *argv[]) {
     /* Create the XPC simulator launchd rendezvous port.
      * This is the port that libxpc's _launch_msg2 connects to when
      * XPC_SIMULATOR_LAUNCHD_NAME is set. The broker KEEPS the receive right
-     * and adds it to the broker's port set for message handling.
-     * Daemons look it up via bootstrap_look_up to get a send right. */
+     * and adds it to the port set for message handling. */
     {
-        mach_port_t rdv_port = MACH_PORT_NULL;
-        kern_return_t kr2 = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rdv_port);
-        if (kr2 == KERN_SUCCESS) {
-            mach_port_insert_right(mach_task_self(), rdv_port, rdv_port, MACH_MSG_TYPE_MAKE_SEND);
-            register_service("com.apple.xpc.sim.launchd.rendezvous", rdv_port);
-            /* Add to broker's port set so we receive messages on it.
-             * Messages to this port are launch_msg check-in requests. */
-            /* TODO: Add to port set and implement launch_msg protocol handler.
-             * For now, the service is registered so look_up works. The actual
-             * launch_msg messages will arrive but won't be handled yet. */
-            broker_log("[broker] rendezvous port created: 0x%x (for XPC_SIMULATOR_LAUNCHD_NAME)\n", rdv_port);
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_rendezvous_port);
+        if (kr == KERN_SUCCESS) {
+            mach_port_insert_right(mach_task_self(), g_rendezvous_port, g_rendezvous_port, MACH_MSG_TYPE_MAKE_SEND);
+            register_service("com.apple.xpc.sim.launchd.rendezvous", g_rendezvous_port);
+            broker_log("[broker] rendezvous port created: 0x%x\n", g_rendezvous_port);
+        }
+    }
+
+    /* Create a port set containing both the broker port and the rendezvous port.
+     * This lets us receive messages from both in a single mach_msg loop. */
+    {
+        kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &g_port_set);
+        if (kr == KERN_SUCCESS) {
+            mach_port_move_member(mach_task_self(), g_broker_port, g_port_set);
+            if (g_rendezvous_port != MACH_PORT_NULL) {
+                mach_port_move_member(mach_task_self(), g_rendezvous_port, g_port_set);
+            }
+            broker_log("[broker] port set created: 0x%x (broker + rendezvous)\n", g_port_set);
+        } else {
+            /* Fallback: use broker port directly */
+            g_port_set = g_broker_port;
+            broker_log("[broker] WARNING: port set allocation failed, using broker port directly\n");
         }
     }
 
@@ -1061,7 +1089,7 @@ int main(int argc, char *argv[]) {
         for (int attempt = 0; attempt < 50 && !ca_found; attempt++) {
             memset(tmp_buf, 0, sizeof(tmp_buf));
             kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                             0, sizeof(tmp_buf), g_broker_port,
+                                             0, sizeof(tmp_buf), g_port_set,
                                              500, MACH_PORT_NULL);
             if (msg_kr == MACH_RCV_TIMED_OUT) continue;
             if (msg_kr != KERN_SUCCESS) break;
@@ -1119,7 +1147,7 @@ int main(int argc, char *argv[]) {
             for (int attempt = 0; attempt < 10; attempt++) {
                 memset(tmp_buf, 0, sizeof(tmp_buf));
                 kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                                 0, sizeof(tmp_buf), g_broker_port,
+                                                 0, sizeof(tmp_buf), g_port_set,
                                                  500, MACH_PORT_NULL);
                 if (msg_kr == MACH_RCV_TIMED_OUT) continue;
                 if (msg_kr != KERN_SUCCESS) break;
@@ -1168,7 +1196,7 @@ int main(int argc, char *argv[]) {
             for (int attempt = 0; attempt < 40 && !sb_ready; attempt++) {
                 memset(tmp_buf, 0, sizeof(tmp_buf));
                 kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                                 0, sizeof(tmp_buf), g_broker_port,
+                                                 0, sizeof(tmp_buf), g_port_set,
                                                  500, MACH_PORT_NULL);
                 if (msg_kr == MACH_RCV_TIMED_OUT) continue;
                 if (msg_kr != KERN_SUCCESS) break;
