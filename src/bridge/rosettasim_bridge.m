@@ -7272,41 +7272,43 @@ static void rosettasim_bridge_init(void) {
             g_ca_server_connected = 1;
             bridge_log("  CARenderServer found via bootstrap: port=0x%x", ca_port);
 
-            /* Set client port IMMEDIATELY — BEFORE UIKit creates any windows.
-             * This tells CoreAnimation to use IOSurface-backed backing stores
-             * for server compositing instead of vm_allocate LOCAL stores.
-             * Without this, UIKit creates LOCAL contexts and static content
-             * (text, images, backgrounds) never reaches CARenderServer. */
+            /* Trigger connect_remote BEFORE UIKit creates any windows.
+             * Creating a remoteContextWithOptions triggers CoreAnimation's
+             * internal connect_remote() → __CASRegisterClient → sets
+             * _user_client_port. After this, CARenderServerGetClientPort()
+             * returns non-zero and UIKit creates IOSurface-backed backing stores
+             * instead of LOCAL vm_allocate stores. */
             @try {
                 Class caCtxCls = objc_getClass("CAContext");
                 if (caCtxCls) {
-                    /* Create a receive port for the client connection */
-                    mach_port_t client_port = MACH_PORT_NULL;
-                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
-                                       &client_port);
-                    if (client_port != MACH_PORT_NULL) {
-                        mach_port_insert_right(mach_task_self(), client_port,
-                                               client_port, MACH_MSG_TYPE_MAKE_SEND);
-                        /* Set the client port globally on CAContext */
-                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                            (id)caCtxCls,
-                            sel_registerName("setClientPort:"),
-                            client_port);
-                        bridge_log("  CAContext.setClientPort(%u) — EARLY (before window creation)",
-                                   client_port);
+                    NSDictionary *opts = @{
+                        @"serverPort": @(ca_port),
+                    };
+                    bridge_log("  Creating early remote CAContext to trigger connect_remote...");
+                    id earlyCtx = ((id(*)(id, SEL, id))objc_msgSend)(
+                        (id)caCtxCls,
+                        sel_registerName("remoteContextWithOptions:"),
+                        opts);
+                    if (earlyCtx) {
+                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                            earlyCtx, sel_registerName("contextId"));
+                        bridge_log("  Early remote CAContext: id=%u (connect_remote should have fired)", cid);
 
-                        /* Verify it was set */
+                        /* Check if CARenderServerGetClientPort now returns non-zero */
                         typedef mach_port_t (*GetCPFn)(mach_port_t);
                         GetCPFn gcp = (GetCPFn)dlsym(RTLD_DEFAULT,
                                                       "CARenderServerGetClientPort");
                         if (gcp) {
                             mach_port_t cp = gcp(ca_port);
-                            bridge_log("  CARenderServerGetClientPort()=%u (should be non-zero)", cp);
+                            bridge_log("  CARenderServerGetClientPort()=%u %s", cp,
+                                       cp ? "✓ IOSurface mode enabled" : "✗ still zero");
                         }
+                    } else {
+                        bridge_log("  Early remote CAContext: creation returned nil");
                     }
                 }
             } @catch (id ex) {
-                bridge_log("  setClientPort threw: %s",
+                bridge_log("  remoteContextWithOptions threw: %s",
                            [[ex description] UTF8String] ?: "unknown");
             }
         } else {
