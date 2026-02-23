@@ -42,6 +42,18 @@
 
 #define MIG_REPLY_OFFSET        100
 
+/* Watchdog MIG protocol (reverse-engineered from BackBoardServices)
+ * Request: msgh_id=0x1513, size=24 (header only)
+ * Reply:   msgh_id=0x5b95b4, size=36
+ *          offset 24: NDR_record (8 bytes)
+ *          offset 32: int32 isAlive (1 = alive) */
+#define BKS_WATCHDOG_MSG_ID     0x1513
+#define BKS_WATCHDOG_REPLY_ID   0x5b95b4
+
+/* Display services MIG protocol (reverse-engineered from BackBoardServices)
+ * BKSDisplayServicesGetMainScreenInfo sends a MIG request and expects
+ * screen dimensions in the reply. Request/reply IDs TBD. */
+
 /* Error codes */
 #define BOOTSTRAP_SUCCESS           0
 #define BOOTSTRAP_NOT_PRIVILEGED    1100
@@ -115,6 +127,7 @@ static mach_port_t g_rendezvous_port = MACH_PORT_NULL; /* XPC sim launchd rendez
 static mach_port_t g_port_set = MACH_PORT_NULL;        /* Port set for receiving */
 static pid_t g_backboardd_pid = -1;
 static volatile sig_atomic_t g_shutdown = 0;
+static mach_port_t g_watchdog_port = MACH_PORT_NULL;   /* Watchdog service port */
 /* Simulator runtime identity (used to populate SIMULATOR_RUNTIME_* env vars). */
 static char g_sim_runtime_version[64] = "10.3";
 static char g_sim_runtime_build_version[64] = "14E8301";
@@ -134,6 +147,8 @@ static volatile int g_pfb_sync_running = 0;
 
 static int pfb_broker_init(void);
 static void pfb_handle_message(mach_msg_header_t *request);
+static int watchdog_init(void);
+static void watchdog_handle_message(mach_msg_header_t *request);
 
 /* Message structures — match actual MIG wire format:
  * look_up/check_in request: header(24) + NDR(8) + name_t(128) = 160 bytes
@@ -1383,6 +1398,11 @@ static void message_loop(void) {
             pfb_handle_message(request);
             continue;
         }
+        /* Watchdog service (BKSWatchdogGetIsAlive MIG 0x1513) */
+        if (g_watchdog_port != MACH_PORT_NULL && request->msgh_local_port == g_watchdog_port) {
+            watchdog_handle_message(request);
+            continue;
+        }
 
         /* Dispatch bootstrap message */
         switch (request->msgh_id) {
@@ -1646,6 +1666,81 @@ static void detect_simulator_runtime(const char *sdk_path) {
 
     broker_log("[broker] runtime: version=%s build=%s (from %s)\n",
                g_sim_runtime_version, g_sim_runtime_build_version, sysver_plist);
+}
+
+/* ================================================================
+ * Watchdog service implementation
+ *
+ * BKSWatchdogGetIsAlive sends MIG msg_id 0x1513 (24-byte request) to
+ * com.apple.backboard.watchdog and expects a 36-byte reply with msgh_id
+ * 0x5b95b4 containing isAlive=1 at offset 32. Backboardd never registers
+ * this service through bootstrap, so we host it in the broker.
+ *
+ * Reverse-engineered from __BKSWatchdogGetIsAlive in BackBoardServices.framework.
+ * ================================================================ */
+
+static int watchdog_init(void) {
+    if (g_watchdog_port != MACH_PORT_NULL) return 0;
+
+    kern_return_t kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_watchdog_port);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][watchdog] mach_port_allocate failed: 0x%x\n", kr);
+        return -1;
+    }
+    kr = mach_port_insert_right(mach_task_self(), g_watchdog_port, g_watchdog_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][watchdog] mach_port_insert_right failed: 0x%x\n", kr);
+        return -1;
+    }
+
+    register_service("com.apple.backboard.watchdog", g_watchdog_port);
+    broker_log("[broker][watchdog] registered on port 0x%x\n", g_watchdog_port);
+    return 0;
+}
+
+static void watchdog_handle_message(mach_msg_header_t *request) {
+    if (request->msgh_id == BKS_WATCHDOG_MSG_ID) {
+        /* isAlive query — reply with alive=1 */
+        mach_port_t reply_port = request->msgh_remote_port;
+        if (reply_port == MACH_PORT_NULL) return;
+
+        /* Reply format: header(24) + NDR(8) + isAlive(4) = 36 bytes */
+        struct {
+            mach_msg_header_t header;
+            uint32_t          ndr[2];    /* NDR_record */
+            int32_t           is_alive;
+        } reply;
+        memset(&reply, 0, sizeof(reply));
+        reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply.header.msgh_size = sizeof(reply);
+        reply.header.msgh_remote_port = reply_port;
+        reply.header.msgh_local_port = MACH_PORT_NULL;
+        reply.header.msgh_id = BKS_WATCHDOG_REPLY_ID;
+        reply.is_alive = 1;
+
+        kern_return_t kr = mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply),
+                                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) {
+            broker_log("[broker][watchdog] reply failed: 0x%x\n", kr);
+        } else {
+            broker_log("[broker][watchdog] isAlive query answered (alive=1)\n");
+        }
+        return;
+    }
+
+    /* Unknown watchdog message — log and send empty reply */
+    broker_log("[broker][watchdog] unknown msg id=%d size=%d\n",
+               request->msgh_id, request->msgh_size);
+    if (request->msgh_remote_port != MACH_PORT_NULL) {
+        mach_msg_header_t reply;
+        memset(&reply, 0, sizeof(reply));
+        reply.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply.msgh_size = sizeof(reply);
+        reply.msgh_remote_port = request->msgh_remote_port;
+        reply.msgh_id = request->msgh_id + MIG_REPLY_OFFSET;
+        mach_msg(&reply, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL,
+                 MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
 }
 
 /* ================================================================
@@ -1973,6 +2068,7 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
 /* Track child PIDs for cleanup */
 static pid_t g_assertiond_pid = -1;
 static pid_t g_springboard_pid = -1;
+static pid_t g_app_pid = -1;
 
 /* Generic function to spawn an iOS simulator daemon with broker port.
  * Uses DYLD_ROOT_PATH for framework resolution and springboard_shim.dylib
@@ -2424,6 +2520,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Watchdog service — backboardd never registers com.apple.backboard.watchdog
+     * through bootstrap, so we host it in the broker. BKSDisplayServicesStart
+     * calls BKSWatchdogGetIsAlive which sends MIG 0x1513 to this port. */
+    if (watchdog_init() != 0) {
+        broker_log("[broker] WARNING: watchdog init failed\n");
+    } else if (g_watchdog_port != MACH_PORT_NULL && g_port_set != g_broker_port) {
+        mach_port_move_member(mach_task_self(), g_watchdog_port, g_port_set);
+        broker_log("[broker] added watchdog port to port set: 0x%x\n", g_watchdog_port);
+    }
+
     /* If enabled, host PurpleFBServer inside the broker and listen on its port too. */
     if (g_pfb_broker_enabled) {
         if (pfb_broker_init() != 0) {
@@ -2489,6 +2595,10 @@ int main(int argc, char *argv[]) {
             }
             if (g_pfb_broker_enabled && tmp_req->msgh_local_port == g_pfb_port) {
                 pfb_handle_message(tmp_req);
+                goto ca_check;
+            }
+            if (g_watchdog_port != MACH_PORT_NULL && tmp_req->msgh_local_port == g_watchdog_port) {
+                watchdog_handle_message(tmp_req);
                 goto ca_check;
             }
 
@@ -2568,6 +2678,10 @@ int main(int argc, char *argv[]) {
                     pfb_handle_message(tmp_req);
                     goto assertiond_svc_check;
                 }
+                if (g_watchdog_port != MACH_PORT_NULL && tmp_req->msgh_local_port == g_watchdog_port) {
+                    watchdog_handle_message(tmp_req);
+                    goto assertiond_svc_check;
+                }
 
                 switch (tmp_req->msgh_id) {
                     case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
@@ -2637,6 +2751,10 @@ int main(int argc, char *argv[]) {
                     pfb_handle_message(tmp_req);
                     goto sb_svc_check;
                 }
+                if (g_watchdog_port != MACH_PORT_NULL && tmp_req->msgh_local_port == g_watchdog_port) {
+                    watchdog_handle_message(tmp_req);
+                    goto sb_svc_check;
+                }
 
                 switch (tmp_req->msgh_id) {
                     case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
@@ -2677,8 +2795,108 @@ int main(int argc, char *argv[]) {
              * Delete stale context ID file BEFORE spawning — the app will write
              * its UIKit _layerContext.contextId after window creation. */
             unlink("/tmp/rosettasim_context_id");
-            spawn_app(app_path, sdk_path, bridge_path);
+            g_app_pid = spawn_app(app_path, sdk_path, bridge_path);
         }
+    }
+
+    /* STRICT 70s acceptance gate — validate startup before entering main loop.
+     * This gate ensures:
+     *   1. No "Connection invalid" errors in assertiond
+     *   2. App process is alive (kill -0 succeeds)
+     *   3. Frame counter is advancing (app is rendering)
+     * If any condition fails, we exit immediately to avoid hiding startup bugs. */
+    if (g_app_pid > 0) {
+        broker_log("[broker] ===== 70s ACCEPTANCE GATE: BEGIN =====\n");
+        
+        /* Wait for app framebuffer to appear (app creates it in didFinishLaunching) */
+        const char *app_fb_path = "/tmp/rosettasim_app_framebuffer";
+        int fb_found = 0;
+        for (int i = 0; i < 140; i++) { /* 70s = 140 * 0.5s */
+            if (access(app_fb_path, R_OK) == 0) {
+                fb_found = 1;
+                break;
+            }
+            usleep(500000); /* 500ms */
+        }
+        
+        if (!fb_found) {
+            broker_log("[broker] GATE FAIL: app framebuffer not created after 70s\n");
+            broker_log("[broker] Check: tail -100 /tmp/rosettasim_broker.log\n");
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        broker_log("[broker] GATE: app framebuffer exists at %s\n", app_fb_path);
+        
+        /* Open framebuffer and read header to get initial frame counter */
+        int fb_fd = open(app_fb_path, O_RDONLY);
+        if (fb_fd < 0) {
+            broker_log("[broker] GATE FAIL: cannot open app framebuffer: %s\n", strerror(errno));
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        RosettaSimFramebufferHeader fb_header;
+        ssize_t n = read(fb_fd, &fb_header, sizeof(fb_header));
+        if (n != sizeof(fb_header) || fb_header.magic != ROSETTASIM_FB_MAGIC) {
+            broker_log("[broker] GATE FAIL: invalid framebuffer header (read=%zd, magic=0x%x)\n",
+                       n, fb_header.magic);
+            close(fb_fd);
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        uint64_t initial_frame = fb_header.frame_counter;
+        broker_log("[broker] GATE: initial frame_counter=%llu\n", initial_frame);
+        
+        /* Wait 10s and verify frame counter is advancing */
+        sleep(10);
+        
+        /* Check app is still alive */
+        if (kill(g_app_pid, 0) != 0) {
+            broker_log("[broker] GATE FAIL: app process %d died (errno=%d: %s)\n",
+                       g_app_pid, errno, strerror(errno));
+            close(fb_fd);
+            return 1;
+        }
+        
+        /* Re-read framebuffer header */
+        lseek(fb_fd, 0, SEEK_SET);
+        n = read(fb_fd, &fb_header, sizeof(fb_header));
+        close(fb_fd);
+        
+        if (n != sizeof(fb_header)) {
+            broker_log("[broker] GATE FAIL: cannot re-read framebuffer header\n");
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        uint64_t current_frame = fb_header.frame_counter;
+        broker_log("[broker] GATE: after 10s, frame_counter=%llu (delta=%llu)\n",
+                   current_frame, current_frame - initial_frame);
+        
+        if (current_frame <= initial_frame) {
+            broker_log("[broker] GATE FAIL: frame counter NOT advancing (app not rendering)\n");
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        /* Check assertiond is still alive */
+        if (g_assertiond_pid > 0 && kill(g_assertiond_pid, 0) != 0) {
+            broker_log("[broker] GATE FAIL: assertiond process %d died\n", g_assertiond_pid);
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        /* Check backboardd is still alive */
+        if (g_backboardd_pid > 0 && kill(g_backboardd_pid, 0) != 0) {
+            broker_log("[broker] GATE FAIL: backboardd process %d died\n", g_backboardd_pid);
+            kill(g_app_pid, SIGKILL);
+            return 1;
+        }
+        
+        broker_log("[broker] ===== 70s ACCEPTANCE GATE: PASSED =====\n");
+        broker_log("[broker] All processes alive, app rendering (frame counter advancing)\n");
     }
 
     /* Run message loop */

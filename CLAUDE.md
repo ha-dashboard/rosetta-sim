@@ -91,6 +91,15 @@ We run the iOS 10.3 SDK's simulator frameworks (from Xcode 8.3.3) via Rosetta 2 
 - Use `siglongjmp` to catch crashes from missing services
 - Swizzle framework methods to return dummy values unless you understand WHY the original fails
 - Add patches to "just get past" a crash without understanding the root cause
+- Stub out functions with hardcoded return values when the real function would work if its dependencies were properly implemented
+- Comment out DYLD interpositions to "try something" without documenting why
+- Add crash guards around code that crashes, instead of fixing why it crashes
+
+### When to Stub vs When to Implement
+
+- **Stub**: Only when the real service is genuinely unnecessary (e.g., cfprefsd write operations that don't need to persist)
+- **Implement**: When the framework uses the service response to configure state (e.g., BKSDisplayServicesStart configures UIScreen — stubbing it means UIScreen is misconfigured)
+- **Pass-through**: When the real function would work if its Mach port dependencies are routed correctly through the broker. Prefer letting the real function run over replacing it with a stub.
 
 ### Service Implementation Checklist
 

@@ -255,38 +255,47 @@ static void _configure_device_profile(void) {
  * and skip step 5 (no CARenderServer yet).
  */
 static bool replacement_BKSDisplayServicesStart(void) {
-    bridge_log("BKSDisplayServicesStart() intercepted — calling REAL implementation");
+    bridge_log("BKSDisplayServicesStart() intercepted");
 
-    /* Call the REAL BKSDisplayServicesStart. It will:
-     * 1. Call bootstrap_look_up("com.apple.backboard.display.services")
-     *    → intercepted by springboard_shim → routed through broker
-     *    → returns the display services port in purple_fb_server
-     * 2. Send MIG msg_id 6001000 to check if server is alive
-     *    → display services handler responds with isAlive=TRUE
-     * 3. Establish the display services connection
+    /* The real function talks to backboardd via MIG, but the app's bootstrap port
+     * is MACH_PORT_DEAD so it can't reach any services. We set up screen info
+     * directly and defer UIScreen._scale fix to after UIScreen is created.
      *
-     * This enables UIKit to use proper display configuration from
-     * backboardd, which should make CoreAnimation create IOSurface-backed
-     * backing stores for server compositing. */
-
-    /* The REAL function is accessible via the original function pointer.
-     * Since we DYLD-interposed it, the original is still at its address
-     * but our replacement runs instead. We can't call the original directly.
-     * Instead, let the function proceed by setting up GSMainScreenInfo
-     * and then doing the display services connection ourselves. */
-
-    /* For now, set screen info and return TRUE — the display services
-     * connection happens through the broker automatically when UIKit
-     * calls BKSDisplayServicesServerPort internally. */
-    /* GSSetMainScreenInfo(double pixW, double pixH, float scale, float orientation).
-     * Internally it stores width/height as int32 via cvttsd2si, scale as float.
-     * GSMainScreenPointSize returns __screenWidth/scale, __screenHeight/scale.
-     * The 4th param is orientation (0.0 = portrait), NOT scaleY. */
+     * GSSetMainScreenInfo(double pixW, double pixH, float scale, float orientation).
+     * Internally stores w/h as int32 via cvttsd2si, scale as float.
+     * GSMainScreenPointSize divides by scale to return points.
+     * 4th param is orientation (0.0 = portrait), NOT scaleY.
+     * (Confirmed via disassembly of GraphicsServices _GSSetMainScreenInfo.)
+     *
+     * TODO: Fix the app's bootstrap port (currently MACH_PORT_DEAD) so the real
+     * BKSDisplayServicesStart can run. The real function also sets UIScreen._scale
+     * and configures the display services connection for GPU compositing. */
     double pixW = kScreenWidth * kScreenScaleX;
     double pixH = kScreenHeight * kScreenScaleY;
     GSSetMainScreenInfo(pixW, pixH, kScreenScaleX, 0.0f);
-    bridge_log("  GSSetMainScreenInfo: %.0fx%.0f px @%.0fx (points: %.0fx%.0f)",
-               pixW, pixH, (double)kScreenScaleX, kScreenWidth, kScreenHeight);
+    bridge_log("  GSSetMainScreenInfo: %.0fx%.0f px @%.0fx", pixW, pixH, (double)kScreenScaleX);
+
+    /* Defer UIScreen._scale fix — UIScreen is created by _UIApplicationMainPreparations
+     * AFTER this function returns. We use the ObjC runtime to set _scale directly. */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class screenClass = objc_getClass("UIScreen");
+        if (!screenClass) return;
+        id mainScreen = ((id(*)(id, SEL))objc_msgSend)((id)screenClass, sel_registerName("mainScreen"));
+        if (!mainScreen) return;
+
+        Ivar scaleIvar = class_getInstanceVariable(screenClass, "_scale");
+        if (scaleIvar) {
+            ptrdiff_t offset = ivar_getOffset(scaleIvar);
+            *(double *)((uint8_t *)(__bridge void *)mainScreen + offset) = (double)kScreenScaleX;
+            bridge_log("  UIScreen._scale = %.1f (ivar offset %td)", (double)kScreenScaleX, offset);
+        }
+        Ivar nativeIvar = class_getInstanceVariable(screenClass, "_nativeScale");
+        if (nativeIvar) {
+            ptrdiff_t offset = ivar_getOffset(nativeIvar);
+            *(double *)((uint8_t *)(__bridge void *)mainScreen + offset) = (double)kScreenScaleX;
+        }
+    });
+
     return true;
 }
 
@@ -4658,6 +4667,12 @@ __attribute__((section("__DATA,__interpose"))) = {
      * internally, which is intercepted by our bridge to route through broker.
      * The display services handler in purple_fb_server responds to the MIG
      * messages, establishing a proper display services connection. */
+    /* BKSDisplayServicesStart — interposed because the app's bootstrap port is
+     * MACH_PORT_DEAD (0xffffffff), so the real function can't reach backboardd.
+     * Our replacement calls GSSetMainScreenInfo with pixel dimensions and sets
+     * UIScreen._scale directly via ObjC runtime after UIScreen is created.
+     * TODO: Fix the bootstrap port for the app process so the real function
+     * can run, which would also fix UIScreen.scale natively. */
     { (const void *)replacement_BKSDisplayServicesStart,
       (const void *)BKSDisplayServicesStart },
     /* { (const void *)replacement_BKSDisplayServicesServerPort,
