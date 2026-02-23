@@ -16,7 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Paths
-SDK="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK_DEFAULT="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK="${ROSETTASIM_SDK:-$SDK_DEFAULT}"
 BROKER="$PROJECT_ROOT/src/bridge/rosettasim_broker"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 BRIDGE="$PROJECT_ROOT/src/bridge/rosettasim_bridge.dylib"
@@ -84,6 +85,7 @@ rm -f "$APP_FB" /tmp/rosettasim_framebuffer /tmp/rosettasim_broker.pid
 # Start broker (spawns backboardd + app)
 echo "Starting broker..."
 "$BROKER" \
+    --sdk "$SDK" \
     --shim "$PFB" \
     --bridge "$BRIDGE" \
     --app "$APP_PATH" \

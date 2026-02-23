@@ -16,10 +16,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SDK="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK_DEFAULT="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK="${ROSETTASIM_SDK:-$SDK_DEFAULT}"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 HID_BUNDLE="$PROJECT_ROOT/src/bridge/RosettaSimHIDManager.bundle"
 SIM_HOME="$PROJECT_ROOT/.sim_home"
+
+# Detect runtime identity from SystemVersion.plist (allow manual override).
+SYSVER_PLIST="$SDK/System/Library/CoreServices/SystemVersion.plist"
+RUNTIME_VERSION="${ROSETTASIM_RUNTIME_VERSION:-}"
+RUNTIME_BUILD="${ROSETTASIM_RUNTIME_BUILD_VERSION:-}"
+if [[ -z "$RUNTIME_VERSION" && -f "$SYSVER_PLIST" ]]; then
+    PV="$(plutil -extract ProductVersion raw -o - "$SYSVER_PLIST" 2>/dev/null || true)"
+    if [[ "$PV" == *.*.* ]]; then
+        RUNTIME_VERSION="${PV%.*}"
+    else
+        RUNTIME_VERSION="$PV"
+    fi
+fi
+if [[ -z "$RUNTIME_BUILD" && -f "$SYSVER_PLIST" ]]; then
+    RUNTIME_BUILD="$(plutil -extract ProductBuildVersion raw -o - "$SYSVER_PLIST" 2>/dev/null || true)"
+fi
+RUNTIME_VERSION="${RUNTIME_VERSION:-10.3}"
+RUNTIME_BUILD="${RUNTIME_BUILD:-14E8301}"
 
 # Build PurpleFBServer if needed
 if [[ ! -f "$PFB" ]] || ! codesign -v "$PFB" 2>/dev/null; then
@@ -50,6 +69,7 @@ echo "========================================"
 echo "RosettaSim backboardd"
 echo "========================================"
 echo "SDK:       $SDK"
+echo "Runtime:   $RUNTIME_VERSION ($RUNTIME_BUILD)"
 echo "Shim:      $PFB"
 echo "HID Mgr:   $HID_BUNDLE"
 echo "Sim Home:  $SIM_HOME"
@@ -66,8 +86,8 @@ if [[ $BACKGROUND -eq 1 ]]; then
       TMPDIR="$SIM_HOME/tmp" \
       SIMULATOR_DEVICE_NAME="iPhone 6s" \
       SIMULATOR_MODEL_IDENTIFIER="iPhone8,1" \
-      SIMULATOR_RUNTIME_VERSION="10.3" \
-      SIMULATOR_RUNTIME_BUILD_VERSION="14E8301" \
+      SIMULATOR_RUNTIME_VERSION="$RUNTIME_VERSION" \
+      SIMULATOR_RUNTIME_BUILD_VERSION="$RUNTIME_BUILD" \
       SIMULATOR_MAINSCREEN_WIDTH="750" \
       SIMULATOR_MAINSCREEN_HEIGHT="1334" \
       SIMULATOR_MAINSCREEN_SCALE="2.0" \
@@ -96,8 +116,8 @@ else
       TMPDIR="$SIM_HOME/tmp" \
       SIMULATOR_DEVICE_NAME="iPhone 6s" \
       SIMULATOR_MODEL_IDENTIFIER="iPhone8,1" \
-      SIMULATOR_RUNTIME_VERSION="10.3" \
-      SIMULATOR_RUNTIME_BUILD_VERSION="14E8301" \
+      SIMULATOR_RUNTIME_VERSION="$RUNTIME_VERSION" \
+      SIMULATOR_RUNTIME_BUILD_VERSION="$RUNTIME_BUILD" \
       SIMULATOR_MAINSCREEN_WIDTH="750" \
       SIMULATOR_MAINSCREEN_HEIGHT="1334" \
       SIMULATOR_MAINSCREEN_SCALE="2.0" \

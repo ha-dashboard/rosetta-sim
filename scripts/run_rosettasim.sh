@@ -17,7 +17,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SDK="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK_DEFAULT="/Applications/Xcode-8.3.3.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator10.3.sdk"
+SDK="${ROSETTASIM_SDK:-$SDK_DEFAULT}"
 BROKER="$PROJECT_ROOT/src/bridge/rosettasim_broker"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 APP_SHIM="$PROJECT_ROOT/src/bridge/app_shim.dylib"
@@ -71,7 +72,7 @@ echo "========================================"
 echo ""
 
 if [[ $BACKGROUND -eq 1 ]]; then
-    "$BROKER" > /tmp/rosettasim.log 2>&1 &
+    "$BROKER" --sdk "$SDK" --shim "$PFB" > /tmp/rosettasim.log 2>&1 &
     BROKER_PID=$!
     echo "Broker PID: $BROKER_PID"
     echo "$BROKER_PID" > /tmp/rosettasim_broker.pid
@@ -93,5 +94,5 @@ if [[ $BACKGROUND -eq 1 ]]; then
         exit 1
     fi
 else
-    exec "$BROKER"
+    exec "$BROKER" --sdk "$SDK" --shim "$PFB"
 fi

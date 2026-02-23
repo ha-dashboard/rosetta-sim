@@ -39,7 +39,7 @@ echo "  Output: $OUT"
 
 clang -arch x86_64 -dynamiclib \
     -isysroot "$SDK" \
-    -mios-simulator-version-min=10.0 \
+    -mios-simulator-version-min=9.0 \
     -F"$SDK/System/Library/Frameworks" \
     -F"$SDK/System/Library/PrivateFrameworks" \
     -framework Foundation \

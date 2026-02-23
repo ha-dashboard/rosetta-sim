@@ -21,6 +21,10 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <pthread.h>
+
+#include "../shared/rosettasim_framebuffer.h"
 
 /* MIG Message IDs (from bootstrap.defs subsystem 400) */
 #define BOOTSTRAP_CHECK_IN      402
@@ -51,6 +55,50 @@
 #define MAX_SERVICES    128
 #define MAX_NAME_LEN    128
 #define BROKER_RECV_BUF_SIZE (64 * 1024)
+/* ================================================================
+ * PurpleFBServer (QuartzCore PurpleDisplay) protocol support
+ *
+ * For iOS 9.x runtimes, injecting our PurpleFBServer shim dylib into backboardd
+ * can crash very early during libobjc image mapping. To keep backboardd alive,
+ * we can host the PurpleFBServer Mach service directly in the broker and just
+ * return its port from bootstrap_look_up("PurpleFBServer").
+ * ================================================================ */
+
+#define PFB_SERVICE_NAME      "PurpleFBServer"
+#define PFB_TVOUT_SERVICE_NAME "PurpleFBTVOutServer"
+
+/* iPhone 6s @ 2x (default device) */
+#define PFB_PIXEL_WIDTH    750
+#define PFB_PIXEL_HEIGHT   1334
+#define PFB_POINT_WIDTH    375
+#define PFB_POINT_HEIGHT   667
+#define PFB_BYTES_PER_ROW  (PFB_PIXEL_WIDTH * 4)  /* BGRA = 4 bytes/pixel */
+#define PFB_SURFACE_SIZE   (PFB_BYTES_PER_ROW * PFB_PIXEL_HEIGHT)
+#define PFB_PAGE_SIZE      4096
+#define PFB_SURFACE_PAGES  ((PFB_SURFACE_SIZE + PFB_PAGE_SIZE - 1) / PFB_PAGE_SIZE)
+#define PFB_SURFACE_ALLOC  (PFB_SURFACE_PAGES * PFB_PAGE_SIZE)
+
+typedef struct {
+    mach_msg_header_t header;       /* 24 bytes */
+    uint8_t           body[48];     /* remaining 48 bytes to reach 72 total */
+} PurpleFBRequest;
+
+#pragma pack(4)
+typedef struct {
+    mach_msg_header_t          header;          /* 24 bytes, offset 0 */
+    mach_msg_body_t            body;            /*  4 bytes, offset 24 */
+    mach_msg_port_descriptor_t port_desc;       /* 12 bytes, offset 28 */
+    /* Inline data (32 bytes): */
+    uint32_t                   memory_size;     /*  4 bytes, offset 40 */
+    uint32_t                   stride;          /*  4 bytes, offset 44 */
+    uint32_t                   unknown1;        /*  4 bytes, offset 48 */
+    uint32_t                   unknown2;        /*  4 bytes, offset 52 */
+    uint32_t                   pixel_width;     /*  4 bytes, offset 56 */
+    uint32_t                   pixel_height;    /*  4 bytes, offset 60 */
+    uint32_t                   point_width;     /*  4 bytes, offset 64 */
+    uint32_t                   point_height;    /*  4 bytes, offset 68 */
+} PurpleFBReply;
+#pragma pack()
 
 /* Service registry entry */
 typedef struct {
@@ -67,8 +115,25 @@ static mach_port_t g_rendezvous_port = MACH_PORT_NULL; /* XPC sim launchd rendez
 static mach_port_t g_port_set = MACH_PORT_NULL;        /* Port set for receiving */
 static pid_t g_backboardd_pid = -1;
 static volatile sig_atomic_t g_shutdown = 0;
+/* Simulator runtime identity (used to populate SIMULATOR_RUNTIME_* env vars). */
+static char g_sim_runtime_version[64] = "10.3";
+static char g_sim_runtime_build_version[64] = "14E8301";
+
+/* Broker-hosted PurpleFBServer state (used to boot iOS 9.x runtimes without
+ * injecting purple_fb_server.dylib into backboardd). */
+static int g_pfb_broker_enabled = 0;
+static mach_port_t g_pfb_port = MACH_PORT_NULL;
+static mach_port_t g_pfb_memory_entry = MACH_PORT_NULL;
+static vm_address_t g_pfb_surface_addr = 0;
+static void *g_pfb_shared_fb = MAP_FAILED;
+static int g_pfb_shared_fd = -1;
+static pthread_t g_pfb_sync_thread;
+static volatile int g_pfb_sync_running = 0;
 
 /* Use system's NDR_record - already defined in mach/ndr.h */
+
+static int pfb_broker_init(void);
+static void pfb_handle_message(mach_msg_header_t *request);
 
 /* Message structures — match actual MIG wire format:
  * look_up/check_in request: header(24) + NDR(8) + name_t(128) = 160 bytes
@@ -1313,6 +1378,11 @@ static void message_loop(void) {
             handle_xpc_launch_msg(request);
             continue;
         }
+        /* PurpleFBServer protocol messages (QuartzCore PurpleDisplay) */
+        if (g_pfb_broker_enabled && request->msgh_local_port == g_pfb_port) {
+            pfb_handle_message(request);
+            continue;
+        }
 
         /* Dispatch bootstrap message */
         switch (request->msgh_id) {
@@ -1491,6 +1561,304 @@ static void ensure_sim_home(void) {
     broker_log("[broker] sim_home: %s\n", g_sim_home);
 }
 
+static void trim_newline(char *s) {
+    if (!s) return;
+    s[strcspn(s, "\r\n")] = 0;
+}
+
+/* Normalize ProductVersion (e.g. "10.3.1") to major.minor ("10.3"). */
+static void normalize_major_minor(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+
+    snprintf(out, out_sz, "%s", in);
+
+    int dots = 0;
+    for (size_t i = 0; out[i]; i++) {
+        if (out[i] == '.') {
+            dots++;
+            if (dots >= 2) {
+                out[i] = '\0';
+                break;
+            }
+        }
+    }
+}
+
+static int plutil_extract_raw(const char *plist_path, const char *key,
+                              char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return -1;
+    out[0] = '\0';
+    if (!plist_path || !plist_path[0] || !key || !key[0]) return -1;
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "plutil -extract %s raw -o - '%s' 2>/dev/null",
+             key, plist_path);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+
+    if (!fgets(out, (int)out_sz, fp)) {
+        pclose(fp);
+        out[0] = '\0';
+        return -1;
+    }
+    trim_newline(out);
+    pclose(fp);
+    return out[0] ? 0 : -1;
+}
+
+static void detect_simulator_runtime(const char *sdk_path) {
+    /* Allow manual override for quick experiments. */
+    const char *ov_ver = getenv("ROSETTASIM_RUNTIME_VERSION");
+    const char *ov_bld = getenv("ROSETTASIM_RUNTIME_BUILD_VERSION");
+    if (ov_ver && ov_ver[0]) {
+        normalize_major_minor(ov_ver, g_sim_runtime_version, sizeof(g_sim_runtime_version));
+    }
+    if (ov_bld && ov_bld[0]) {
+        snprintf(g_sim_runtime_build_version, sizeof(g_sim_runtime_build_version), "%s", ov_bld);
+    }
+
+    char sysver_plist[2048];
+    snprintf(sysver_plist, sizeof(sysver_plist),
+             "%s/System/Library/CoreServices/SystemVersion.plist", sdk_path);
+
+    if (access(sysver_plist, R_OK) != 0) {
+        broker_log("[broker] runtime detect: SystemVersion.plist not readable: %s\n", sysver_plist);
+        broker_log("[broker] runtime: version=%s build=%s\n",
+                   g_sim_runtime_version, g_sim_runtime_build_version);
+        return;
+    }
+
+    if (!(ov_ver && ov_ver[0])) {
+        char pv[64] = "";
+        if (plutil_extract_raw(sysver_plist, "ProductVersion", pv, sizeof(pv)) == 0) {
+            normalize_major_minor(pv, g_sim_runtime_version, sizeof(g_sim_runtime_version));
+        }
+    }
+    if (!(ov_bld && ov_bld[0])) {
+        char pbv[64] = "";
+        if (plutil_extract_raw(sysver_plist, "ProductBuildVersion", pbv, sizeof(pbv)) == 0) {
+            snprintf(g_sim_runtime_build_version, sizeof(g_sim_runtime_build_version), "%s", pbv);
+        }
+    }
+
+    broker_log("[broker] runtime: version=%s build=%s (from %s)\n",
+               g_sim_runtime_version, g_sim_runtime_build_version, sysver_plist);
+}
+
+/* ================================================================
+ * Broker-hosted PurpleFBServer implementation
+ * ================================================================ */
+
+extern kern_return_t mach_make_memory_entry_64(
+    vm_map_t target_task,
+    memory_object_size_t *size,
+    memory_object_offset_t offset,
+    vm_prot_t permission,
+    mach_port_t *object_handle,
+    mem_entry_name_port_t parent_entry
+);
+
+static kern_return_t pfb_create_surface(void) {
+    if (g_pfb_surface_addr != 0 && g_pfb_memory_entry != MACH_PORT_NULL) {
+        return KERN_SUCCESS;
+    }
+
+    kern_return_t kr = vm_allocate(mach_task_self(), &g_pfb_surface_addr,
+                                   PFB_SURFACE_ALLOC, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][pfb] vm_allocate failed: 0x%x\n", kr);
+        return kr;
+    }
+
+    /* Clear to black (BGRA) with opaque alpha */
+    memset((void *)g_pfb_surface_addr, 0, PFB_SURFACE_ALLOC);
+    uint8_t *pixels = (uint8_t *)g_pfb_surface_addr;
+    for (uint32_t i = 0; i < PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT; i++) {
+        pixels[i * 4 + 3] = 0xFF;
+    }
+
+    memory_object_size_t entry_size = PFB_SURFACE_ALLOC;
+    kr = mach_make_memory_entry_64(
+        mach_task_self(),
+        &entry_size,
+        (memory_object_offset_t)g_pfb_surface_addr,
+        VM_PROT_READ | VM_PROT_WRITE,
+        &g_pfb_memory_entry,
+        MACH_PORT_NULL
+    );
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][pfb] mach_make_memory_entry_64 failed: 0x%x\n", kr);
+        vm_deallocate(mach_task_self(), g_pfb_surface_addr, PFB_SURFACE_ALLOC);
+        g_pfb_surface_addr = 0;
+        g_pfb_memory_entry = MACH_PORT_NULL;
+        return kr;
+    }
+
+    broker_log("[broker][pfb] surface: %ux%u px (%u bytes/row), mem_entry=0x%x\n",
+               PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, PFB_BYTES_PER_ROW, g_pfb_memory_entry);
+    return KERN_SUCCESS;
+}
+
+static void pfb_setup_shared_framebuffer(void) {
+    if (g_pfb_shared_fb != MAP_FAILED) return;
+
+    uint32_t total_size = ROSETTASIM_FB_TOTAL_SIZE(PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT);
+    g_pfb_shared_fd = open(ROSETTASIM_FB_GPU_PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (g_pfb_shared_fd < 0) {
+        broker_log("[broker][pfb] WARNING: open(%s) failed: %s\n",
+                   ROSETTASIM_FB_GPU_PATH, strerror(errno));
+        return;
+    }
+    if (ftruncate(g_pfb_shared_fd, (off_t)total_size) < 0) {
+        broker_log("[broker][pfb] WARNING: ftruncate failed: %s\n", strerror(errno));
+        close(g_pfb_shared_fd);
+        g_pfb_shared_fd = -1;
+        return;
+    }
+    g_pfb_shared_fb = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_pfb_shared_fd, 0);
+    if (g_pfb_shared_fb == MAP_FAILED) {
+        broker_log("[broker][pfb] WARNING: mmap failed: %s\n", strerror(errno));
+        close(g_pfb_shared_fd);
+        g_pfb_shared_fd = -1;
+        return;
+    }
+
+    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_pfb_shared_fb;
+    hdr->magic = ROSETTASIM_FB_MAGIC;
+    hdr->version = ROSETTASIM_FB_VERSION;
+    hdr->width = PFB_PIXEL_WIDTH;
+    hdr->height = PFB_PIXEL_HEIGHT;
+    hdr->stride = PFB_BYTES_PER_ROW;
+    hdr->format = ROSETTASIM_FB_FORMAT_BGRA;
+    hdr->frame_counter = 0;
+    hdr->timestamp_ns = 0;
+    hdr->flags = ROSETTASIM_FB_FLAG_APP_RUNNING;
+    hdr->fps_target = 60;
+
+    broker_log("[broker][pfb] shared fb: %s (%u bytes)\n", ROSETTASIM_FB_GPU_PATH, total_size);
+}
+
+static void pfb_sync_to_shared(void) {
+    if (g_pfb_shared_fb == MAP_FAILED || g_pfb_surface_addr == 0) return;
+
+    uint8_t *pixel_dest = (uint8_t *)g_pfb_shared_fb + ROSETTASIM_FB_META_SIZE;
+    memcpy(pixel_dest, (void *)g_pfb_surface_addr, PFB_SURFACE_SIZE);
+
+    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_pfb_shared_fb;
+    hdr->frame_counter++;
+    hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+}
+
+static void *pfb_sync_thread_main(void *arg) {
+    (void)arg;
+    broker_log("[broker][pfb] sync thread started\n");
+    while (g_pfb_sync_running) {
+        pfb_sync_to_shared();
+        usleep(16666); /* ~60Hz */
+    }
+    broker_log("[broker][pfb] sync thread exiting\n");
+    return NULL;
+}
+
+static void pfb_handle_message(mach_msg_header_t *request) {
+    PurpleFBRequest *req = (PurpleFBRequest *)request;
+    mach_port_t reply_port = req->header.msgh_remote_port;
+
+    /* Limit log spam */
+    static int msg_log_count = 0;
+    if (msg_log_count < 50) {
+        broker_log("[broker][pfb] msg id=%u size=%u reply=0x%x\n",
+                   req->header.msgh_id, req->header.msgh_size, reply_port);
+        msg_log_count++;
+    }
+
+    if (req->header.msgh_id == 4 && reply_port != MACH_PORT_NULL) {
+        /* map_surface request */
+        PurpleFBReply reply;
+        memset(&reply, 0, sizeof(reply));
+
+        reply.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+                                 MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply.header.msgh_size = sizeof(PurpleFBReply);
+        reply.header.msgh_remote_port = reply_port;
+        reply.header.msgh_local_port = MACH_PORT_NULL;
+        reply.header.msgh_id = 4;
+
+        reply.body.msgh_descriptor_count = 1;
+        reply.port_desc.name = g_pfb_memory_entry;
+        reply.port_desc.pad1 = 0;
+        reply.port_desc.pad2 = 0;
+        reply.port_desc.disposition = MACH_MSG_TYPE_COPY_SEND;
+        reply.port_desc.type = MACH_MSG_PORT_DESCRIPTOR;
+
+        reply.memory_size = PFB_SURFACE_ALLOC;
+        reply.stride = PFB_BYTES_PER_ROW;
+        reply.unknown1 = 0;
+        reply.unknown2 = 0;
+        reply.pixel_width = PFB_PIXEL_WIDTH;
+        reply.pixel_height = PFB_PIXEL_HEIGHT;
+        reply.point_width = PFB_POINT_WIDTH;
+        reply.point_height = PFB_POINT_HEIGHT;
+
+        kern_return_t kr = mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply),
+                                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (kr != KERN_SUCCESS) {
+            broker_log("[broker][pfb] map_surface reply failed: 0x%x\n", kr);
+        }
+        return;
+    }
+
+    if (reply_port != MACH_PORT_NULL) {
+        /* Protocol expects 72-byte replies; send a simple empty reply. */
+        uint8_t reply_buf[72];
+        memset(reply_buf, 0, sizeof(reply_buf));
+        mach_msg_header_t *hdr = (mach_msg_header_t *)reply_buf;
+        hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        hdr->msgh_size = 72;
+        hdr->msgh_remote_port = reply_port;
+        hdr->msgh_local_port = MACH_PORT_NULL;
+        hdr->msgh_id = req->header.msgh_id;
+        mach_msg(hdr, MACH_SEND_MSG, 72, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
+}
+
+static int pfb_broker_init(void) {
+    if (!g_pfb_broker_enabled) return 0;
+    if (g_pfb_port != MACH_PORT_NULL) return 0;
+
+    kern_return_t kr = pfb_create_surface();
+    if (kr != KERN_SUCCESS) return -1;
+    pfb_setup_shared_framebuffer();
+
+    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_pfb_port);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][pfb] mach_port_allocate failed: 0x%x\n", kr);
+        return -1;
+    }
+    kr = mach_port_insert_right(mach_task_self(), g_pfb_port, g_pfb_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) {
+        broker_log("[broker][pfb] mach_port_insert_right failed: 0x%x\n", kr);
+        return -1;
+    }
+
+    /* Register both names — QuartzCore probes TVOut too. */
+    register_service(PFB_SERVICE_NAME, g_pfb_port);
+    register_service(PFB_TVOUT_SERVICE_NAME, g_pfb_port);
+
+    /* Start sync thread for the shared framebuffer */
+    g_pfb_sync_running = 1;
+    if (pthread_create(&g_pfb_sync_thread, NULL, pfb_sync_thread_main, NULL) == 0) {
+        pthread_detach(g_pfb_sync_thread);
+    } else {
+        broker_log("[broker][pfb] WARNING: failed to start sync thread\n");
+    }
+
+    broker_log("[broker][pfb] enabled on port 0x%x\n", g_pfb_port);
+    return 0;
+}
 /* Spawn backboardd with broker port */
 static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     broker_log("[broker] spawning backboardd\n");
@@ -1525,16 +1893,27 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     /* bootstrap_fix.dylib MUST be first — it interposes bootstrap_check_in/look_up
      * so that the iOS SDK sends MIG messages to our broker port. */
-    char shim_abs[1280];
-    resolve_project_path(shim_path, shim_abs, sizeof(shim_abs));
     char bfix_path[1280];
     snprintf(bfix_path, sizeof(bfix_path), "%s/src/bridge/bootstrap_fix.dylib", root);
-    snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s:%s", bfix_path, shim_abs);
+    if (!g_pfb_broker_enabled && shim_path && shim_path[0]) {
+        char shim_abs[1280];
+        resolve_project_path(shim_path, shim_abs, sizeof(shim_abs));
+        snprintf(env_dyld_insert, sizeof(env_dyld_insert),
+                 "DYLD_INSERT_LIBRARIES=%s:%s", bfix_path, shim_abs);
+    } else {
+        snprintf(env_dyld_insert, sizeof(env_dyld_insert),
+                 "DYLD_INSERT_LIBRARIES=%s", bfix_path);
+    }
     snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
     snprintf(env_cffixed_home, sizeof(env_cffixed_home), "CFFIXED_USER_HOME=%s", g_sim_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
+    char env_runtime_version[128], env_runtime_build[128];
+    snprintf(env_runtime_version, sizeof(env_runtime_version),
+             "SIMULATOR_RUNTIME_VERSION=%s", g_sim_runtime_version);
+    snprintf(env_runtime_build, sizeof(env_runtime_build),
+             "SIMULATOR_RUNTIME_BUILD_VERSION=%s", g_sim_runtime_build_version);
 
     /* HID System Manager bundle path — resolve relative to project root */
     snprintf(env_hid_manager, sizeof(env_hid_manager),
@@ -1542,6 +1921,7 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
 
     char *env[] = {
         env_dyld_root,
+        "DYLD_SHARED_REGION=avoid",
         env_dyld_insert,
         env_iphone_sim_root,
         env_sim_root,
@@ -1551,8 +1931,8 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
         "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous",
         "SIMULATOR_DEVICE_NAME=iPhone 6s",
         "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1",
-        "SIMULATOR_RUNTIME_VERSION=10.3",
-        "SIMULATOR_RUNTIME_BUILD_VERSION=14E8301",
+        env_runtime_version,
+        env_runtime_build,
         "SIMULATOR_MAINSCREEN_WIDTH=750",
         "SIMULATOR_MAINSCREEN_HEIGHT=1334",
         "SIMULATOR_MAINSCREEN_SCALE=2.0",
@@ -1628,9 +2008,15 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
     snprintf(env_cffixed_home, sizeof(env_cffixed_home), "CFFIXED_USER_HOME=%s", g_sim_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
+    char env_runtime_version[128], env_runtime_build[128];
+    snprintf(env_runtime_version, sizeof(env_runtime_version),
+             "SIMULATOR_RUNTIME_VERSION=%s", g_sim_runtime_version);
+    snprintf(env_runtime_build, sizeof(env_runtime_build),
+             "SIMULATOR_RUNTIME_BUILD_VERSION=%s", g_sim_runtime_build_version);
 
     char *env[] = {
         env_dyld_root,
+        "DYLD_SHARED_REGION=avoid",
         env_dyld_insert,
         env_iphone_sim_root,
         env_sim_root,
@@ -1640,8 +2026,8 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
         "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous",
         "SIMULATOR_DEVICE_NAME=iPhone 6s",
         "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1",
-        "SIMULATOR_RUNTIME_VERSION=10.3",
-        "SIMULATOR_RUNTIME_BUILD_VERSION=14E8301",
+        env_runtime_version,
+        env_runtime_build,
         "SIMULATOR_MAINSCREEN_WIDTH=750",
         "SIMULATOR_MAINSCREEN_HEIGHT=1334",
         "SIMULATOR_MAINSCREEN_SCALE=2.0",
@@ -1804,6 +2190,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_bundle_exec[256] = "", env_bundle_path[1280] = "", env_proc_path[1280] = "";
     char env_ca_mode[64] = "";
+    char env_runtime_version[128] = "", env_runtime_build[128] = "";
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     if (bridge_path && bridge_path[0]) {
@@ -1853,6 +2240,7 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     char *env[32];
     int ei = 0;
     env[ei++] = env_dyld_root;
+    env[ei++] = "DYLD_SHARED_REGION=avoid";
     if (env_dyld_insert[0]) env[ei++] = env_dyld_insert;
     env[ei++] = env_iphone_sim_root;
     env[ei++] = env_sim_root;
@@ -1862,8 +2250,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     env[ei++] = "XPC_SIMULATOR_LAUNCHD_NAME=com.apple.xpc.sim.launchd.rendezvous";
     env[ei++] = "SIMULATOR_DEVICE_NAME=iPhone 6s";
     env[ei++] = "SIMULATOR_MODEL_IDENTIFIER=iPhone8,1";
-    env[ei++] = "SIMULATOR_RUNTIME_VERSION=10.3";
-    env[ei++] = "SIMULATOR_RUNTIME_BUILD_VERSION=14E8301";
+    env[ei++] = env_runtime_version;
+    env[ei++] = env_runtime_build;
     env[ei++] = "SIMULATOR_MAINSCREEN_WIDTH=750";
     env[ei++] = "SIMULATOR_MAINSCREEN_HEIGHT=1334";
     env[ei++] = "SIMULATOR_MAINSCREEN_SCALE=2.0";
@@ -1937,6 +2325,12 @@ int main(int argc, char *argv[]) {
 
     broker_log("[broker] RosettaSim broker starting\n");
     init_project_root(argv[0]);
+    detect_simulator_runtime(sdk_path);
+    if (atoi(g_sim_runtime_version) < 10) {
+        g_pfb_broker_enabled = 1;
+        broker_log("[broker] PurpleFBServer: broker-hosted mode ENABLED for runtime %s\n",
+                   g_sim_runtime_version);
+    }
 
     /* Initialize service registry */
     memset(g_services, 0, sizeof(g_services));
@@ -2030,6 +2424,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* If enabled, host PurpleFBServer inside the broker and listen on its port too. */
+    if (g_pfb_broker_enabled) {
+        if (pfb_broker_init() != 0) {
+            broker_log("[broker] WARNING: PurpleFBServer broker-hosted init failed\n");
+        } else if (g_pfb_port != MACH_PORT_NULL) {
+            if (g_port_set != g_broker_port) {
+                mach_port_move_member(mach_task_self(), g_pfb_port, g_port_set);
+                broker_log("[broker] added PurpleFBServer port to port set: 0x%x\n", g_pfb_port);
+            } else {
+                broker_log("[broker] WARNING: no port set available; cannot receive PurpleFBServer messages\n");
+            }
+        }
+    }
+
     /* Spawn iokitsimd — IOKit simulator daemon.
      * Must start BEFORE backboardd (backboardd uses IOKit for display/HID). */
     if (spawn_iokitsimd(sdk_path) != 0) {
@@ -2077,6 +2485,10 @@ int main(int argc, char *argv[]) {
             }
             if (tmp_req->msgh_id == XPC_LISTENER_REG_ID) {
                 broker_log("[broker] pre-app: listener-reg consumed\n");
+                goto ca_check;
+            }
+            if (g_pfb_broker_enabled && tmp_req->msgh_local_port == g_pfb_port) {
+                pfb_handle_message(tmp_req);
                 goto ca_check;
             }
 
@@ -2152,6 +2564,10 @@ int main(int argc, char *argv[]) {
                     broker_log("[broker] assertiond-wait: listener-reg consumed\n");
                     goto assertiond_svc_check;
                 }
+                if (g_pfb_broker_enabled && tmp_req->msgh_local_port == g_pfb_port) {
+                    pfb_handle_message(tmp_req);
+                    goto assertiond_svc_check;
+                }
 
                 switch (tmp_req->msgh_id) {
                     case BOOTSTRAP_CHECK_IN: handle_check_in(tmp_req); break;
@@ -2215,6 +2631,10 @@ int main(int argc, char *argv[]) {
                 }
                 if (tmp_req->msgh_id == XPC_LISTENER_REG_ID) {
                     broker_log("[broker] sb-wait: listener-reg consumed\n");
+                    goto sb_svc_check;
+                }
+                if (g_pfb_broker_enabled && tmp_req->msgh_local_port == g_pfb_port) {
+                    pfb_handle_message(tmp_req);
                     goto sb_svc_check;
                 }
 
