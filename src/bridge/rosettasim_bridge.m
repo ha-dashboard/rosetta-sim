@@ -123,7 +123,12 @@ extern void _GSEventInitializeApp(void);
 extern void BKSHIDEventRegisterEventCallbackOnRunLoop(void *callback,
                                                        void *target,
                                                        void *refcon,
-                                                       void *runloop);
+                                                       void *runloop) __attribute__((weak_import));
+/* iOS 9.3 uses BKSHIDEventRegisterEventCallback (no ...OnRunLoop). */
+extern void BKSHIDEventRegisterEventCallback(void *callback,
+                                              void *target,
+                                              void *refcon,
+                                              void *runloop) __attribute__((weak_import));
 
 /* QuartzCore */
 extern mach_port_t CARenderServerGetServerPort(void);
@@ -1258,6 +1263,14 @@ static void replacement_BKSHIDEventRegisterEventCallbackOnRunLoop(
     void *callback, void *target, void *refcon, void *runloop)
 {
     bridge_log("BKSHIDEventRegisterEventCallbackOnRunLoop() intercepted → no-op");
+    bridge_log("  (Touch input delivered via mmap polling + UITouchesEvent injection)");
+}
+
+static void replacement_BKSHIDEventRegisterEventCallback(
+    void *callback, void *target, void *refcon, void *runloop)
+{
+    (void)callback; (void)target; (void)refcon; (void)runloop;
+    bridge_log("BKSHIDEventRegisterEventCallback() intercepted → no-op");
     bridge_log("  (Touch input delivered via mmap polling + UITouchesEvent injection)");
 }
 
@@ -4217,11 +4230,70 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     void *ctx = _cg_CreateBitmap(_render_buffer, px_w, px_h, 8, px_w * 4, cs, 0x2002);
 
     if (ctx) {
-        /* Scale for Retina. CG origin is bottom-left — we keep positive scale
-         * to avoid CoreText glyph mirroring, then rotate the buffer 180° in
-         * post-processing to convert from CG coordinate space (origin bottom-left)
-         * to raster coordinate space (origin top-left). */
-        _cg_ScaleCTM(ctx, (double)kScreenScaleX, (double)kScreenScaleY);
+        /* Scale for Retina.
+         *
+         * IMPORTANT: Under some configurations, UIKit/CA ends up with a root
+         * layer whose bounds are already in pixel-sized coordinates (e.g.
+         * 750x1334) even though our framebuffer is also 750x1334. In that case,
+         * applying the usual 2x scale causes the visible region in user-space
+         * to shrink to 375x667, yielding the classic "top-left quadrant only"
+         * artifact.
+         *
+         * To avoid this, derive the CTM scale from the actual root layer bounds:
+         *   scaleX = fb_px_w / layer_bounds_w
+         *   scaleY = fb_px_h / layer_bounds_h
+         *
+         * We fetch bounds via KVC + -[NSValue getValue:] to avoid objc_msgSend
+         * struct-return ABI pitfalls.
+         *
+         * CG origin is bottom-left — we keep positive scale to avoid CoreText
+         * glyph mirroring.
+         */
+        static int _capture_scale_ready = 0;
+        static double _capture_scale_x = 0.0;
+        static double _capture_scale_y = 0.0;
+        static double _capture_units_w = 0.0;
+        static double _capture_units_h = 0.0;
+        static int _logged_capture_scale = 0;
+
+        if (!_capture_scale_ready && layer) {
+            @try {
+                id boundsVal = ((id(*)(id, SEL, id))objc_msgSend)(
+                    layer, sel_registerName("valueForKey:"), @"bounds");
+                if (boundsVal) {
+                    SEL getValSel = sel_registerName("getValue:");
+                    if (class_respondsToSelector(object_getClass(boundsVal), getValSel)) {
+                        _RSBridgeCGRect b = {0, 0, 0, 0};
+                        ((void(*)(id, SEL, void *))objc_msgSend)(boundsVal, getValSel, &b);
+                        if (b.w > 1.0 && b.h > 1.0) {
+                            double sx = (double)px_w / (double)b.w;
+                            double sy = (double)px_h / (double)b.h;
+                            if (sx > 0.1 && sx < 8.0 && sy > 0.1 && sy < 8.0) {
+                                _capture_scale_x = sx;
+                                _capture_scale_y = sy;
+                                _capture_units_w = b.w;
+                                _capture_units_h = b.h;
+                                _capture_scale_ready = 1;
+                                if (!_logged_capture_scale) {
+                                    _logged_capture_scale = 1;
+                                    bridge_log("Frame capture scale: layer bounds %.0fx%.0f, fb %dx%d -> CTM scale %.2fx%.2f",
+                                               b.w, b.h, px_w, px_h, _capture_scale_x, _capture_scale_y);
+                                }
+                            }
+                        }
+                    }
+                }
+            } @catch (id ex) {
+                /* ignore and fall back */
+            }
+        }
+
+        double scaleX = _capture_scale_ready ? _capture_scale_x : (double)kScreenScaleX;
+        double scaleY = _capture_scale_ready ? _capture_scale_y : (double)kScreenScaleY;
+        double unitsW = _capture_scale_ready ? _capture_units_w : (double)kScreenWidth;
+        double unitsH = _capture_scale_ready ? _capture_units_h : (double)kScreenHeight;
+
+        _cg_ScaleCTM(ctx, scaleX, scaleY);
 
         /* Pre-fill with window's background color so plain-backgroundColor
          * views (skipped by _force_display_recursive) are visible.
@@ -4240,7 +4312,7 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                         dlsym(RTLD_DEFAULT, "CGContextFillRect");
                     if (cg_SetFillColor && cg_FillRect) {
                         cg_SetFillColor(ctx, cgColor);
-                        _RSBridgeCGRect fullScreen = {0, 0, kScreenWidth, kScreenHeight};
+                        _RSBridgeCGRect fullScreen = {0, 0, unitsW, unitsH};
                         cg_FillRect(ctx, fullScreen);
                     }
                 }
@@ -4252,7 +4324,7 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     dlsym(RTLD_DEFAULT, "CGContextFillRect");
                 if (cg_SetGray && cg_FillRect) {
                     cg_SetGray(ctx, 1.0, 1.0);  /* white, full alpha */
-                    _RSBridgeCGRect fullScreen = {0, 0, kScreenWidth, kScreenHeight};
+                    _RSBridgeCGRect fullScreen = {0, 0, unitsW, unitsH};
                     cg_FillRect(ctx, fullScreen);
                 }
             }
@@ -4529,7 +4601,31 @@ static kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
         return 1102; /* BOOTSTRAP_UNKNOWN_SERVICE */
     }
 
-    /* Pass through to real bootstrap_look_up for all other services */
+    /* In broker mode, NEVER call the iOS SDK's real bootstrap_look_up on macOS.
+     * It uses mach_msg2 internally which can hang when talking to our broker
+     * (a mach_msg receiver). If broker lookup misses, fast-fail so UIKit can
+     * continue (or gracefully degrade) instead of deadlocking before _run. */
+    if (name && g_bridge_broker_port != MACH_PORT_NULL) {
+        mach_port_t port = bridge_broker_lookup(name);
+        if (port != MACH_PORT_NULL) {
+            if (sp) *sp = port;
+            /* Track CARenderServer connection */
+            if (strcmp(name, "com.apple.CARenderServer") == 0) {
+                g_ca_server_port = port;
+                g_ca_server_connected = 1;
+            }
+            return KERN_SUCCESS;
+        }
+        static int _miss_log_count = 0;
+        if (_miss_log_count < 30) {
+            bridge_log("bootstrap_look_up('%s') → broker MISS (fast-fail)", name);
+            _miss_log_count++;
+        }
+        if (sp) *sp = MACH_PORT_NULL;
+        return 1102; /* BOOTSTRAP_UNKNOWN_SERVICE */
+    }
+
+    /* Standalone: pass through to real bootstrap_look_up for all other services */
     kern_return_t kr = bootstrap_look_up(bp, name, sp);
     if (name) {
         static int _lookup_count = 0;
@@ -4595,6 +4691,8 @@ __attribute__((section("__DATA,__interpose"))) = {
     /* BKSHIDEventRegisterEventCallbackOnRunLoop - skip HID system client */
     { (const void *)replacement_BKSHIDEventRegisterEventCallbackOnRunLoop,
       (const void *)BKSHIDEventRegisterEventCallbackOnRunLoop },
+    { (const void *)replacement_BKSHIDEventRegisterEventCallback,
+      (const void *)BKSHIDEventRegisterEventCallback },
 
     /* UIApplicationMain - wrap with abort guard */
     { (const void *)replacement_UIApplicationMain,
@@ -6894,8 +6992,8 @@ rowBytes, void *transform);
 }
 /* Swizzle UIApplication run methods early enough to affect UIApplicationMain.
  *
- * In standalone mode (no SpringBoard / no FBSWorkspace), UIKit blocks inside
- * -[UIApplication _run] waiting on the workspace/scene handshake.
+ * UIKit blocks inside -[UIApplication _run] waiting on the workspace/scene
+ * handshake when SpringBoard/FBSWorkspace are unavailable or incomplete.
  * These swizzles bypass the handshake and jump directly to our replacement
  * run loop bootstrap (replacement_runWithMainScene). */
 static void swizzle_uiapplication_run_methods(void) {
@@ -7007,9 +7105,8 @@ static void swizzle_bks_methods(void) {
     /* UIApplication.keyWindow — let UIKit manage natively. */
     bridge_log("  UIApplication.keyWindow NOT swizzled — using UIKit native");
     /* NOTE: UIApplication _run/_runWithMainScene swizzles are installed EARLY
-     * (before UIApplicationMain calls _run) by swizzle_uiapplication_run_methods()
-     * in standalone/forced mode. In broker mode we prefer the natural
-     * FBSWorkspace → SpringBoard lifecycle. */
+     * (before UIApplicationMain calls _run) in rosettasim_bridge_init()
+     * via swizzle_uiapplication_run_methods(). */
 
     /* FBSWorkspace / FBSScene / FBSWorkspaceClient (ITEM 14).
      *
@@ -7762,41 +7859,8 @@ static void rosettasim_bridge_init(void) {
         bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
     }
 
-    /* CRITICAL: Swizzle UIApplication._run and _runWithMainScene EAGERLY (not deferred).
-     * UIApplicationMain calls [UIApplication _run] synchronously. If _run tries to
-     * connect to FBSWorkspace (which requires SpringBoard), it blocks forever.
-     * Our replacement skips FBSWorkspace and calls _callInitializationDelegatesForMainScene: directly.
-     * This swizzle MUST be installed before UIApplicationMain is called. */
-    {
-        Class appClass = objc_getClass("UIApplication");
-        if (appClass) {
-            SEL runSceneSel = sel_registerName("_runWithMainScene:transitionContext:completion:");
-            Method runSceneMethod = class_getInstanceMethod(appClass, runSceneSel);
-            if (runSceneMethod) {
-                method_setImplementation(runSceneMethod, (IMP)replacement_runWithMainScene);
-                bridge_log("  Swizzled UIApplication._runWithMainScene (EAGER)");
-            }
-
-            SEL runSel = sel_registerName("_run");
-            Method runMethod = class_getInstanceMethod(appClass, runSel);
-            if (runMethod) {
-                method_setImplementation(runMethod, (IMP)replacement_runWithMainScene);
-                bridge_log("  Swizzled UIApplication._run (EAGER)");
-            }
-
-            /* Also install workspaceShouldExit: early to prevent exit() on workspace failure */
-            SEL wseSel = sel_registerName("workspaceShouldExit:");
-            Method wseMethod = class_getInstanceMethod(appClass, wseSel);
-            if (wseMethod) {
-                method_setImplementation(wseMethod, (IMP)_noopMethod);
-            }
-            SEL wse2Sel = sel_registerName("workspaceShouldExit:withTransitionContext:");
-            Method wse2Method = class_getInstanceMethod(appClass, wse2Sel);
-            if (wse2Method) {
-                method_setImplementation(wse2Method, (IMP)_noopMethod);
-            }
-        }
-    }
+    /* CRITICAL: Swizzle UIApplication._run/_runWithMainScene BEFORE UIApplicationMain calls _run. */
+    swizzle_uiapplication_run_methods();
 
     /* Defer CARenderServer initialization and remaining BKS swizzles.
      * These trigger framework loading (CoreText → GraphicsServices → MobileGestalt)

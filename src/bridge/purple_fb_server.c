@@ -224,7 +224,7 @@ static void pfb_setup_shared_framebuffer(void) {
      * CPU framebuffer. The bridge reads from this file in GPU rendering mode. */
     g_shared_fd = open(ROSETTASIM_FB_GPU_PATH, O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (g_shared_fd < 0) {
-        pfb_log("WARNING: Cannot create %s: %s", ROSETTASIM_FB_PATH, strerror(errno));
+        pfb_log("WARNING: Cannot create %s: %s", ROSETTASIM_FB_GPU_PATH, strerror(errno));
         return;
     }
 
@@ -616,10 +616,45 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
     if (displayLayer) {
         pfb_log("Display layer = %p (class=%s)", (void *)displayLayer,
                 class_getName(object_getClass(displayLayer)));
+        /* Determine how CAWindowServer sized the display layer.
+         *
+         * In some runs, the display layer appears to use a 1x coordinate space
+         * sized in *pixels* (750x1334). In others, it uses a 2x coordinate space
+         * sized in *points* (375x667) with contentsScale=2.
+         *
+         * If we always size CALayerHost to points (375x667) but the display
+         * layer is in a 1x/pixel coordinate space, the hosted app content will
+         * only fill the top-left quadrant of the framebuffer.
+         *
+         * Heuristic: use displayLayer.contentsScale to decide whether to size
+         * the host in points or pixels, and propagate the same contentsScale to
+         * the CALayerHost.
+         */
+        double displayScale = 1.0;
+        {
+            SEL csSel = sel_registerName("contentsScale");
+            if (class_respondsToSelector(object_getClass(displayLayer), csSel)) {
+                displayScale = ((double(*)(id, SEL))objc_msgSend)(displayLayer, csSel);
+            }
+        }
+        pfb_log("Display layer contentsScale=%.2f", displayScale);
+
+        /* Propagate contentsScale to the CALayerHost when available */
+        {
+            SEL setCsSel = sel_registerName("setContentsScale:");
+            if (class_respondsToSelector(object_getClass(layerHost), setCsSel)) {
+                ((void(*)(id, SEL, double))objc_msgSend)(layerHost, setCsSel, displayScale);
+                pfb_log("CALayerHost contentsScale set to %.2f", displayScale);
+            }
+        }
+
+        double targetW = (displayScale >= 1.5) ? (double)PFB_POINT_WIDTH  : (double)PFB_PIXEL_WIDTH;
+        double targetH = (displayScale >= 1.5) ? (double)PFB_POINT_HEIGHT : (double)PFB_PIXEL_HEIGHT;
 
         typedef struct { double x, y, w, h; } CGRect_t;
-        CGRect_t frame = { 0, 0, (double)PFB_POINT_WIDTH, (double)PFB_POINT_HEIGHT };
-        pfb_log("Setting CALayerHost frame: %.0fx%.0f", frame.w, frame.h);
+        CGRect_t frame = { 0, 0, targetW, targetH };
+        pfb_log("Setting CALayerHost frame: %.0fx%.0f (%s space)",
+                frame.w, frame.h, (displayScale >= 1.5) ? "points" : "pixels");
 
         typedef void (*SetFrameFn)(id, SEL, CGRect_t);
         ((SetFrameFn)objc_msgSend)(layerHost, sel_registerName("setFrame:"), frame);
