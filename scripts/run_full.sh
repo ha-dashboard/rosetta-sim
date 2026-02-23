@@ -29,6 +29,7 @@ APP_PATH="${1:-/Users/ashhopkins/Projects/hass-dashboard/build/rosettasim/Build/
 
 # App framebuffer (separate from backboardd's)
 APP_FB="/tmp/rosettasim_app_framebuffer"
+GPU_FB="/tmp/rosettasim_framebuffer_gpu"
 
 # Build if needed
 echo "========================================"
@@ -74,13 +75,13 @@ cleanup() {
     if [[ -n "${HOST_PID:-}" ]]; then
         kill "$HOST_PID" 2>/dev/null || true
     fi
-    rm -f /tmp/rosettasim_broker.pid "$APP_FB" /tmp/rosettasim_framebuffer
+    rm -f /tmp/rosettasim_broker.pid "$APP_FB" "$GPU_FB" /tmp/rosettasim_framebuffer
     echo "Done."
 }
 trap cleanup EXIT
 
 # Clean old state
-rm -f "$APP_FB" /tmp/rosettasim_framebuffer /tmp/rosettasim_broker.pid
+rm -f "$APP_FB" "$GPU_FB" /tmp/rosettasim_framebuffer /tmp/rosettasim_broker.pid
 
 # Start broker (spawns backboardd + app)
 echo "Starting broker..."
@@ -101,18 +102,28 @@ for i in $(seq 1 120); do
         echo "App framebuffer ready."
         break
     fi
+    if [[ -f "$GPU_FB" ]]; then
+        APP_FB="$GPU_FB"
+        echo "GPU framebuffer ready."
+        break
+    fi
     sleep 0.5
 done
 
 if [[ ! -f "$APP_FB" ]]; then
-    echo "ERROR: App framebuffer not created after 60s"
+    echo "ERROR: Framebuffer not created after 60s"
     echo "Check: tail -f /tmp/rosettasim_broker.log"
-    # Don't exit — try to continue with backboardd framebuffer
-    echo "Trying with backboardd framebuffer instead..."
-    APP_FB="/tmp/rosettasim_framebuffer"
-    if [[ ! -f "$APP_FB" ]]; then
-        echo "No framebuffer at all — check logs"
-        exit 1
+    # Don't exit — try GPU framebuffer, then backboardd framebuffer
+    if [[ -f "$GPU_FB" ]]; then
+        echo "Using GPU framebuffer instead..."
+        APP_FB="$GPU_FB"
+    else
+        echo "Trying with backboardd framebuffer instead..."
+        APP_FB="/tmp/rosettasim_framebuffer"
+        if [[ ! -f "$APP_FB" ]]; then
+            echo "No framebuffer at all — check logs"
+            exit 1
+        fi
     fi
 fi
 

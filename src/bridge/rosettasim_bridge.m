@@ -381,6 +381,14 @@ static mach_port_t g_ca_server_port = MACH_PORT_NULL;
 static int g_ca_server_connected = 0;
 static id _bridge_pre_created_context = nil; /* Pre-created REMOTE CAContext */
 
+/* CPU-only mode: ROSETTASIM_CA_MODE=cpu or auto-detected when CARenderServer
+ * is not connected. When true, we force LOCAL CA contexts (no remote server)
+ * so renderInContext doesn't block on CARenderServer sync. */
+static int _force_cpu_mode(void) {
+    const char *mode = getenv("ROSETTASIM_CA_MODE");
+    return (mode && strcmp(mode, "cpu") == 0);
+}
+
 /* GPU rendering mode — when active, CARenderServer handles display compositing.
  * Set after UIKit init if CADisplay is available from CARenderServer.
  * In this mode, frame_capture_tick skips CPU rendering and copies from
@@ -388,6 +396,38 @@ static id _bridge_pre_created_context = nil; /* Pre-created REMOTE CAContext */
 static int g_gpu_rendering_active = 0;
 static void *_backboardd_fb_mmap = NULL;
 static size_t _backboardd_fb_size = 0;
+/* Lazily map the GPU framebuffer exported by backboardd/PurpleFBServer.
+ * This is safe to call from the app process to opportunistically switch
+ * capture to GPU mode when UIKit has already created a REMOTE CA context. */
+static int try_map_gpu_framebuffer(void) {
+    if (_backboardd_fb_mmap && _backboardd_fb_mmap != MAP_FAILED) return 1;
+
+    const char *gpu_fb_path = ROSETTASIM_FB_GPU_PATH;
+    int gpu_fd = open(gpu_fb_path, O_RDONLY);
+    if (gpu_fd < 0) return 0;
+
+    struct stat st;
+    if (fstat(gpu_fd, &st) != 0 || st.st_size <= (off_t)ROSETTASIM_FB_META_SIZE) {
+        close(gpu_fd);
+        return 0;
+    }
+
+    void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, gpu_fd, 0);
+    close(gpu_fd);
+    if (m == MAP_FAILED) return 0;
+
+    RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)m;
+    if (hdr->magic != ROSETTASIM_FB_MAGIC) {
+        munmap(m, (size_t)st.st_size);
+        return 0;
+    }
+
+    _backboardd_fb_mmap = m;
+    _backboardd_fb_size = (size_t)st.st_size;
+    g_gpu_rendering_active = 1;
+    bridge_log("GPU framebuffer mapped lazily: %s (%zu bytes)", gpu_fb_path, _backboardd_fb_size);
+    return 1;
+}
 
 /* Broker port — obtained from TASK_BOOTSTRAP_PORT when running under broker */
 static mach_port_t g_bridge_broker_port = MACH_PORT_NULL;
@@ -841,6 +881,12 @@ static void replacement_exit(int status) {
 extern int UIApplicationMain(int argc, char *argv[], id principal, id delegate);
 extern void UIApplicationInitialize(void);
 
+/* Forward declaration — defined later, called from timeout block */
+static void replacement_runWithMainScene(id self, SEL _cmd,
+                                          id scene,
+                                          id transitionContext,
+                                          id completionBlock);
+
 /* Keep track of the args for post-recovery initialization */
 static int _saved_argc;
 static char **_saved_argv;
@@ -853,6 +899,25 @@ static id _saved_delegate_class_name;
  * should NOT re-initialize. */
 static int _didFinishLaunching_called = 0;
 
+/* Track whether replacement_runWithMainScene has been entered.
+ * Used by the UIApplicationMain timeout to force-call it if UIKit's
+ * _run blocks (e.g., waiting for FBSWorkspace scene reply). */
+static volatile int _runWithMainScene_entered = 0;
+
+/* Main thread reference + sigjmp_buf for the workspace timeout mechanism.
+ * When UIApplicationMain blocks before calling _run, a background timer
+ * sends SIGUSR1 to the main thread, which siglongjmps out of the block. */
+static pthread_t _main_thread;
+static sigjmp_buf _uiam_recovery;
+static volatile sig_atomic_t _uiam_timeout_armed = 0;
+
+static void _uiam_timeout_handler(int sig) {
+    if (_uiam_timeout_armed && !_runWithMainScene_entered) {
+        _uiam_timeout_armed = 0;
+        siglongjmp(_uiam_recovery, 99);
+    }
+}
+
 static int replacement_UIApplicationMain(int argc, char *argv[],
                                           id principalClassName,
                                           id delegateClassName) {
@@ -862,15 +927,58 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
     _saved_argv = argv;
     _saved_principal_class_name = principalClassName;
     _saved_delegate_class_name = delegateClassName;
+    _main_thread = pthread_self();
+
+    /* Install SIGUSR1 handler for workspace timeout */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = _uiam_timeout_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
 
     /* Set abort guard */
     _abort_guard_active = 1;
     int abort_result = setjmp(_abort_recovery);
 
     if (abort_result == 0) {
+        /* Safety timeout: if UIApplicationMain blocks before calling _run
+         * (e.g., FBSWorkspace handshake stalls), interrupt the main thread
+         * with SIGUSR1 after 5 seconds. The signal handler siglongjmps to
+         * _uiam_recovery which bypasses the blocked UIApplicationMain. */
+        int jmp_val = sigsetjmp(_uiam_recovery, 1);
+        if (jmp_val == 99) {
+            /* We were interrupted by the workspace timeout. UIApplicationMain
+             * is blocked — proceed with our replacement lifecycle. */
+            bridge_log("UIApplicationMain: workspace timeout fired — running replacement lifecycle");
+            _abort_guard_active = 0;
+            id app = ((id(*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("UIApplication"),
+                sel_registerName("sharedApplication"));
+            if (app) {
+                replacement_runWithMainScene(app,
+                    sel_registerName("_runWithMainScene:transitionContext:completion:"),
+                    nil, nil, nil);
+            }
+            return 0;
+        }
+
+        /* Arm the timeout */
+        _uiam_timeout_armed = 1;
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                if (_uiam_timeout_armed && !_runWithMainScene_entered) {
+                    bridge_log("UIApplicationMain TIMEOUT: _run not called after 5s — "
+                               "sending SIGUSR1 to main thread");
+                    pthread_kill(_main_thread, SIGUSR1);
+                }
+            });
+
         /* First pass - try the original UIApplicationMain */
         bridge_log("  Calling original UIApplicationMain (attempt 1)");
         int ret = UIApplicationMain(argc, argv, principalClassName, delegateClassName);
+        _uiam_timeout_armed = 0;
         _abort_guard_active = 0;
         return ret;
     }
@@ -4346,6 +4454,53 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
             }
         }
 
+        /* Pre-render: increment frame_counter NOW to prove the loop is alive.
+         * If the broker sees delta>0 but pixels are wrong, the hang is inside
+         * renderInContext:. Also log context type on first frame. */
+        {
+            /* If UIKit has created a REMOTE CA context (server_port != 0) but the
+             * GPU framebuffer isn't mapped yet, CPU renderInContext can deadlock.
+             * Try to flip into GPU capture opportunistically and skip renderInContext. */
+            Ivar lcI = class_getInstanceVariable(
+                object_getClass(_bridge_root_window), "_layerContext");
+            id lctx = lcI ? *(id *)((uint8_t *)_bridge_root_window +
+                                     ivar_getOffset(lcI)) : nil;
+            uint32_t srv = 0;
+            if (lctx) {
+                Ivar implI = class_getInstanceVariable(
+                    object_getClass(lctx), "_impl");
+                if (implI) {
+                    void *imp = *(void **)((uint8_t *)lctx + ivar_getOffset(implI));
+                    if (imp) srv = *(uint32_t *)((uint8_t *)imp + 0x98);
+                }
+            }
+
+            if (srv != 0 && !_force_cpu_mode()) {
+                static int _logged_remote_skip = 0;
+                if (!_logged_remote_skip) {
+                    _logged_remote_skip = 1;
+                    bridge_log("frame_capture_tick: REMOTE context detected (server_port=%u) but GPU capture inactive — skipping renderInContext (avoid deadlock) and attempting lazy GPU mmap", srv);
+                }
+                /* Attempt to enable GPU capture for subsequent frames. */
+                if (!g_gpu_rendering_active || !_backboardd_fb_mmap) {
+                    (void)try_map_gpu_framebuffer();
+                }
+                _cg_Release(ctx);
+                _cg_ReleaseCS(cs);
+                _sendEvent_guard_active = 0;
+                return;
+            }
+
+            hdr->frame_counter++;
+            __sync_synchronize();
+            static int _render_logged = 0;
+            if (!_render_logged) {
+                _render_logged = 1;
+                bridge_log("frame_capture_tick: PRE-RENDER fc=%llu layerCtx=%p server_port=%u — calling renderInContext:",
+                           hdr->frame_counter, (void *)lctx, srv);
+            }
+        }
+
         /* Render the layer tree into the local buffer */
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
@@ -4476,8 +4631,9 @@ static void start_frame_capture(void) {
         frame_capture_tick,               /* callback */
         NULL);                            /* context */
 
-    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
-    bridge_log("Frame capture started (%.0f FPS target)", fps);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    bridge_log("Frame capture started (%.0f FPS target, mode=default, runloop=%p)",
+               fps, (void *)CFRunLoopGetCurrent());
 
     /* Register as a CADisplayLink-lite: post a notification that CADisplayLink
      * observers can hook into. This enables basic animation timing support
@@ -4863,8 +5019,9 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
 
         /* Use the PRE-CREATED remote context from CARenderServerGetServerPort.
          * This context was created BEFORE any views exist, ensuring all layer
-         * backing stores go through the server pipeline from the start. */
-        if (_bridge_pre_created_context) { /* re-enabled for proper GPU rendering */
+         * backing stores go through the server pipeline from the start.
+         * SKIP in CPU mode — remote context causes renderInContext to block. */
+        if (_bridge_pre_created_context && !_force_cpu_mode()) {
             /* Set the pre-created context as UIWindow's _layerContext */
             Ivar lcIvar = class_getInstanceVariable(object_getClass(self), "_layerContext");
             if (lcIvar) {
@@ -4903,9 +5060,12 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
          *   1. _shouldUseRemoteContext → YES (rendersLocally=NO)
          *   2. setClientPort(GSGetPurpleApplicationPort())
          *   3. remoteContextWithOptions: → connect_remote()
-         */
+         *
+         * In CPU mode, we still call _createContextAttached: — but rendersLocally
+         * is swizzled to YES, so UIKit will create a LOCAL context instead. */
         {
-            bridge_log("  Calling UIKit's _createContextAttached:YES (natural path)");
+            bridge_log("  Calling UIKit's _createContextAttached:YES (%s path)",
+                       _force_cpu_mode() ? "LOCAL/cpu" : "natural");
             SEL createCtxSel = sel_registerName("_createContextAttached:");
             if ([(id)self respondsToSelector:createCtxSel]) {
                 ((void(*)(id, SEL, BOOL))objc_msgSend)(self, createCtxSel, YES);
@@ -5012,37 +5172,9 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
             } else {
                 bridge_log("  UIKit's _createContextAttached: returned nil _layerContext!");
             }
-            if (0) { /* DISABLED: manual context creation */
-                Class caCtxClass = objc_getClass("CAContext");
-                SEL remCtxSel = sel_registerName("remoteContextWithOptions:");
-                (void)caCtxClass; (void)remCtxSel;
-                id remoteCtx = nil;
-                if (remoteCtx) {
-                    /* Set the window's root layer as the context's layer */
-                    id rootLayer = ((id(*)(id, SEL))objc_msgSend)(self, sel_registerName("layer"));
-                    if (rootLayer) {
-                        SEL setLayerSel = sel_registerName("setLayer:");
-                        if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
-                            ((void(*)(id, SEL, id))objc_msgSend)(remoteCtx, setLayerSel, rootLayer);
-                        }
-                    }
-                    /* Set as the UIWindow's _layerContext */
-                    Ivar lcIvar2 = class_getInstanceVariable(object_getClass(self), "_layerContext");
-                    if (lcIvar2) {
-                        ((id(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("retain"));
-                        *(id *)((uint8_t *)self + ivar_getOffset(lcIvar2)) = remoteCtx;
-                    }
-                    unsigned int cid = [(id)remoteCtx respondsToSelector:sel_registerName("contextId")] ?
-                        ((unsigned int(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("contextId")) : 0;
-                    bridge_log("  UIWindow: REMOTE context created (contextId=%u, displayable=YES)", cid);
-                } else {
-                    bridge_log("  UIWindow: remoteContextWithOptions returned nil — falling back");
-                    SEL createCtxSel2 = sel_registerName("_createContextAttached:");
-                    if ([(id)self respondsToSelector:createCtxSel2])
-                        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, createCtxSel2, YES);
-                }
-            } else {
-                /* Fallback */
+            /* Only call _createContextAttached: again if UIKit didn't create one above */
+            if (!layerCtx) {
+                bridge_log("  _layerContext still nil — retrying _createContextAttached:YES");
                 SEL createCtxSel2 = sel_registerName("_createContextAttached:");
                 if ([(id)self respondsToSelector:createCtxSel2])
                     ((void(*)(id, SEL, BOOL))objc_msgSend)(self, createCtxSel2, YES);
@@ -5114,6 +5246,10 @@ static id replacement_keyWindow(id self, SEL _cmd) {
     return _bridge_key_window ? _bridge_key_window : _bridge_root_window;
 }
 
+/* Forward declaration — defined later, called eagerly here to ensure
+ * _original_makeKeyAndVisible_IMP is set before any window is created. */
+static void swizzle_bks_methods(void);
+
 /* ================================================================
  * UIApplication._runWithMainScene:transitionContext:completion:
  *
@@ -5137,7 +5273,15 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                           id scene,
                                           id transitionContext,
                                           id completionBlock) {
+    _runWithMainScene_entered = 1;
     bridge_log("_runWithMainScene: intercepted — bypassing FBSWorkspace");
+
+    /* Ensure BKS swizzles are installed NOW — the deferred block may not
+     * have run yet (it's dispatched to the main queue, but the run loop
+     * hasn't started iterating). We need _original_makeKeyAndVisible_IMP
+     * set before any code calls makeKeyAndVisible, otherwise the fallback
+     * path calls setHidden:NO which hangs on BKSEventFocusManager. */
+    swizzle_bks_methods();
 
     /* Create UIEventDispatcher — normally done by _runWithMainScene before
      * the completion block fires. This creates:
@@ -5819,6 +5963,16 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
      * start_frame_capture with renderInContext).
      * ================================================================ */
     int _fbs_display_pipeline_active = 0;
+    /* Proactively probe CARenderServer here to avoid a race with the deferred
+     * init block in rosettasim_bridge_init(). UIKit can create a REMOTE CAContext
+     * before g_ca_server_connected flips, which would otherwise push us into CPU
+     * renderInContext() on a remote context (hang/deadlock). */
+    if (!_force_cpu_mode() && !g_ca_server_connected) {
+        mach_port_t p = replacement_CARenderServerGetServerPort();
+        if (p != MACH_PORT_NULL && g_ca_server_connected) {
+            bridge_log("Display Pipeline: CARenderServer probe succeeded (port=%u)", p);
+        }
+    }
 
     if (g_ca_server_connected) {
         bridge_log("Display Pipeline: CARenderServer connected — setting up display...");
@@ -7004,13 +7158,27 @@ rowBytes, void *transform);
         }
     });
 
-    /* Start the main run loop — this is what _runWithMainScene normally
-     * does at the very end. CFRunLoopRun never returns. */
-    bridge_log("  Starting CFRunLoop from _runWithMainScene replacement...");
-    CFRunLoopRun();
-
-    /* Only reached if CFRunLoopRun returns (app shutting down) */
-    bridge_log("  CFRunLoopRun returned from _runWithMainScene replacement");
+    /* Start the main run loop.
+     *
+     * Default: CFRunLoopRun() — normal UIKit run loop semantics.
+     * ROSETTASIM_RUNLOOP_PUMP=1: Manual pump that calls frame_capture_tick
+     *   directly + drains run loop events. Use this if CFRunLoopTimer
+     *   callbacks don't fire (observed with iOS 10.3 SDK under Rosetta 2). */
+    if (getenv("ROSETTASIM_RUNLOOP_PUMP") && atoi(getenv("ROSETTASIM_RUNLOOP_PUMP"))) {
+        bridge_log("  Starting manual run loop pump (~30 FPS, ROSETTASIM_RUNLOOP_PUMP=1)...");
+        for (;;) {
+            @autoreleasepool {
+                frame_capture_tick(NULL, NULL);
+                while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true)
+                       == kCFRunLoopRunHandledSource) { /* drain */ }
+                usleep(33000);
+            }
+        }
+    } else {
+        bridge_log("  Starting CFRunLoopRun...");
+        CFRunLoopRun();
+        bridge_log("  CFRunLoopRun returned");
+    }
 }
 /* Swizzle UIApplication run methods early enough to affect UIApplicationMain.
  *
@@ -7083,10 +7251,11 @@ static void swizzle_bks_methods(void) {
         }
 
         /* Swizzle UIWindow.initWithFrame: to set the pre-created remote context
-         * immediately when the window is created (before any views are added). */
+         * immediately when the window is created (before any views are added).
+         * SKIP in CPU mode — we don't want remote contexts. */
         SEL initFrameSel = sel_registerName("initWithFrame:");
         Method initFrameM = class_getInstanceMethod(windowClass, initFrameSel);
-        if (initFrameM) {
+        if (initFrameM && !_force_cpu_mode()) {
             typedef struct { double x, y, w, h; } _CGRect;
             typedef id (*orig_initFrame_fn)(id, SEL, _CGRect);
             __block orig_initFrame_fn origInitFrame = (orig_initFrame_fn)method_getImplementation(initFrameM);
@@ -7126,6 +7295,26 @@ static void swizzle_bks_methods(void) {
 
     /* UIApplication.keyWindow — let UIKit manage natively. */
     bridge_log("  UIApplication.keyWindow NOT swizzled — using UIKit native");
+
+    /* In CPU mode, force +[UIApplication rendersLocally] → YES so UIKit's
+     * _createContextAttached: creates a LOCAL CA context (no server sync).
+     * Without this, renderInContext: blocks on CARenderServer Mach messages. */
+    if (_force_cpu_mode()) {
+        Class appClass2 = objc_getClass("UIApplication");
+        if (appClass2) {
+            SEL rlSel = sel_registerName("rendersLocally");
+            IMP yesImp = imp_implementationWithBlock(^BOOL(id self) { return YES; });
+            Method rlMethod = class_getClassMethod(appClass2, rlSel);
+            if (rlMethod) {
+                method_setImplementation(rlMethod, yesImp);
+                bridge_log("  +[UIApplication rendersLocally] → YES (CPU mode)");
+            } else {
+                class_addMethod(object_getClass((id)appClass2), rlSel, yesImp, "B@:");
+                bridge_log("  +[UIApplication rendersLocally] added → YES (CPU mode)");
+            }
+        }
+    }
+
     /* NOTE: UIApplication _run/_runWithMainScene swizzles are installed EARLY
      * (before UIApplicationMain calls _run) in rosettasim_bridge_init()
      * via swizzle_uiapplication_run_methods(). */
@@ -7397,95 +7586,18 @@ static void swizzle_bks_methods(void) {
         }
     }
 
-    /* Runtime binary patch for UIApplicationMain.
+    /* Runtime binary patch for UIApplicationMain — DISABLED.
      *
-     * The app uses a debug dylib loaded via dlopen at runtime. DYLD interposition
-     * only applies to images loaded at startup — the debug dylib's GOT entries for
-     * UIApplicationMain point to the real function, not our replacement.
+     * This patch overwrites UIKit's UIApplicationMain code bytes with a JMP to
+     * replacement_UIApplicationMain. But replacement_UIApplicationMain calls
+     * UIApplicationMain() to invoke the original, and (within the interposing
+     * library) that call resolves to the now-patched UIKit code → infinite
+     * recursion. DYLD __interpose is sufficient for all startup-loaded images.
      *
-     * Fix: Write an x86_64 trampoline at UIApplicationMain's code address to
-     * redirect ALL calls (including from dlopen'd images) to our replacement. */
-    {
-        /* dlsym returns our replacement due to DYLD interposition, so we
-         * must find the ORIGINAL by walking Mach-O symbol tables directly. */
-        void *orig_uiam = NULL;
-        uint32_t img_count = _dyld_image_count();
-        for (uint32_t i = 0; i < img_count && !orig_uiam; i++) {
-            const char *img_name = _dyld_get_image_name(i);
-            if (!img_name) continue;
-            if (strstr(img_name, "rosettasim_bridge")) continue; /* skip our dylib */
-            const struct mach_header *mh = _dyld_get_image_header(i);
-            if (!mh || mh->magic != MH_MAGIC_64) continue;
-            const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            /* Walk load commands to find LC_SYMTAB and __LINKEDIT */
-            const uint8_t *lc_ptr = (const uint8_t *)mh64 + sizeof(struct mach_header_64);
-            const struct symtab_command *symtab_cmd = NULL;
-            const struct segment_command_64 *linkedit_seg = NULL;
-            for (uint32_t j = 0; j < mh64->ncmds; j++) {
-                const struct load_command *lc = (const struct load_command *)lc_ptr;
-                if (lc->cmd == LC_SYMTAB) symtab_cmd = (const struct symtab_command *)lc;
-                else if (lc->cmd == LC_SEGMENT_64) {
-                    const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                    if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit_seg = seg;
-                }
-                lc_ptr += lc->cmdsize;
-            }
-            if (!symtab_cmd || !linkedit_seg) continue;
-            uintptr_t lb = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
-            const struct nlist_64 *syms = (const struct nlist_64 *)(lb + symtab_cmd->symoff);
-            const char *strs = (const char *)(lb + symtab_cmd->stroff);
-            for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
-                if ((syms[k].n_type & N_TYPE) != N_SECT) continue;
-                uint32_t sx = syms[k].n_un.n_strx;
-                if (sx && strcmp(strs + sx, "_UIApplicationMain") == 0) {
-                    orig_uiam = (void *)(syms[k].n_value + slide);
-                    bridge_log("  Found original UIApplicationMain at %p in %s", orig_uiam, img_name);
-                    break;
-                }
-            }
-        }
-        void *our_uiam = (void *)replacement_UIApplicationMain;
-        if (orig_uiam && orig_uiam != our_uiam) {
-            bridge_log("  Patching UIApplicationMain at %p → %p (runtime trampoline)", orig_uiam, our_uiam);
-            vm_address_t page = (vm_address_t)orig_uiam & ~(vm_address_t)0xFFF;
-            kern_return_t kr = vm_protect(mach_task_self(), page, 0x2000, FALSE,
-                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            if (kr != KERN_SUCCESS) {
-                kr = vm_protect(mach_task_self(), page, 0x1000, FALSE,
-                                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            }
-            if (kr == KERN_SUCCESS) {
-                uint8_t *code = (uint8_t *)orig_uiam;
-                uint64_t addr = (uint64_t)(uintptr_t)our_uiam;
-                code[0]  = 0x48; code[1]  = 0xB8; /* movabs rax, imm64 */
-                memcpy(&code[2], &addr, 8);
-                code[10] = 0xFF; code[11] = 0xE0; /* jmp rax */
-                /* Aggressive Rosetta cache flush:
-                 * 1. Remove execute permission entirely (invalidates translation)
-                 * 2. Re-add RX permissions (forces re-translation on next access)
-                 * 3. sys_icache_invalidate as additional safety */
-                vm_protect(mach_task_self(), page, 0x2000, FALSE,
-                           VM_PROT_READ); /* remove X → invalidate Rosetta cache */
-                vm_protect(mach_task_self(), page, 0x2000, FALSE,
-                           VM_PROT_READ | VM_PROT_EXECUTE); /* re-add X */
-                extern void sys_icache_invalidate(void *start, size_t len);
-                sys_icache_invalidate(orig_uiam, 12);
-                /* Verify the trampoline bytes are in place */
-                bridge_log("  UIApplicationMain: trampoline bytes: %02x %02x %02x %02x ... %02x %02x",
-                           code[0], code[1], code[2], code[3], code[10], code[11]);
-                /* Verify by calling the original address directly with dummy args.
-                 * This should trigger our replacement_UIApplicationMain. */
-                bridge_log("  UIApplicationMain: runtime trampoline installed");
-            } else {
-                bridge_log("  UIApplicationMain: vm_protect failed 0x%x", kr);
-            }
-        } else if (orig_uiam == our_uiam) {
-            bridge_log("  UIApplicationMain: DYLD interposition already active");
-        } else {
-            bridge_log("  UIApplicationMain: not found via dlsym");
-        }
-    }
+     * If dlopen'd images bypassing __interpose becomes a problem, reintroduce
+     * this with a proper stolen-bytes trampoline so the replacement can call
+     * the original without re-entering itself. */
+    bridge_log("  UIApplicationMain: relying on DYLD __interpose (runtime patch disabled)");
 }
 
 /* Global exception handler — log with full context, re-throw unknown exceptions.
@@ -7884,11 +7996,16 @@ static void rosettasim_bridge_init(void) {
     /* CRITICAL: Swizzle UIApplication._run/_runWithMainScene BEFORE UIApplicationMain calls _run. */
     swizzle_uiapplication_run_methods();
 
-    /* Defer CARenderServer initialization and remaining BKS swizzles.
-     * These trigger framework loading (CoreText → GraphicsServices → MobileGestalt)
-     * which does XPC calls to system services (cfprefsd, mobilegestalt) that
-     * don't exist in our simulator. Running them in the constructor blocks forever.
-     * Defer to after the main run loop starts. */
+    /* Defer CARenderServer initialization and BKS swizzles.
+     * CARenderServer init triggers framework loading (CoreText → GraphicsServices
+     * → MobileGestalt) which does XPC calls to system services (cfprefsd,
+     * mobilegestalt) that don't exist in our simulator. Running them in the
+     * constructor blocks forever. Defer to after the main run loop starts.
+     *
+     * NOTE: swizzle_bks_methods() is also called eagerly in
+     * replacement_runWithMainScene (before makeKeyAndVisible) to ensure
+     * _original_makeKeyAndVisible_IMP is set. The deferred call is kept
+     * as a safety net — swizzle_bks_methods() is idempotent. */
     if (g_bridge_broker_port != MACH_PORT_NULL) {
         bridge_log("  CARenderServer + BKS swizzles: DEFERRED to run loop");
         dispatch_async(dispatch_get_main_queue(), ^{
