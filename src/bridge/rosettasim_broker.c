@@ -1401,15 +1401,78 @@ static void message_loop(void) {
     broker_log("[broker] exiting message loop\n");
 }
 
+/* Project root — derived from the broker binary path (fallback: cwd). */
+static char g_project_root[1024] = "";
+
 /* Sim home directory — created under project root */
 static char g_sim_home[1024] = "";
+
+static void path_pop_dir(char *path) {
+    if (!path || !path[0]) return;
+    char *slash = strrchr(path, '/');
+    if (!slash) return;
+    if (slash == path) {
+        /* Preserve "/" */
+        path[1] = '\0';
+        return;
+    }
+    *slash = '\0';
+}
+
+static void init_project_root(const char *argv0) {
+    if (g_project_root[0]) return;
+
+    char resolved[2048];
+    resolved[0] = '\0';
+
+    if (argv0 && argv0[0] && realpath(argv0, resolved)) {
+        /* /.../rosetta/src/bridge/rosettasim_broker -> /.../rosetta */
+        path_pop_dir(resolved); /* bridge */
+        path_pop_dir(resolved); /* src */
+        path_pop_dir(resolved); /* project root */
+        snprintf(g_project_root, sizeof(g_project_root), "%s", resolved);
+        broker_log("[broker] project_root: %s\n", g_project_root);
+        return;
+    }
+
+    /* Fallback: cwd */
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd))) {
+        snprintf(g_project_root, sizeof(g_project_root), "%s", cwd);
+        broker_log("[broker] project_root (fallback=cwd): %s\n", g_project_root);
+    }
+}
+
+static void resolve_project_path(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+
+    if (in[0] == '/') {
+        snprintf(out, out_sz, "%s", in);
+        return;
+    }
+    if (g_project_root[0]) {
+        snprintf(out, out_sz, "%s/%s", g_project_root, in);
+        return;
+    }
+    snprintf(out, out_sz, "%s", in);
+}
 
 static void ensure_sim_home(void) {
     if (g_sim_home[0]) return;
 
+    const char *root = NULL;
     char cwd[1024];
-    getcwd(cwd, sizeof(cwd));
-    snprintf(g_sim_home, sizeof(g_sim_home), "%s/.sim_home", cwd);
+    if (g_project_root[0]) {
+        root = g_project_root;
+    } else if (getcwd(cwd, sizeof(cwd))) {
+        root = cwd;
+    } else {
+        root = "/tmp";
+    }
+
+    snprintf(g_sim_home, sizeof(g_sim_home), "%s/.sim_home", root);
 
     /* Create sim_home directory structure */
     char path[1280];
@@ -1447,29 +1510,35 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     }
 
     /* Build environment — must match run_backboardd.sh exactly */
-    char env_dyld_root[1024], env_dyld_insert[1024];
+    char env_dyld_root[1024], env_dyld_insert[2048];
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_hid_manager[1280];
-
+    const char *root = g_project_root[0] ? g_project_root : NULL;
     char cwd[1024];
+    if (!root) {
+        if (getcwd(cwd, sizeof(cwd))) root = cwd;
+        else root = "/tmp";
+    }
     getcwd(cwd, sizeof(cwd));
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     /* bootstrap_fix.dylib MUST be first — it interposes bootstrap_check_in/look_up
      * so that the iOS SDK sends MIG messages to our broker port. */
+    char shim_abs[1280];
+    resolve_project_path(shim_path, shim_abs, sizeof(shim_abs));
     char bfix_path[1280];
-    snprintf(bfix_path, sizeof(bfix_path), "%s/src/bridge/bootstrap_fix.dylib", cwd);
-    snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s:%s", bfix_path, shim_path);
+    snprintf(bfix_path, sizeof(bfix_path), "%s/src/bridge/bootstrap_fix.dylib", root);
+    snprintf(env_dyld_insert, sizeof(env_dyld_insert), "DYLD_INSERT_LIBRARIES=%s:%s", bfix_path, shim_abs);
     snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
     snprintf(env_cffixed_home, sizeof(env_cffixed_home), "CFFIXED_USER_HOME=%s", g_sim_home);
     snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s/tmp", g_sim_home);
 
-    /* HID System Manager bundle path — resolve relative to cwd */
+    /* HID System Manager bundle path — resolve relative to project root */
     snprintf(env_hid_manager, sizeof(env_hid_manager),
-             "SIMULATOR_HID_SYSTEM_MANAGER=%s/src/bridge/RosettaSimHIDManager.bundle", cwd);
+             "SIMULATOR_HID_SYSTEM_MANAGER=%s/src/bridge/RosettaSimHIDManager.bundle", root);
 
     char *env[] = {
         env_dyld_root,
@@ -1539,18 +1608,21 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
 
     ensure_sim_home();
 
-    char env_dyld_root[1024], env_dyld_insert[1280];
+    char env_dyld_root[1024], env_dyld_insert[2048];
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
-
+    const char *root = g_project_root[0] ? g_project_root : NULL;
     char cwd[1024];
-    getcwd(cwd, sizeof(cwd));
+    if (!root) {
+        if (getcwd(cwd, sizeof(cwd))) root = cwd;
+        else root = "/tmp";
+    }
     /* All daemons get both bootstrap_fix.dylib + springboard_shim.dylib */
     snprintf(env_dyld_insert, sizeof(env_dyld_insert),
              "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib:%s/src/bridge/springboard_shim.dylib",
-             cwd, cwd);
+             root, root);
     snprintf(env_iphone_sim_root, sizeof(env_iphone_sim_root), "IPHONE_SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_sim_root, sizeof(env_sim_root), "SIMULATOR_ROOT=%s", sdk_path);
     snprintf(env_home, sizeof(env_home), "HOME=%s", g_sim_home);
@@ -1733,14 +1805,20 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     char env_bundle_exec[256] = "", env_bundle_path[1280] = "", env_proc_path[1280] = "";
     char env_ca_mode[64] = "";
 
-    char cwd_app[1024];
-    getcwd(cwd_app, sizeof(cwd_app));
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     if (bridge_path && bridge_path[0]) {
         /* bootstrap_fix.dylib first, then bridge */
+        const char *root = g_project_root[0] ? g_project_root : NULL;
+        char cwd_app[1024];
+        if (!root) {
+            if (getcwd(cwd_app, sizeof(cwd_app))) root = cwd_app;
+            else root = "/tmp";
+        }
+        char bridge_abs[1280];
+        resolve_project_path(bridge_path, bridge_abs, sizeof(bridge_abs));
         snprintf(env_dyld_insert, sizeof(env_dyld_insert),
                  "DYLD_INSERT_LIBRARIES=%s/src/bridge/bootstrap_fix.dylib:%s",
-                 cwd_app, bridge_path);
+                 root, bridge_abs);
     } else {
         env_dyld_insert[0] = '\0';
     }
@@ -1795,6 +1873,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* Use separate framebuffer path for the app to avoid conflict with
      * PurpleFBServer's 60Hz sync in backboardd */
     env[ei++] = "ROSETTASIM_FB_PATH=/tmp/rosettasim_app_framebuffer";
+    /* Enable XPC send_sync timeout for app only — prevents MobileGestalt block
+     * in [UIApplication init]. Daemons handle the block on background threads. */
+    env[ei++] = "ROSETTASIM_XPC_TIMEOUT=1";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
     if (env_proc_path[0]) env[ei++] = env_proc_path;
@@ -1855,6 +1936,7 @@ int main(int argc, char *argv[]) {
     }
 
     broker_log("[broker] RosettaSim broker starting\n");
+    init_project_root(argv[0]);
 
     /* Initialize service registry */
     memset(g_services, 0, sizeof(g_services));

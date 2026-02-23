@@ -1080,6 +1080,15 @@ extern void xpc_connection_send_message_with_reply(xpc_connection_t_bfix connect
 extern xpc_object_t_bfix xpc_connection_send_message_with_reply_sync(
     xpc_connection_t_bfix connection, xpc_object_t_bfix message);
 
+/* Return an XPC error object that callers can handle gracefully.
+ * Returning NULL from send_sync causes crashes in callers that don't
+ * check for nil (e.g., backboardd's MobileGestalt code). */
+extern xpc_object_t_bfix xpc_dictionary_create(const char *const *keys,
+                                                  xpc_object_t_bfix const *values,
+                                                  size_t count);
+extern void xpc_dictionary_set_int64(xpc_object_t_bfix dict, const char *key, int64_t value);
+extern void xpc_dictionary_set_string(xpc_object_t_bfix dict, const char *key, const char *value);
+
 static xpc_object_t_bfix replacement_xpc_send_sync(
     xpc_connection_t_bfix connection, xpc_object_t_bfix message) {
 
@@ -1097,9 +1106,12 @@ static xpc_object_t_bfix replacement_xpc_send_sync(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
 
     if (result != 0) {
-        /* Timeout — service didn't respond. Return NULL (XPC treats as error). */
-        bfix_log("[bfix] xpc_send_sync: TIMEOUT (2s) — service unresponsive\n");
-        return NULL;
+        /* Timeout — service didn't respond. Return an empty XPC dictionary
+         * instead of NULL. Callers (MobileGestalt, cfprefsd) typically check
+         * for specific keys and handle missing keys gracefully, but crash on NULL. */
+        bfix_log("[bfix] xpc_send_sync: TIMEOUT (2s) — returning empty dict\n");
+        xpc_object_t_bfix empty = xpc_dictionary_create(NULL, NULL, 0);
+        return empty;
     }
 
     return reply;
@@ -1199,9 +1211,6 @@ static void patch_bootstrap_functions(void) {
         /* Listener registration: builds proper 52-byte registration message
          * for dispatch_mach_connect (required for LISTENER mode to work). */
         { "_xpc_connection_check_in", (void *)replacement_xpc_connection_check_in },
-        /* NOTE: xpc_connection_send_message_with_reply_sync timeout REMOVED.
-         * It caused backboardd to crash when MobileGestalt returned NULL.
-         * The proper fix is implementing the MobileGestalt service (Service #2). */
         /* NOTE: launch_msg runtime trampoline REMOVED — causes infinite recursion
          * because fallthrough calls the patched function. DYLD interposition handles
          * cross-library calls; intra-library calls need saved-original approach. */
@@ -1212,6 +1221,23 @@ static void patch_bootstrap_functions(void) {
         void *orig = find_original_function(patches[i].name);
         if (orig) {
             write_trampoline(orig, patches[i].replacement, patches[i].name);
+        }
+    }
+
+    /* Conditionally install xpc_send_sync timeout for APP process only.
+     * Daemons (backboardd, assertiond, SpringBoard) block on MobileGestalt
+     * harmlessly on background threads. The app blocks on main thread inside
+     * [UIApplication init], preventing _run from ever being called.
+     * Broker sets ROSETTASIM_XPC_TIMEOUT=1 for the app process only. */
+    {
+        const char *timeout_env = getenv("ROSETTASIM_XPC_TIMEOUT");
+        if (timeout_env && timeout_env[0] == '1') {
+            void *orig_send_sync = find_original_function("xpc_connection_send_message_with_reply_sync");
+            if (orig_send_sync) {
+                write_trampoline(orig_send_sync, (void *)replacement_xpc_send_sync,
+                                 "xpc_connection_send_message_with_reply_sync");
+                bfix_log("[bfix] XPC send_sync timeout enabled (app process)\n");
+            }
         }
     }
 
