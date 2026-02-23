@@ -127,18 +127,20 @@ scripts/kill_sim.sh
 ## Current State (as of 2026-02-23)
 
 ### What Works
-- All 5 processes spawn and stay alive (broker, backboardd, SpringBoard, app; assertiond dies after ~30s)
-- Bootstrap namespace: services register and look up correctly via broker
+- All 5 processes spawn and stay alive for 90+ seconds (broker, backboardd, assertiond, SpringBoard, app)
+- Bootstrap namespace: 23 services registered and routable via broker
 - XPC pipe protocol: CheckIn, GetJobs, LookUp all working
 - XPC listener registration: dispatch_mach_connect flow working
-- App reaches UIApplicationMain and starts initialization
-- Frame capture pipeline exists (CPU rendering path)
-- Broker-hosted PurpleFBServer for iOS 9.x runtimes
+- App fully starts: `didFinishLaunching` completes in ~260ms, UI created, `makeKeyAndVisible` called
+- CPU frame capture running at 24-30 FPS
+- Host app displays rendered app content correctly
+- Broker-hosted PurpleFBServer for iOS <10 runtimes
+- HA Dashboard test app renders: navigation, controls, camera feeds all visible
 
-### Active Blockers
-1. **BKSDisplayServicesStart assertion** — app crashes: "backboardd isn't running, isAlive: 0". The `BKSWatchdogGetIsAlive()` check fails because the watchdog Mach message isn't handled.
-2. **assertiond "Connection invalid"** — BSXPCConnectionListener fails because of port right management issues in the broker (double-move of receive rights for pre-created services).
-3. **CARenderServer rendering** — commits not flowing to shared framebuffer. Downstream of blockers 1 and 2.
+### Active Issues
+1. **UIScreen.scale = 1.0** — should be 2.0. `GSSetMainScreenInfo` correctly sets the GS-level scale, and `UIScreen.mainScreen.bounds` is correct (375x667), but `UIScreen.scale` still returns 1.0. This means UIScreen's internal `_scale` ivar is set through a different path — likely the `BKSDisplayServices` Mach protocol to backboardd. Need to reverse-engineer what `BKSDisplayServicesStart` does beyond `GSSetMainScreenInfo` and implement the display services protocol handler.
+2. **Scroll crash (SIGSEGV)** — null deref when user scrolls. UIScrollView's pan gesture triggers CA internal layout passes that access CARenderServer state. The crash guard catches it during frame capture but not during live gesture processing. Need to understand what CA operation crashes and either implement the missing service or properly guard the gesture path.
+3. **No GPU rendering** — CPU frame capture works but CARenderServer render commits don't flow to the framebuffer. This is the next major milestone after the display services protocol is implemented.
 
 ### Session History
 - Sessions 1-6: UIKit works, basic display
@@ -146,7 +148,8 @@ scripts/kill_sim.sh
 - Sessions 10-11: GPU rendering investigation
 - Session 12: FBSWorkspace lifecycle
 - Sessions 13-14: Bootstrap namespace, XPC pipe, all processes alive
-- Session 15+: XPC wire type fixes, broker-hosted PFB, app startup
+- Session 15: XPC wire type fixes, broker-hosted PFB, app startup
+- Session 16: Screen scale fix (GSSetMainScreenInfo takes pixels), app rendering working
 
 ## Mach IPC Reference
 
@@ -173,6 +176,24 @@ scripts/kill_sim.sh
 | INT64 | 0x3000 | 64-bit integer |
 | MACH_SEND | 0xC000 | Mach send right |
 | MACH_RECV | 0xB000 | Mach receive right |
+
+### GraphicsServices Screen Info (confirmed via disassembly)
+
+```c
+// GSSetMainScreenInfo(double pixelWidth, double pixelHeight, float scale, float orientation)
+// Internally: cvttsd2si → __screenWidth (int32), cvttsd2si → __screenHeight (int32)
+//             movss → __screenScale (float), movss → __screenOrientation (float)
+// 4th param is orientation (0.0 = portrait), NOT scaleY!
+
+// GSMainScreenPointSize() returns: __screenWidth/__screenScale, __screenHeight/__screenScale
+// GSMainScreenPixelSize() returns: __screenWidth, __screenHeight (raw ints → doubles)
+// GSMainScreenScaleFactor() returns: __screenScale
+
+// kGSMainScreenWidth/Height/Scale are SEPARATE symbols from __screenWidth/Height/Scale
+// The kGS* symbols are exported data (for other frameworks to read)
+// The __screen* symbols are internal data (set by GSSetMainScreenInfo)
+// Both need to be set for full compatibility
+```
 
 ### CARenderServer (MIG subsystem 40000)
 | ID | Name |
