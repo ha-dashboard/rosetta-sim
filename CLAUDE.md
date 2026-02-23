@@ -133,23 +133,32 @@ scripts/kill_sim.sh
 
 **NEVER use `pkill -f` with generic names** like `backboardd`, `SpringBoard`, etc. These match macOS system daemons and will crash the Mac. Always kill by exact PID. The `kill_sim.sh` script handles this correctly.
 
-## Current State (as of 2026-02-23)
+## Current State (as of 2026-02-23, commit 9569dd3)
 
 ### What Works
-- All 5 processes spawn and stay alive for 90+ seconds (broker, backboardd, assertiond, SpringBoard, app)
-- Bootstrap namespace: 23 services registered and routable via broker
+- All 5 processes spawn and stay alive: broker, backboardd, assertiond, SpringBoard, app
+- **Acceptance gate PASSES**: framebuffer exists, frame_counter advancing, all processes alive
+- **GPU Display Pipeline ACTIVE**: CARenderServer connected, RegisterClient succeeded, PurpleFBServer syncing to `/tmp/rosettasim_framebuffer_gpu` at 60Hz
+- App fully starts: `didFinishLaunching` completes in ~173ms, `makeKeyAndVisible` with original UIKit IMP
+- Bootstrap namespace: 23+ services registered, per-process mobilegestalt check_in (fresh ports)
 - XPC pipe protocol: CheckIn, GetJobs, LookUp all working
-- XPC listener registration: dispatch_mach_connect flow working
-- App fully starts: `didFinishLaunching` completes in ~260ms, UI created, `makeKeyAndVisible` called
-- CPU frame capture running at 24-30 FPS
-- Host app displays rendered app content correctly
-- Broker-hosted PurpleFBServer for iOS <10 runtimes
-- HA Dashboard test app renders: navigation, controls, camera feeds all visible
+- Broker drains Mach messages during acceptance gate (prevents bootstrap port death)
+- `com.apple.system.logger` stub prevents SpringBoard workspace disconnect
+- SBShim only injected into SpringBoard (not assertiond/backboardd)
+- CPU debug mode available via `ROSETTASIM_CA_MODE=cpu` (frame_counter=3608/90s verified)
+- Broker enters message loop and stays alive indefinitely
 
 ### Active Issues
-1. **UIScreen.scale = 1.0** — should be 2.0. `GSSetMainScreenInfo` correctly sets the GS-level scale, and `UIScreen.mainScreen.bounds` is correct (375x667), but `UIScreen.scale` still returns 1.0. This means UIScreen's internal `_scale` ivar is set through a different path — likely the `BKSDisplayServices` Mach protocol to backboardd. Need to reverse-engineer what `BKSDisplayServicesStart` does beyond `GSSetMainScreenInfo` and implement the display services protocol handler.
-2. **Scroll crash (SIGSEGV)** — null deref when user scrolls. UIScrollView's pan gesture triggers CA internal layout passes that access CARenderServer state. The crash guard catches it during frame capture but not during live gesture processing. Need to understand what CA operation crashes and either implement the missing service or properly guard the gesture path.
-3. **No GPU rendering** — CPU frame capture works but CARenderServer render commits don't flow to the framebuffer. This is the next major milestone after the display services protocol is implemented.
+1. **UIScreen.scale** — not yet verified in GPU mode. `GSSetMainScreenInfo` sets GS-level scale (750x1334 @2x), but UIScreen's internal `_scale` ivar path (via BKSDisplayServices) needs verification.
+2. **Scroll crash (SIGSEGV)** — not yet tested in GPU mode. Previously: UIScrollView pan gesture triggers CA layout passes that access CARenderServer state.
+3. **Frame counter slow** — GPU framebuffer advances ~100 frames/95s (vs expected ~2850 at 30fps). PurpleFBServer syncs at 60Hz but CA commits are infrequent. May need `CATransaction.flush` or display link integration.
+4. **CFRunLoop timers don't fire** — iOS 10.3 SDK's CFRunLoopRun under Rosetta 2 doesn't wake for CFRunLoopTimer callbacks. The manual pump (`ROSETTASIM_RUNLOOP_PUMP=1`) works but is diagnostic-only. GCD dispatch_async to main queue also doesn't fire without the pump.
+
+### Key Architectural Decisions (Session 17)
+- **Acceptance gate serves messages**: replaced `usleep()` loop with `drain_pending_messages()` so the broker keeps processing bootstrap/XPC requests while waiting for the app framebuffer
+- **Per-process check_in**: the broker creates fresh ports for repeat check_ins (e.g., mobilegestalt) instead of blocking with error 1103
+- **SIGUSR1 timeout**: if UIApplicationMain blocks before calling `_run` (workspace handshake stalls), a 5s timer sends SIGUSR1 to the main thread which `siglongjmp`s to the recovery path
+- **UIApplicationMain runtime patch disabled**: the code-patching trampoline conflicted with DYLD `__interpose`, causing infinite recursion. DYLD interposition alone is sufficient.
 
 ### Session History
 - Sessions 1-6: UIKit works, basic display
@@ -159,6 +168,7 @@ scripts/kill_sim.sh
 - Sessions 13-14: Bootstrap namespace, XPC pipe, all processes alive
 - Session 15: XPC wire type fixes, broker-hosted PFB, app startup
 - Session 16: Screen scale fix (GSSetMainScreenInfo takes pixels), app rendering working
+- Session 17: GPU display pipeline active — acceptance gate passes. Fixed: broker message drain, per-process mobilegestalt, SBShim injection target, system.logger stub, UIApplicationMain timeout, makeKeyAndVisible IMP timing
 
 ## Mach IPC Reference
 
