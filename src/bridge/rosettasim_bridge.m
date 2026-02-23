@@ -278,8 +278,15 @@ static bool replacement_BKSDisplayServicesStart(void) {
     /* For now, set screen info and return TRUE — the display services
      * connection happens through the broker automatically when UIKit
      * calls BKSDisplayServicesServerPort internally. */
-    GSSetMainScreenInfo(kScreenWidth, kScreenHeight, kScreenScaleX, kScreenScaleY);
-    bridge_log("  GSSetMainScreenInfo set, returning TRUE");
+    /* GSSetMainScreenInfo(double pixW, double pixH, float scale, float orientation).
+     * Internally it stores width/height as int32 via cvttsd2si, scale as float.
+     * GSMainScreenPointSize returns __screenWidth/scale, __screenHeight/scale.
+     * The 4th param is orientation (0.0 = portrait), NOT scaleY. */
+    double pixW = kScreenWidth * kScreenScaleX;
+    double pixH = kScreenHeight * kScreenScaleY;
+    GSSetMainScreenInfo(pixW, pixH, kScreenScaleX, 0.0f);
+    bridge_log("  GSSetMainScreenInfo: %.0fx%.0f px @%.0fx (points: %.0fx%.0f)",
+               pixW, pixH, (double)kScreenScaleX, kScreenWidth, kScreenHeight);
     return true;
 }
 
@@ -4651,8 +4658,8 @@ __attribute__((section("__DATA,__interpose"))) = {
      * internally, which is intercepted by our bridge to route through broker.
      * The display services handler in purple_fb_server responds to the MIG
      * messages, establishing a proper display services connection. */
-    /* { (const void *)replacement_BKSDisplayServicesStart,
-      (const void *)BKSDisplayServicesStart }, */
+    { (const void *)replacement_BKSDisplayServicesStart,
+      (const void *)BKSDisplayServicesStart },
     /* { (const void *)replacement_BKSDisplayServicesServerPort,
       (const void *)BKSDisplayServicesServerPort }, */
     /* { (const void *)replacement_BKSDisplayServicesGetMainScreenInfo,
@@ -7932,15 +7939,19 @@ static void rosettasim_bridge_init(void) {
     /* Set screen dimension globals directly in GraphicsServices.
        These are exported data symbols that UIScreen reads.
        Must be set before UIApplicationMain runs. */
+    /* kGSMainScreenWidth/Height are PIXEL dimensions (UIScreen divides by scale).
+     * kGSMainScreenScale is the scale factor (2.0 for retina). */
     double *gsWidth = (double *)dlsym(RTLD_DEFAULT, "kGSMainScreenWidth");
     double *gsHeight = (double *)dlsym(RTLD_DEFAULT, "kGSMainScreenHeight");
     double *gsScale = (double *)dlsym(RTLD_DEFAULT, "kGSMainScreenScale");
-    if (gsWidth) { *gsWidth = kScreenWidth; }
-    if (gsHeight) { *gsHeight = kScreenHeight; }
+    double pixelW = kScreenWidth * kScreenScaleX;
+    double pixelH = kScreenHeight * kScreenScaleY;
+    if (gsWidth) { *gsWidth = pixelW; }
+    if (gsHeight) { *gsHeight = pixelH; }
     if (gsScale) { *gsScale = (double)kScreenScaleX; }
-    bridge_log("Set screen globals: %.0fx%.0f @%.0fx",
+    bridge_log("Set screen globals: %.0fx%.0f px @%.0fx (points: %.0fx%.0f)",
                gsWidth ? *gsWidth : 0, gsHeight ? *gsHeight : 0,
-               gsScale ? *gsScale : 0);
+               gsScale ? *gsScale : 0, kScreenWidth, kScreenHeight);
 
     /* Defer font registration — CTFontManagerRegisterFontsForURL triggers
      * CoreText → GraphicsServices → MobileGestalt → XPC (blocks on
