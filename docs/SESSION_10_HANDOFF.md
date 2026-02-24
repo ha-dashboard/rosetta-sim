@@ -378,7 +378,7 @@ bash scripts/build_broker.sh      # rosettasim_broker
 bash scripts/build_bridge.sh      # rosettasim_bridge.dylib
 
 # Run full pipeline (broker + backboardd + app + host app)
-bash scripts/run_full.sh
+bash scripts/run_full.sh --timeout 120
 
 # Run standalone (no broker, CPU rendering only)
 bash scripts/run_sim.sh ~/Projects/hass-dashboard/build/rosettasim/Build/Products/Debug-iphonesimulator/HA\ Dashboard.app

@@ -257,7 +257,7 @@ bash scripts/build_bridge.sh --force
 
 # Run (auto-builds if needed)
 ROSETTASIM_DNS_MAP="homeassistant.local=192.168.1.162" \
-bash scripts/run_full.sh
+bash scripts/run_full.sh --timeout 120
 ```
 
 ### Environment Variables

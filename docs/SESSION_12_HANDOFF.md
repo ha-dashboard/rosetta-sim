@@ -3,6 +3,39 @@
 **Date:** 2026-02-21
 **Commit:** 5361a40
 **Focus:** Getting the real iOS simulator stack running (backboardd + SpringBoard + app)
+## Update — 2026-02-24 (Current Status)
+
+This handoff is still useful for architecture context, but these points supersede it for current work:
+
+### 1) Safety policy update (critical)
+
+- `scripts/run_rosettasim.sh` now requires `--timeout <seconds>`.
+- `scripts/run_full.sh` now requires `--timeout <seconds>` and self-wraps the full run with `gtimeout` when timeout > 0.
+- `--timeout 0` is allowed for manual runs only. Agents should not use `0`.
+- Goal: never lose terminal/session control due to non-terminating simulator runs.
+
+### 2) SpringBoard bootstrap nil-error issue is resolved
+
+- The prior “Bootstrap failed … error: (null)” path was addressed by injecting a synthesized `BSProcessHandle` during `-[BKSProcess _bootstrapWithError:]`.
+- This unblocked AssertionServices bootstrap for SpringBoard.
+
+### 3) Current top functional blocker
+
+- SpringBoard still does **not** become the active listener for `com.apple.frontboard.workspace` in broker namespace.
+- Broker readiness now correctly requires `receive_moved == 1`; this never flips for workspace.
+- App commonly hangs in workspace/scene negotiation (`UIApplicationMain`) and logs “workspace server has disconnected.”
+
+### 4) Additional fixes landed after this handoff
+
+- `ROSETTASIM_LIFECYCLE_MODE` now propagates to all spawned simulator daemons (not only backboardd).
+- strict-mode assertiond recursion crash was fixed by avoiding strict+assertiond trampoline patching of `_xpc_connection_check_in` in `bootstrap_fix.dylib`.
+
+### 5) Immediate next steps
+
+1. Determine which process actually owns/registers `com.apple.frontboard.workspace` in iOS 10.3 simulator runtime (SpringBoard vs another daemon).
+2. Instrument registration paths (`xpc_connection_create_mach_service`, `_xpc_connection_check_in`, `bootstrap_check_in/register`) to capture attempts and precise failure reason.
+3. If registration is attempted but fails, implement missing launchd/XPC contract in broker/shim path.
+4. If registration is never attempted, identify and satisfy earlier initialization gate (missing prerequisite daemons/services).
 
 ## What Was Achieved
 
@@ -287,7 +320,7 @@ bash scripts/build_springboard_shim.sh
 
 # Run full pipeline (launches host display app too)
 ROSETTASIM_DNS_MAP="homeassistant.local=192.168.1.162" \
-  bash scripts/run_full.sh "/path/to/HA Dashboard.app"
+  bash scripts/run_full.sh --timeout 120 "/path/to/HA Dashboard.app"
 
 # Check logs
 tail -f /tmp/rosettasim_broker.log

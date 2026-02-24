@@ -117,7 +117,7 @@ When the simulator crashes or hangs on a missing service:
 
 ```bash
 # Full pipeline (builds everything, spawns all processes, starts host app)
-scripts/run_full.sh
+scripts/run_full.sh --timeout 120
 
 # Individual builds
 scripts/build_broker.sh       # ARM64 broker

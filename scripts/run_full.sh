@@ -6,8 +6,9 @@
 # The host app displays the app's framebuffer and sends touch/keyboard input.
 #
 # Usage:
-#   ./scripts/run_full.sh [app_path]
-#   ./scripts/run_full.sh  # defaults to hass-dashboard
+#   ./scripts/run_full.sh --timeout <seconds> [app_path]
+#   ./scripts/run_full.sh --timeout <seconds>            # defaults to hass-dashboard
+#   ./scripts/run_full.sh --timeout 0 [app_path]         # infinite (manual use only)
 #
 
 set -euo pipefail
@@ -23,9 +24,90 @@ PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 BRIDGE="$PROJECT_ROOT/src/bridge/rosettasim_bridge.dylib"
 BFIX="$PROJECT_ROOT/src/bridge/bootstrap_fix.dylib"
 HOST_APP="$PROJECT_ROOT/src/host/RosettaSimApp/build/RosettaSim"
+usage() {
+    echo "Usage: $0 --timeout <seconds> [app_path]"
+    echo ""
+    echo "  --timeout <seconds>   Required. Non-negative integer seconds."
+    echo "                        Use 0 for infinite (manual use only)."
+}
 
+TIMEOUT_SECS=""
+WRAPPED=0
 # Default app
-APP_PATH="${1:-/Users/ashhopkins/Projects/hass-dashboard/build/rosettasim/Build/Products/Debug-iphonesimulator/HA Dashboard.app}"
+APP_PATH=""
+APP_PATH_DEFAULT="/Users/ashhopkins/Projects/hass-dashboard/build/rosettasim/Build/Products/Debug-iphonesimulator/HA Dashboard.app"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout|--timeout-seconds)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: $1 requires a value" >&2
+                usage
+                exit 2
+            fi
+            TIMEOUT_SECS="$2"
+            shift 2
+            ;;
+        --timeout=*|--timeout-seconds=*)
+            TIMEOUT_SECS="${1#*=}"
+            shift
+            ;;
+        --wrapped)
+            WRAPPED=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "ERROR: Unknown option: $1" >&2
+            usage
+            exit 2
+            ;;
+        *)
+            if [[ -z "$APP_PATH" ]]; then
+                APP_PATH="$1"
+                shift
+            else
+                echo "ERROR: Unexpected argument: $1" >&2
+                usage
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$APP_PATH" ]]; then
+    APP_PATH="$APP_PATH_DEFAULT"
+fi
+
+if [[ -z "$TIMEOUT_SECS" ]]; then
+    echo "ERROR: --timeout <seconds> is required" >&2
+    usage
+    exit 2
+fi
+
+if ! [[ "$TIMEOUT_SECS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --timeout must be a non-negative integer (seconds). Got: '$TIMEOUT_SECS'" >&2
+    exit 2
+fi
+
+if [[ "$TIMEOUT_SECS" -gt 0 && "$WRAPPED" -eq 0 ]]; then
+    if ! command -v gtimeout >/dev/null 2>&1; then
+        echo "ERROR: gtimeout not found. Install coreutils (e.g. 'brew install coreutils')." >&2
+        exit 1
+    fi
+    exec gtimeout -k 5 "${TIMEOUT_SECS}s" "$0" --wrapped --timeout "$TIMEOUT_SECS" "$APP_PATH"
+fi
+
+if [[ "$TIMEOUT_SECS" -eq 0 ]]; then
+    echo "WARNING: --timeout 0 means infinite. Use only for manual interactive runs." >&2
+fi
 
 # App framebuffer (separate from backboardd's)
 APP_FB="/tmp/rosettasim_app_framebuffer"
@@ -58,6 +140,7 @@ echo "App:       $APP_PATH"
 echo "Host App:  $HOST_APP"
 echo "Bootstrap: $BFIX"
 echo "App FB:    $APP_FB"
+echo "Timeout:   ${TIMEOUT_SECS}s"
 echo "========================================"
 echo ""
 
@@ -79,6 +162,7 @@ cleanup() {
     echo "Done."
 }
 trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 # Clean old state
 rm -f "$APP_FB" "$GPU_FB" /tmp/rosettasim_framebuffer /tmp/rosettasim_broker.pid
@@ -139,7 +223,11 @@ echo "RosettaSim running:"
 echo "  Broker:   PID $BROKER_PID (log: /tmp/rosettasim_broker.log)"
 echo "  Host App: PID $HOST_PID"
 echo ""
-echo "Press Ctrl+C to stop."
+if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+    echo "This run will auto-stop after ${TIMEOUT_SECS}s."
+else
+    echo "Press Ctrl+C to stop."
+fi
 
 # Wait for either process to exit
 wait $HOST_PID 2>/dev/null || true

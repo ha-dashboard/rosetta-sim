@@ -7,9 +7,10 @@
 # ports are shared via the broker for app processes to connect.
 #
 # Usage:
-#   ./scripts/run_rosettasim.sh                # build + run
-#   ./scripts/run_rosettasim.sh --no-build     # run only (skip build)
-#   ./scripts/run_rosettasim.sh --background   # run in background
+#   ./scripts/run_rosettasim.sh --timeout <seconds>               # build + run
+#   ./scripts/run_rosettasim.sh --timeout <seconds> --no-build    # run only (skip build)
+#   ./scripts/run_rosettasim.sh --timeout <seconds> --background  # run in background
+#   ./scripts/run_rosettasim.sh --timeout 0 ...                   # infinite (manual use only)
 #
 
 set -euo pipefail
@@ -22,15 +23,67 @@ SDK="${ROSETTASIM_SDK:-$SDK_DEFAULT}"
 BROKER="$PROJECT_ROOT/src/bridge/rosettasim_broker"
 PFB="$PROJECT_ROOT/src/bridge/purple_fb_server.dylib"
 APP_SHIM="$PROJECT_ROOT/src/bridge/app_shim.dylib"
+usage() {
+    echo "Usage: $0 --timeout <seconds> [--no-build] [--background]"
+    echo ""
+    echo "  --timeout <seconds>   Required. Non-negative integer seconds."
+    echo "                        Use 0 for infinite (manual use only)."
+    echo "  --no-build            Skip build step"
+    echo "  --background          Run broker in background (log: /tmp/rosettasim.log)"
+}
 
 NO_BUILD=0
 BACKGROUND=0
-for arg in "$@"; do
-    case "$arg" in
-        --no-build) NO_BUILD=1 ;;
-        --background) BACKGROUND=1 ;;
+TIMEOUT_SECS=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-build) NO_BUILD=1; shift ;;
+        --background) BACKGROUND=1; shift ;;
+        --timeout|--timeout-seconds)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: $1 requires a value" >&2
+                usage
+                exit 2
+            fi
+            TIMEOUT_SECS="$2"
+            shift 2
+            ;;
+        --timeout=*|--timeout-seconds=*)
+            TIMEOUT_SECS="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
     esac
 done
+
+if [[ -z "$TIMEOUT_SECS" ]]; then
+    echo "ERROR: --timeout <seconds> is required" >&2
+    usage
+    exit 2
+fi
+
+if ! [[ "$TIMEOUT_SECS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --timeout must be a non-negative integer (seconds). Got: '$TIMEOUT_SECS'" >&2
+    exit 2
+fi
+
+if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+    if ! command -v gtimeout >/dev/null 2>&1; then
+        echo "ERROR: gtimeout not found. Install coreutils (e.g. 'brew install coreutils')." >&2
+        exit 1
+    fi
+else
+    echo "WARNING: --timeout 0 means infinite. Use only for manual interactive runs." >&2
+fi
 
 # Clean up any existing processes
 cleanup() {
@@ -72,7 +125,11 @@ echo "========================================"
 echo ""
 
 if [[ $BACKGROUND -eq 1 ]]; then
-    "$BROKER" --sdk "$SDK" --shim "$PFB" > /tmp/rosettasim.log 2>&1 &
+    if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+        gtimeout -k 5 "${TIMEOUT_SECS}s" "$BROKER" --sdk "$SDK" --shim "$PFB" > /tmp/rosettasim.log 2>&1 &
+    else
+        "$BROKER" --sdk "$SDK" --shim "$PFB" > /tmp/rosettasim.log 2>&1 &
+    fi
     BROKER_PID=$!
     echo "Broker PID: $BROKER_PID"
     echo "$BROKER_PID" > /tmp/rosettasim_broker.pid
@@ -94,5 +151,9 @@ if [[ $BACKGROUND -eq 1 ]]; then
         exit 1
     fi
 else
-    exec "$BROKER" --sdk "$SDK" --shim "$PFB"
+    if [[ "$TIMEOUT_SECS" -gt 0 ]]; then
+        gtimeout -k 5 "${TIMEOUT_SECS}s" "$BROKER" --sdk "$SDK" --shim "$PFB"
+    else
+        exec "$BROKER" --sdk "$SDK" --shim "$PFB"
+    fi
 fi
