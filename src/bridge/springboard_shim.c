@@ -442,6 +442,8 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
             if (conn) {
                 sb_log("  real xpc_create_mach_service returned %p", conn);
+                /* Track CLIENT connections too (for xpc_send_sync intercept) */
+                sb_track_assertiond_conn(name, conn);
                 return conn;
             }
         }
