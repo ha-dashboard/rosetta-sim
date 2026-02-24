@@ -26,6 +26,7 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #import <Foundation/Foundation.h>
+#include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
 #include <mach-o/nlist.h>
 #include <mach-o/loader.h>
@@ -689,6 +690,21 @@ static launch_data_t replacement_launch_msg(launch_data_t msg) {
 extern kern_return_t bootstrap_look_up(mach_port_t, const name_t, mach_port_t *);
 extern kern_return_t bootstrap_check_in(mach_port_t, const name_t, mach_port_t *);
 extern kern_return_t bootstrap_register(mach_port_t, const name_t, mach_port_t);
+extern kern_return_t mach_msg(mach_msg_header_t *msg,
+                               mach_msg_option_t option,
+                               mach_msg_size_t send_size,
+                               mach_msg_size_t rcv_size,
+                               mach_port_name_t rcv_name,
+                               mach_msg_timeout_t timeout,
+                               mach_port_name_t notify);
+
+static kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
+                                           mach_msg_option_t option,
+                                           mach_msg_size_t send_size,
+                                           mach_msg_size_t rcv_size,
+                                           mach_port_name_t rcv_name,
+                                           mach_msg_timeout_t timeout,
+                                           mach_port_name_t notify);
 
 /* DYLD interposition */
 __attribute__((used))
@@ -696,6 +712,7 @@ static const struct {
     const void *replacement;
     const void *replacee;
 } interpositions[] __attribute__((section("__DATA,__interpose"))) = {
+    { (void *)replacement_mach_msg,            (void *)mach_msg },
     { (void *)replacement_bootstrap_look_up,   (void *)bootstrap_look_up },
     { (void *)replacement_bootstrap_check_in,  (void *)bootstrap_check_in },
     { (void *)replacement_bootstrap_register,  (void *)bootstrap_register },
@@ -716,7 +733,600 @@ static const struct {
  */
 #include <dlfcn.h>
 #include <mach/vm_map.h>
+/* ================================================================
+ * assertiond processinfoservice instrumentation
+ *
+ * Goal: determine whether assertiond receives and replies to SpringBoard's
+ * bootstrap message (often "messageType=0") sent over
+ * com.apple.assertiond.processinfoservice.
+ *
+ * We interpose mach_msg and:
+ *   - observe XPC pipe routine=805 check-in requests (msg_id=0x10000000)
+ *     to map handle -> service name
+ *   - observe matching check-in replies (msg_id=0x20000000) to capture the
+ *     local port name for com.apple.assertiond.processinfoservice
+ *   - log any messages received on that port and whether a reply is sent
+ * ================================================================ */
 
+#define BFIX_XPC_MAGIC           0x58504321  /* "!CPX" */
+#define BFIX_XPC_TYPE_BOOL       0x00002000
+#define BFIX_XPC_TYPE_INT64      0x00003000
+#define BFIX_XPC_TYPE_UINT64     0x00004000
+#define BFIX_XPC_TYPE_STRING     0x00009000
+#define BFIX_XPC_TYPE_MACH_SEND  0x0000d000
+#define BFIX_XPC_TYPE_MACH_RECV  0x00015000
+#define BFIX_XPC_TYPE_ARRAY      0x0000e000
+#define BFIX_XPC_TYPE_DICT       0x0000f000
+
+#define BFIX_XPC_LAUNCH_MSG_ID      0x10000000
+#define BFIX_XPC_PIPE_REPLY_MSG_ID  0x20000000
+
+typedef kern_return_t (*mach_msg_fn)(mach_msg_header_t *, mach_msg_option_t,
+                                      mach_msg_size_t, mach_msg_size_t,
+                                      mach_port_name_t, mach_msg_timeout_t,
+                                      mach_port_name_t);
+static mach_msg_fn g_orig_mach_msg = NULL;
+
+static int bfix_is_assertiond_process(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *pn = getprogname();
+    cached = (pn && strstr(pn, "assertiond")) ? 1 : 0;
+    return cached;
+}
+
+static int bfix_trace_pi_enabled(void) {
+    const char *e = getenv("ROSETTASIM_ASSERTIOND_TRACE");
+    return (e && e[0] == '1');
+}
+
+typedef struct {
+    uint64_t handle;
+    char name[128];
+} bfix_handle_map_entry_t;
+
+#define BFIX_HANDLE_MAP_SLOTS 32
+static bfix_handle_map_entry_t g_bfix_handle_map[BFIX_HANDLE_MAP_SLOTS];
+
+static void bfix_handle_map_set(uint64_t handle, const char *name) {
+    if (!handle || !name || !name[0]) return;
+    int slot = (int)(handle % BFIX_HANDLE_MAP_SLOTS);
+    g_bfix_handle_map[slot].handle = handle;
+    strncpy(g_bfix_handle_map[slot].name, name, sizeof(g_bfix_handle_map[slot].name) - 1);
+    g_bfix_handle_map[slot].name[sizeof(g_bfix_handle_map[slot].name) - 1] = '\0';
+}
+
+static const char *bfix_handle_map_get(uint64_t handle) {
+    if (!handle) return NULL;
+    int slot = (int)(handle % BFIX_HANDLE_MAP_SLOTS);
+    if (g_bfix_handle_map[slot].handle == handle && g_bfix_handle_map[slot].name[0])
+        return g_bfix_handle_map[slot].name;
+    return NULL;
+}
+/* For XPC pipe routine=805, the "handle" field is frequently 0.
+ * Instead, correlate reply → request via the Mach reply port
+ * (request msgh_local_port / reply msgh_local_port in receiver namespace). */
+typedef struct {
+    mach_port_t reply_port;
+    char name[128];
+} bfix_checkin_map_entry_t;
+
+#define BFIX_CHECKIN_MAP_SLOTS 64
+static bfix_checkin_map_entry_t g_bfix_checkin_map[BFIX_CHECKIN_MAP_SLOTS];
+
+static void bfix_checkin_map_set(mach_port_t reply_port, const char *name) {
+    if (reply_port == MACH_PORT_NULL || !name || !name[0]) return;
+    int slot = (int)(((uint32_t)reply_port) % BFIX_CHECKIN_MAP_SLOTS);
+    g_bfix_checkin_map[slot].reply_port = reply_port;
+    strncpy(g_bfix_checkin_map[slot].name, name, sizeof(g_bfix_checkin_map[slot].name) - 1);
+    g_bfix_checkin_map[slot].name[sizeof(g_bfix_checkin_map[slot].name) - 1] = '\0';
+}
+
+static const char *bfix_checkin_map_get(mach_port_t reply_port) {
+    if (reply_port == MACH_PORT_NULL) return NULL;
+    int slot = (int)(((uint32_t)reply_port) % BFIX_CHECKIN_MAP_SLOTS);
+    if (g_bfix_checkin_map[slot].reply_port == reply_port && g_bfix_checkin_map[slot].name[0])
+        return g_bfix_checkin_map[slot].name;
+    return NULL;
+}
+
+static void bfix_checkin_map_clear(mach_port_t reply_port) {
+    if (reply_port == MACH_PORT_NULL) return;
+    int slot = (int)(((uint32_t)reply_port) % BFIX_CHECKIN_MAP_SLOTS);
+    if (g_bfix_checkin_map[slot].reply_port == reply_port) {
+        g_bfix_checkin_map[slot].reply_port = MACH_PORT_NULL;
+        g_bfix_checkin_map[slot].name[0] = '\0';
+    }
+}
+
+typedef struct {
+    mach_port_t reply_port;
+    uint32_t req_id;
+    uint64_t seq;
+} bfix_pending_reply_t;
+
+#define BFIX_PENDING_REPLY_SLOTS 64
+static bfix_pending_reply_t g_bfix_pending_replies[BFIX_PENDING_REPLY_SLOTS];
+static uint64_t g_bfix_pending_seq = 0;
+
+static void bfix_pending_add(mach_port_t reply_port, uint32_t req_id) {
+    if (reply_port == MACH_PORT_NULL) return;
+    uint64_t seq = ++g_bfix_pending_seq;
+    int slot = (int)(seq % BFIX_PENDING_REPLY_SLOTS);
+    g_bfix_pending_replies[slot].reply_port = reply_port;
+    g_bfix_pending_replies[slot].req_id = req_id;
+    g_bfix_pending_replies[slot].seq = seq;
+}
+
+static int bfix_pending_match_and_clear(mach_port_t reply_port, uint32_t *out_req_id) {
+    if (reply_port == MACH_PORT_NULL) return 0;
+    for (int i = 0; i < BFIX_PENDING_REPLY_SLOTS; i++) {
+        if (g_bfix_pending_replies[i].reply_port == reply_port) {
+            if (out_req_id) *out_req_id = g_bfix_pending_replies[i].req_id;
+            g_bfix_pending_replies[i].reply_port = MACH_PORT_NULL;
+            g_bfix_pending_replies[i].req_id = 0;
+            g_bfix_pending_replies[i].seq = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const uint8_t *bfix_find_xpc_payload(const uint8_t *raw, uint32_t total,
+                                            uint32_t *out_off) {
+    if (!raw || total < sizeof(mach_msg_header_t) + 20) return NULL;
+    uint32_t start = (uint32_t)sizeof(mach_msg_header_t);
+    uint32_t end = total;
+    if (end > 512) end = 512;
+    if (end < start + 4) return NULL;
+    for (uint32_t off = start; off + 4 <= end; off += 4) {
+        if (*(const uint32_t *)(raw + off) == BFIX_XPC_MAGIC) {
+            if (out_off) *out_off = off;
+            return raw + off;
+        }
+    }
+    return NULL;
+}
+
+static uint64_t bfix_xpc_extract_int64_key(const uint8_t *xpc, uint32_t xpc_len,
+                                           const char *wanted_key, int *found) {
+    if (found) *found = 0;
+    if (!xpc || xpc_len < 20 || !wanted_key) return 0;
+    if (*(const uint32_t *)xpc != BFIX_XPC_MAGIC) return 0;
+    if (*(const uint32_t *)(xpc + 8) != BFIX_XPC_TYPE_DICT) return 0;
+    uint32_t entry_count = *(const uint32_t *)(xpc + 16);
+    uint32_t pos = 20;
+    for (uint32_t i = 0; i < entry_count && pos < xpc_len; i++) {
+        const char *key = (const char *)(xpc + pos);
+        uint32_t key_len = (uint32_t)strnlen(key, xpc_len - pos);
+        uint32_t key_padded = (key_len + 1 + 3) & ~3;
+        pos += key_padded;
+        if (pos + 4 > xpc_len) break;
+        uint32_t val_type = *(const uint32_t *)(xpc + pos);
+        pos += 4;
+        if (val_type == BFIX_XPC_TYPE_INT64 || val_type == BFIX_XPC_TYPE_UINT64) {
+            if (pos + 8 > xpc_len) break;
+            uint64_t v = *(const uint64_t *)(xpc + pos);
+            if (strcmp(key, wanted_key) == 0) {
+                if (found) *found = 1;
+                return v;
+            }
+            pos += 8;
+        } else if (val_type == BFIX_XPC_TYPE_STRING) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t slen = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            uint32_t spad = (slen + 3) & ~3;
+            pos += spad;
+        } else if (val_type == BFIX_XPC_TYPE_BOOL) {
+            if (pos + 4 > xpc_len) break;
+            pos += 4;
+        } else if (val_type == BFIX_XPC_TYPE_MACH_SEND || val_type == BFIX_XPC_TYPE_MACH_RECV) {
+            /* no inline payload */
+        } else if (val_type == BFIX_XPC_TYPE_DICT || val_type == BFIX_XPC_TYPE_ARRAY) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t sz = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            pos += sz;
+        } else {
+            if (pos + 4 > xpc_len) break;
+            uint32_t sz = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            if (sz < 0x10000) pos += sz;
+            else break;
+        }
+    }
+    return 0;
+}
+
+static int bfix_xpc_extract_string_key_copy(const uint8_t *xpc, uint32_t xpc_len,
+                                            const char *wanted_key,
+                                            char *out, size_t out_len) {
+    if (!xpc || xpc_len < 24 || !wanted_key || !out || out_len == 0) return 0;
+    out[0] = '\0';
+    if (*(const uint32_t *)xpc != BFIX_XPC_MAGIC) return 0;
+    if (*(const uint32_t *)(xpc + 8) != BFIX_XPC_TYPE_DICT) return 0;
+    uint32_t entry_count = *(const uint32_t *)(xpc + 16);
+    uint32_t pos = 20;
+    for (uint32_t i = 0; i < entry_count && pos < xpc_len; i++) {
+        const char *key = (const char *)(xpc + pos);
+        uint32_t key_len = (uint32_t)strnlen(key, xpc_len - pos);
+        uint32_t key_padded = (key_len + 1 + 3) & ~3;
+        pos += key_padded;
+        if (pos + 4 > xpc_len) break;
+        uint32_t val_type = *(const uint32_t *)(xpc + pos);
+        pos += 4;
+        if (val_type == BFIX_XPC_TYPE_STRING) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t slen = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            if (strcmp(key, wanted_key) == 0 && pos + slen <= xpc_len) {
+                /* slen includes null terminator in this wire format */
+                size_t n = slen;
+                if (n == 0) n = 1;
+                if (n > out_len) n = out_len;
+                strncpy(out, (const char *)(xpc + pos), n - 1);
+                out[n - 1] = '\0';
+                return 1;
+            }
+            uint32_t spad = (slen + 3) & ~3;
+            pos += spad;
+        } else if (val_type == BFIX_XPC_TYPE_INT64 || val_type == BFIX_XPC_TYPE_UINT64) {
+            if (pos + 8 > xpc_len) break;
+            pos += 8;
+        } else if (val_type == BFIX_XPC_TYPE_BOOL) {
+            if (pos + 4 > xpc_len) break;
+            pos += 4;
+        } else if (val_type == BFIX_XPC_TYPE_MACH_SEND || val_type == BFIX_XPC_TYPE_MACH_RECV) {
+            /* no inline payload */
+        } else if (val_type == BFIX_XPC_TYPE_DICT || val_type == BFIX_XPC_TYPE_ARRAY) {
+            if (pos + 4 > xpc_len) break;
+            uint32_t sz = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            pos += sz;
+        } else {
+            if (pos + 4 > xpc_len) break;
+            uint32_t sz = *(const uint32_t *)(xpc + pos);
+            pos += 4;
+            if (sz < 0x10000) pos += sz;
+            else break;
+        }
+    }
+    return 0;
+}
+
+static mach_port_t bfix_extract_first_port_desc_name(mach_msg_header_t *msg,
+                                                     uint32_t total,
+                                                     uint32_t *out_desc_count) {
+    if (out_desc_count) *out_desc_count = 0;
+    if (!msg || total < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) return MACH_PORT_NULL;
+    if ((msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0) return MACH_PORT_NULL;
+    uint8_t *raw = (uint8_t *)msg;
+    mach_msg_body_t *body = (mach_msg_body_t *)(raw + sizeof(mach_msg_header_t));
+    uint32_t dc = body->msgh_descriptor_count;
+    if (out_desc_count) *out_desc_count = dc;
+    if (dc == 0) return MACH_PORT_NULL;
+    size_t off = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+    if (off + sizeof(mach_msg_port_descriptor_t) > total) return MACH_PORT_NULL;
+    mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)(raw + off);
+    return pd->name;
+}
+
+static void bfix_trace_received_on_pi_port(mach_msg_header_t *msg, uint32_t total) {
+    static int log_count = 0;
+    if (!msg || total < sizeof(mach_msg_header_t)) return;
+    if (log_count++ > 200) return;
+
+    uint32_t xpc_off = 0;
+    const uint8_t *xpc = bfix_find_xpc_payload((const uint8_t *)msg, total, &xpc_off);
+    int mt_found = 0;
+    uint64_t mt = 0;
+    if (xpc) {
+        mt = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "messageType", &mt_found);
+        if (!mt_found) mt = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "type", &mt_found);
+    }
+
+    if (mt_found) {
+        bfix_log("[bfix] PI RECV: id=0x%x size=%u bits=0x%x local=0x%x reply=0x%x messageType=%llu\n",
+                 msg->msgh_id, total, msg->msgh_bits,
+                 msg->msgh_local_port, msg->msgh_remote_port,
+                 (unsigned long long)mt);
+    } else {
+        bfix_log("[bfix] PI RECV: id=0x%x size=%u bits=0x%x local=0x%x reply=0x%x (no messageType)\n",
+                 msg->msgh_id, total, msg->msgh_bits,
+                 msg->msgh_local_port, msg->msgh_remote_port);
+    }
+}
+
+kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
+                                   mach_msg_option_t option,
+                                   mach_msg_size_t send_size,
+                                   mach_msg_size_t rcv_size,
+                                   mach_port_name_t rcv_name,
+                                   mach_msg_timeout_t timeout,
+                                   mach_port_name_t notify) {
+    if (!g_orig_mach_msg) {
+        g_orig_mach_msg = (mach_msg_fn)dlsym(RTLD_NEXT, "mach_msg");
+        if (!g_orig_mach_msg) {
+            /* Best-effort fallback */
+            g_orig_mach_msg = (mach_msg_fn)dlsym(RTLD_DEFAULT, "mach_msg");
+        }
+        if (!g_orig_mach_msg) {
+            return KERN_FAILURE;
+        }
+    }
+
+    const int is_assertiond = bfix_is_assertiond_process();
+
+    /* Pre-send trace: capture routine=805 name/handle mapping for assertiond. */
+    uint64_t pre_handle = 0;
+    char pre_name[128] = {0};
+    int pre_is_pi_checkin = 0;
+    if (is_assertiond && (option & MACH_SEND_MSG) && msg) {
+        uint32_t total = msg->msgh_size;
+        if (send_size && send_size < total) total = send_size;
+        uint32_t xpc_off = 0;
+        const uint8_t *xpc = bfix_find_xpc_payload((const uint8_t *)msg, total, &xpc_off);
+        if (xpc) {
+            int f1 = 0, f2 = 0;
+            uint64_t routine = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "routine", &f1);
+            pre_handle = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "handle", &f2);
+            if (routine == 805 && f2) {
+                if (bfix_xpc_extract_string_key_copy(xpc, total - xpc_off, "name",
+                                                     pre_name, sizeof(pre_name))) {
+                    bfix_handle_map_set(pre_handle, pre_name);
+                    bfix_checkin_map_set(msg->msgh_local_port, pre_name);
+                    if (strstr(pre_name, "processinfoservice")) pre_is_pi_checkin = 1;
+                }
+            }
+        }
+    }
+
+    kern_return_t kr = g_orig_mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify);
+
+    if (!is_assertiond) return kr;
+
+    /* Post-recv trace: capture the processinfoservice port from routine=805 reply. */
+    if ((option & MACH_RCV_MSG) && kr == KERN_SUCCESS && msg) {
+        uint32_t total = msg->msgh_size;
+        if (msg->msgh_id == BFIX_XPC_PIPE_REPLY_MSG_ID) {
+            uint32_t xpc_off = 0;
+            const uint8_t *xpc = bfix_find_xpc_payload((const uint8_t *)msg, total, &xpc_off);
+            if (xpc) {
+                int f1 = 0, f2 = 0;
+                uint64_t routine = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "routine", &f1);
+                uint64_t handle = bfix_xpc_extract_int64_key(xpc, total - xpc_off, "handle", &f2);
+                if (routine == 805) {
+                    const char *svc = bfix_checkin_map_get(msg->msgh_local_port);
+                    if (svc && strstr(svc, "com.apple.assertiond.processinfoservice")) {
+                        if (g_processinfoservice_port == MACH_PORT_NULL) {
+                            uint32_t dc = 0;
+                            mach_port_t p = bfix_extract_first_port_desc_name(msg, total, &dc);
+                            if (p != MACH_PORT_NULL) {
+                                g_processinfoservice_port = p;
+                                bfix_log("[bfix] PI PORT CAPTURED: svc=%s reply_port=0x%x handle=%llu port=0x%x desc_count=%u\n",
+                                         svc, msg->msgh_local_port,
+                                         (unsigned long long)(f2 ? handle : 0),
+                                         p, dc);
+                            } else if (bfix_trace_pi_enabled()) {
+                                bfix_log("[bfix] PI PORT CAPTURE FAILED: svc=%s reply_port=0x%x (no port desc)\n",
+                                         svc, msg->msgh_local_port);
+                            }
+                        }
+                        /* One-shot mapping. */
+                        bfix_checkin_map_clear(msg->msgh_local_port);
+                    }
+                }
+            }
+        }
+
+        /* Log messages received on processinfoservice port + track reply port. */
+        if (g_processinfoservice_port != MACH_PORT_NULL &&
+            msg->msgh_local_port == g_processinfoservice_port) {
+            if (bfix_trace_pi_enabled()) {
+                bfix_trace_received_on_pi_port(msg, total);
+            }
+            if (msg->msgh_remote_port != MACH_PORT_NULL) {
+                bfix_pending_add(msg->msgh_remote_port, msg->msgh_id);
+            }
+        }
+    }
+
+    /* Post-send trace: did we send a reply to a pending reply port? */
+    if ((option & MACH_SEND_MSG) && msg && bfix_trace_pi_enabled()) {
+        uint32_t req_id = 0;
+        if (bfix_pending_match_and_clear(msg->msgh_remote_port, &req_id)) {
+            bfix_log("[bfix] PI REPLY SENT: req_id=0x%x reply_to=0x%x send_id=0x%x kr=0x%x\n",
+                     req_id, msg->msgh_remote_port, msg->msgh_id, kr);
+        } else if (pre_is_pi_checkin) {
+            bfix_log("[bfix] PI CHECKIN SEND: name=%s handle=%llu kr=0x%x\n",
+                     pre_name, (unsigned long long)pre_handle, kr);
+        }
+    }
+
+    return kr;
+}
+
+/* ================================================================
+ * SpringBoard strict-lifecycle fix: synthesize BSProcessHandle
+ *
+ * In strict mode with real FBSWorkspace, SpringBoard's FrontBoard code path
+ * can abort early if FBApplicationProcess/_FBProcess has a nil BSProcessHandle
+ * (normally provided by CoreSimulator process launch/registration).
+ *
+ * We patch SpringBoard only (guarded by ROSETTASIM_SB_HANDLE_FIX=1):
+ *   - Swizzle -[FBApplicationProcess _queue_bootstrapAndExecWithContext:]
+ *   - If its FBProcess has a nil handle, create one via
+ *       +[BSProcessHandle processHandleForPID:]
+ *     using PID from the process/context or /tmp/rosettasim_app_pid.
+ * ================================================================ */
+
+static int bfix_is_springboard_process(void) {
+    const char *pn = getprogname();
+    return (pn && strstr(pn, "SpringBoard")) ? 1 : 0;
+}
+
+static int bfix_sb_handle_fix_enabled(void) {
+    const char *e = getenv("ROSETTASIM_SB_HANDLE_FIX");
+    return (e && e[0] == '1');
+}
+
+static int bfix_read_int_file(const char *path) {
+    if (!path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int v = 0;
+    if (fscanf(f, "%d", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+static int bfix_get_pid_from_obj(id obj) {
+    if (!obj) return 0;
+    SEL s = sel_registerName("pid");
+    if ([obj respondsToSelector:s]) {
+        return (int)((int(*)(id, SEL))objc_msgSend)(obj, s);
+    }
+    s = sel_registerName("processIdentifier");
+    if ([obj respondsToSelector:s]) {
+        return (int)((int(*)(id, SEL))objc_msgSend)(obj, s);
+    }
+    s = sel_registerName("PID");
+    if ([obj respondsToSelector:s]) {
+        return (int)((int(*)(id, SEL))objc_msgSend)(obj, s);
+    }
+    return 0;
+}
+
+static id bfix_create_bsprocesshandle_for_pid(int pid) {
+    if (pid <= 0) return nil;
+    Class cls = objc_getClass("BSProcessHandle");
+    if (!cls) return nil;
+    SEL s = sel_registerName("processHandleForPID:");
+    if (class_respondsToSelector(cls, s)) {
+        return ((id(*)(id, SEL, int))objc_msgSend)((id)cls, s, pid);
+    }
+    s = sel_registerName("processHandleForPid:");
+    if (class_respondsToSelector(cls, s)) {
+        return ((id(*)(id, SEL, int))objc_msgSend)((id)cls, s, pid);
+    }
+    return nil;
+}
+
+static int bfix_set_process_handle(id process, id handle) {
+    if (!process || !handle) return 0;
+
+    SEL setSel = sel_registerName("setHandle:");
+    if ([process respondsToSelector:setSel]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(process, setSel, handle);
+        return 1;
+    }
+
+    /* KVC fallback (safe under @try) */
+    @try {
+        [process setValue:handle forKey:@"handle"];
+        return 1;
+    } @catch (id ex) {
+        /* ignore */
+    }
+
+    Ivar iv = class_getInstanceVariable(object_getClass(process), "_handle");
+    if (iv) {
+        object_setIvar(process, iv, handle);
+        return 1;
+    }
+    return 0;
+}
+
+static IMP g_orig_fbapp_queue_bootstrap = NULL;
+static int g_sb_handle_fix_swizzled = 0;
+
+static void replacement_FBApplicationProcess_queue_bootstrap(id self, SEL _cmd, id context) {
+    static int log_budget = 100;
+
+    bfix_log("[bfix] SB_HANDLE_FIX: ENTRY self=%p _cmd=%s ctx=%p budget=%d\n",
+             (void *)self, sel_getName(_cmd), (void *)context, log_budget);
+
+    if (bfix_sb_handle_fix_enabled() && log_budget > 0) {
+        id process = nil;
+        SEL procSel = sel_registerName("process");
+        if ([self respondsToSelector:procSel]) {
+            process = ((id(*)(id, SEL))objc_msgSend)(self, procSel);
+        }
+        if (!process) {
+            Ivar iv = class_getInstanceVariable(object_getClass(self), "_process");
+            if (iv) process = object_getIvar(self, iv);
+        }
+
+        id handle = nil;
+        if (process) {
+            SEL hSel = sel_registerName("handle");
+            if ([process respondsToSelector:hSel]) {
+                handle = ((id(*)(id, SEL))objc_msgSend)(process, hSel);
+            }
+            if (!handle) {
+                Ivar hiv = class_getInstanceVariable(object_getClass(process), "_handle");
+                if (hiv) handle = object_getIvar(process, hiv);
+            }
+        }
+
+        if (!handle) {
+            int pid = bfix_get_pid_from_obj(process);
+            if (pid <= 0) pid = bfix_get_pid_from_obj(context);
+            if (pid <= 0) pid = bfix_read_int_file("/tmp/rosettasim_app_pid");
+
+            id newHandle = bfix_create_bsprocesshandle_for_pid(pid);
+            if (newHandle && process) {
+                int ok = bfix_set_process_handle(process, newHandle);
+                bfix_log("[bfix] SB_HANDLE_FIX: set handle=%p pid=%d ok=%d proc=%p ctx=%p\n",
+                         newHandle, pid, ok, process, context);
+                log_budget--;
+            } else {
+                bfix_log("[bfix] SB_HANDLE_FIX: unable to create handle (pid=%d proc=%p ctx=%p)\n",
+                         pid, process, context);
+                log_budget--;
+            }
+        }
+    }
+
+    if (g_orig_fbapp_queue_bootstrap) {
+        ((void(*)(id, SEL, id))g_orig_fbapp_queue_bootstrap)(self, _cmd, context);
+    }
+}
+
+static void bfix_try_install_springboard_handle_fix(void) {
+    if (!bfix_is_springboard_process()) return;
+    if (!bfix_sb_handle_fix_enabled()) return;
+    if (g_sb_handle_fix_swizzled) return;
+
+    Class cls = objc_getClass("FBApplicationProcess");
+    if (!cls) return;
+
+    SEL sel = sel_registerName("_queue_bootstrapAndExecWithContext:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+
+    g_orig_fbapp_queue_bootstrap = method_getImplementation(m);
+    method_setImplementation(m, (IMP)replacement_FBApplicationProcess_queue_bootstrap);
+    g_sb_handle_fix_swizzled = 1;
+    bfix_log("[bfix] SB_HANDLE_FIX: installed FBApplicationProcess swizzle\n");
+}
+
+static void bfix_install_springboard_handle_fix_async(void) {
+    if (!bfix_is_springboard_process()) return;
+    if (!bfix_sb_handle_fix_enabled()) return;
+
+    /* Poll for FBApplicationProcess to load; install once. */
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        for (int i = 0; i < 200; i++) { /* up to ~10s */
+            if (g_sb_handle_fix_swizzled) return;
+            bfix_try_install_springboard_handle_fix();
+            if (g_sb_handle_fix_swizzled) return;
+            usleep(50000);
+        }
+        bfix_log("[bfix] SB_HANDLE_FIX: FAILED to install (FBApplicationProcess not found)\n");
+    });
+}
 static void patch_client_port(mach_port_t port_value) {
     /* Find the real CARenderServerGetClientPort function */
     void *fn = dlsym(RTLD_DEFAULT, "CARenderServerGetClientPort");
@@ -1170,6 +1780,52 @@ static void replacement_xpc_connection_check_in(void *conn) {
     }
 }
 
+/* Logging-only wrapper for _xpc_connection_check_in (strict mode, assertiond only).
+ * Captures the listener port for processinfoservice then calls the original.
+ * Does NOT modify connection state — the original handles everything. */
+typedef void (*xpc_connection_check_in_fn)(void *conn);
+static xpc_connection_check_in_fn g_orig_xpc_connection_check_in = NULL;
+
+static void strict_logging_xpc_connection_check_in(void *conn) {
+    uint8_t *obj = (uint8_t *)conn;
+    int is_listener = (obj[0xd9] & 0x2) != 0;
+    mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
+
+    /* Try to get connection name */
+    const char *conn_name = NULL;
+    void *name_ptr = *(void **)(obj + 0x70);
+    if (name_ptr && (uintptr_t)name_ptr > 0x1000 && (uintptr_t)name_ptr < 0x7fffffffffff) {
+        const char *try_name = (const char *)name_ptr;
+        if (try_name[0] == 'c' && try_name[1] == 'o' && try_name[2] == 'm')
+            conn_name = try_name;
+    }
+    if (!conn_name) {
+        name_ptr = *(void **)(obj + 0x78);
+        if (name_ptr && (uintptr_t)name_ptr > 0x1000 && (uintptr_t)name_ptr < 0x7fffffffffff) {
+            const char *try_name = (const char *)name_ptr;
+            if (try_name[0] == 'c' && try_name[1] == 'o' && try_name[2] == 'm')
+                conn_name = try_name;
+        }
+    }
+
+    /* Capture processinfoservice listener port */
+    if (is_listener && conn_name && strstr(conn_name, "processinfoservice")) {
+        g_processinfoservice_port = port1;
+        bfix_log("[bfix] STRICT PI PORT CAPTURED: svc=%s listener port=0x%x\n",
+                 conn_name, port1);
+    }
+
+    if (is_listener) {
+        bfix_log("[bfix] STRICT check_in LISTENER '%s' port1=0x%x\n",
+                 conn_name ? conn_name : "?", port1);
+    }
+
+    /* Call the original */
+    if (g_orig_xpc_connection_check_in) {
+        g_orig_xpc_connection_check_in(conn);
+    }
+}
+
 /* Replacement for xpc_connection_send_message_with_reply_sync.
  *
  * The original function blocks forever waiting for a reply. In our simulator,
@@ -1331,7 +1987,39 @@ static void patch_bootstrap_functions(void) {
                     patches[i].replacement = (void *)replacement_xpc_connection_check_in;
             }
         } else {
-            bfix_log("[bfix] STRICT: skipping _xpc_look_up_endpoint + _xpc_connection_check_in patches\n");
+            const char *pn = getprogname();
+            int is_sb = (pn && strstr(pn, "SpringBoard"));
+            int is_assertiond = (pn && strstr(pn, "assertiond"));
+            bfix_log("[bfix] STRICT mode: progname='%s' is_sb=%d is_assertiond=%d\n",
+                     pn ? pn : "(null)", is_sb, is_assertiond);
+
+            if (is_sb) {
+                /* STRICT+SpringBoard: STILL patch _xpc_look_up_endpoint +
+                 * _xpc_connection_check_in. SpringBoard's native libxpc never
+                 * sends a routine=805 check_in for frontboard.workspace (the
+                 * 805 message never reaches the broker). Without our patches,
+                 * the workspace port is never owned by SpringBoard and the
+                 * app hangs forever. */
+                for (int i = 0; i < n_patches; i++) {
+                    if (strcmp(patches[i].name, "_xpc_look_up_endpoint") == 0)
+                        patches[i].replacement = (void *)replacement_xpc_look_up_endpoint;
+                    else if (strcmp(patches[i].name, "_xpc_connection_check_in") == 0)
+                        patches[i].replacement = (void *)replacement_xpc_connection_check_in;
+                }
+                bfix_log("[bfix] STRICT+SpringBoard: _xpc_look_up_endpoint + _xpc_connection_check_in PATCHED\n");
+            } else if (is_assertiond) {
+                /* STRICT+assertiond:
+                 * Do NOT trampoline _xpc_connection_check_in.
+                 * The previous logging wrapper recursed (because our trampoline
+                 * overwrote the original entry point, so calling it re-entered
+                 * the wrapper) and assertiond would crash with a stack overflow.
+                 *
+                 * We already have a mach_msg-based capture path for the
+                 * processinfoservice port, so keep assertiond stable. */
+                bfix_log("[bfix] STRICT+assertiond: skipping _xpc_connection_check_in port-capture patch\n");
+            } else {
+                bfix_log("[bfix] STRICT: skipping _xpc_look_up_endpoint + _xpc_connection_check_in patches\n");
+            }
         }
     }
 
@@ -1423,6 +2111,7 @@ static void bootstrap_fix_constructor(void) {
          * in libxpc calls bootstrap_look_up as an intra-library call.
          * This must happen BEFORE any XPC operations. */
         patch_bootstrap_functions();
+        bfix_install_springboard_handle_fix_async();
 
         /* Look up CARenderServer and patch the client port.
          * This must happen BEFORE UIKit creates any windows. */

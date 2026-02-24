@@ -2328,6 +2328,13 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
     char env_hid_manager[1280];
+    static char env_lifecycle_daemon[128] = "";
+    {
+        const char *lm = getenv("ROSETTASIM_LIFECYCLE_MODE");
+        if (lm && env_lifecycle_daemon[0] == '\0')
+            snprintf(env_lifecycle_daemon, sizeof(env_lifecycle_daemon),
+                     "ROSETTASIM_LIFECYCLE_MODE=%s", lm);
+    }
     const char *root = g_project_root[0] ? g_project_root : NULL;
     char cwd[1024];
     if (!root) {
@@ -2384,6 +2391,8 @@ static int spawn_backboardd(const char *sdk_path, const char *shim_path) {
         "SIMULATOR_MAINSCREEN_SCALE=2.0",
         env_hid_manager,
         "ROSETTASIM_MG_STUB=1",
+        "ROSETTASIM_SB_HANDLE_FIX=1",
+        env_lifecycle_daemon[0] ? env_lifecycle_daemon : "ROSETTASIM_LIFECYCLE_MODE=compat",
         NULL
     };
 
@@ -2435,6 +2444,13 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
     char env_dyld_root[1024], env_dyld_insert[2048];
     char env_iphone_sim_root[1024], env_sim_root[1024];
     char env_home[1024], env_cffixed_home[1024], env_tmpdir[1024];
+    static char env_lifecycle_daemon[128] = "";
+    {
+        const char *lm = getenv("ROSETTASIM_LIFECYCLE_MODE");
+        if (lm && env_lifecycle_daemon[0] == '\0')
+            snprintf(env_lifecycle_daemon, sizeof(env_lifecycle_daemon),
+                     "ROSETTASIM_LIFECYCLE_MODE=%s", lm);
+    }
 
     snprintf(env_dyld_root, sizeof(env_dyld_root), "DYLD_ROOT_PATH=%s", sdk_path);
     const char *root = g_project_root[0] ? g_project_root : NULL;
@@ -2485,6 +2501,9 @@ static int spawn_sim_daemon(const char *binary_path, const char *sdk_path,
         "SIMULATOR_MAINSCREEN_HEIGHT=1334",
         "SIMULATOR_MAINSCREEN_SCALE=2.0",
         "ROSETTASIM_MG_STUB=1",
+        "ROSETTASIM_ASSERTIOND_TRACE=1",
+        "ROSETTASIM_SB_HANDLE_FIX=1",
+        env_lifecycle_daemon[0] ? env_lifecycle_daemon : "ROSETTASIM_LIFECYCLE_MODE=compat",
         NULL
     };
 
@@ -2773,6 +2792,28 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     }
 
     broker_log("[broker] app spawned with pid %d\n", pid);
+
+    /* Write PID + bundle-id for SpringBoard-side lifecycle shims.
+     * In strict mode, SpringBoard may fail bootstrap early if it cannot
+     * produce a BSProcessHandle for the app (normally provided via
+     * CoreSimulator launch flow). */
+    {
+        int fd = open("/tmp/rosettasim_app_pid", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            char buf[32];
+            int len = snprintf(buf, sizeof(buf), "%d\n", pid);
+            if (len > 0) write(fd, buf, (size_t)len);
+            close(fd);
+        }
+    }
+    if (g_app_bundle_id[0]) {
+        int fd = open("/tmp/rosettasim_app_bundleid", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            write(fd, g_app_bundle_id, strlen(g_app_bundle_id));
+            write(fd, "\n", 1);
+            close(fd);
+        }
+    }
     return pid;
 }
 
@@ -3213,13 +3254,17 @@ int main(int argc, char *argv[]) {
                 }
 
                 sb_svc_check:
-                /* Check if SpringBoard registered its key services */
+                /* Check if SpringBoard ACTUALLY checked in (receive_moved=1)
+                 * for its key services. Just checking 'active' is insufficient
+                 * because pre-created services are active at creation time
+                 * but nobody owns the receive right until check_in moves it. */
                 for (int i = 0; i < MAX_SERVICES; i++) {
-                    if (g_services[i].active &&
+                    if (g_services[i].active && g_services[i].receive_moved &&
                         (strstr(g_services[i].name, "PurpleSystemAppPort") ||
                          strstr(g_services[i].name, "frontboard.workspace"))) {
                         sb_ready = 1;
-                        broker_log("[broker] SpringBoard service registered: %s\n", g_services[i].name);
+                        broker_log("[broker] SpringBoard service CHECKED IN: %s (receive_moved=1)\n",
+                                   g_services[i].name);
                         break;
                     }
                 }

@@ -19,6 +19,8 @@
 #include <stdarg.h>
 #include <mach/ndr.h>
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 /* Bootstrap API — not available in iOS simulator SDK headers */
 extern mach_port_t bootstrap_port;
@@ -32,9 +34,15 @@ typedef void *xpc_connection_t;
 typedef void *xpc_object_t;
 typedef void *xpc_endpoint_t;
 typedef void (^xpc_handler_t)(xpc_object_t);
-typedef struct dispatch_queue_s *dispatch_queue_t;
+/* dispatch_queue_t provided by dispatch/dispatch.h */
 
 #define XPC_CONNECTION_MACH_SERVICE_LISTENER (1ULL << 0)
+
+/* XPC dict API — used for synthetic replies */
+extern xpc_object_t xpc_dictionary_create(const char *const *keys,
+                                           const xpc_object_t *values, size_t count);
+extern int64_t xpc_dictionary_get_int64(xpc_object_t dict, const char *key);
+extern void xpc_dictionary_set_int64(xpc_object_t dict, const char *key, int64_t val);
 
 extern xpc_connection_t xpc_connection_create_mach_service(const char *name,
     dispatch_queue_t targetq, uint64_t flags);
@@ -101,7 +109,9 @@ static void sb_log_listener_fields(const char *name, xpc_connection_t conn) {
 }
 static void sb_track_assertiond_conn(const char *name, xpc_connection_t conn) {
     if (!name || !conn) return;
-    if (strncmp(name, "com.apple.assertiond.", 21) != 0) return;
+    /* Track assertiond AND backboard system-app-server connections */
+    if (strncmp(name, "com.apple.assertiond.", 21) != 0 &&
+        strstr(name, "system-app-server") == NULL) return;
     for (int i = 0; i < SB_CONN_TRACK_SLOTS; i++) {
         if (g_sb_conn_track[i].conn == conn || g_sb_conn_track[i].conn == NULL) {
             g_sb_conn_track[i].conn = conn;
@@ -455,6 +465,252 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
     }
 }
 
+/* ================================================================
+ * SpringBoard BKSProcess bootstrap instrumentation
+ *
+ * Swizzle -[BKSProcess _bootstrapWithError:] to log entry/exit + error.
+ * Interpose xpc_connection_send_message_with_reply_sync to log PI sends.
+ * ================================================================ */
+#include <objc/runtime.h>
+#include <objc/message.h>
+
+static IMP g_orig_bks_bootstrapWithError = NULL;
+static int g_bks_bootstrap_logged = 0;
+static int g_bks_bootstrap_in_progress = 0;
+
+/* Swizzled -[BKSProcess _bootstrapWithError:] */
+static BOOL replacement_bks_bootstrapWithError(id self, SEL _cmd, id *errorPtr) {
+    /* Log entry with process info — use _bundleID ivar (not a public method) */
+    const char *bid = "?";
+    Ivar bidIvar = class_getInstanceVariable(object_getClass(self), "_bundleID");
+    if (bidIvar) {
+        id bundleID = object_getIvar(self, bidIvar);
+        if (bundleID)
+            bid = ((const char *(*)(id, SEL))objc_msgSend)(bundleID, sel_registerName("UTF8String"));
+    }
+
+    /* Check the _client connection */
+    Ivar clientIvar = class_getInstanceVariable(object_getClass(self), "_client");
+    id client = clientIvar ? object_getIvar(self, clientIvar) : nil;
+
+    sb_log("BKS_BOOTSTRAP ENTRY: self=%p bundleID='%s' client=%p errorPtr=%p",
+           (void *)self, bid, (void *)client, (void *)errorPtr);
+
+    /* Set flag so BSDeserialize interpose knows we're in bootstrap.
+     * The reply handler block runs asynchronously on a dispatch queue,
+     * so g_bks_bootstrap_in_progress must stay set until EXIT. */
+    g_bks_bootstrap_in_progress = 1;
+    sb_log("BKS_BOOTSTRAP: set g_bks_bootstrap_in_progress=1");
+
+    /* Call original */
+    BOOL result = ((BOOL(*)(id, SEL, id *))g_orig_bks_bootstrapWithError)(self, _cmd, errorPtr);
+
+    g_bks_bootstrap_in_progress = 0;
+
+    /* Log exit */
+    id error = (errorPtr && *errorPtr) ? *errorPtr : nil;
+    const char *errDesc = "nil";
+    if (error) {
+        id desc = ((id(*)(id, SEL))objc_msgSend)(error, sel_registerName("description"));
+        errDesc = desc ? ((const char *(*)(id, SEL))objc_msgSend)(desc, sel_registerName("UTF8String")) : "?";
+    }
+    sb_log("BKS_BOOTSTRAP EXIT: result=%d error=%s bundleID='%s'",
+           result, errDesc, bid);
+
+    return result;
+}
+
+/* Interpose xpc_connection_send_message_with_reply_sync to log PI sends */
+extern xpc_object_t xpc_connection_send_message_with_reply_sync(
+    xpc_connection_t conn, xpc_object_t message);
+extern const char *xpc_copy_description(xpc_object_t obj);
+
+static xpc_object_t replacement_xpc_send_sync(xpc_connection_t conn, xpc_object_t message) {
+    /* Check if this connection targets assertiond.processinfoservice */
+    const char *conn_name = NULL;
+    for (int i = 0; i < SB_CONN_TRACK_SLOTS; i++) {
+        if (g_sb_conn_track[i].conn == conn) {
+            conn_name = g_sb_conn_track[i].name;
+            break;
+        }
+    }
+
+    int is_pi = (conn_name && strstr(conn_name, "processinfoservice"));
+    int is_sas = (conn_name && strstr(conn_name, "system-app-server"));
+
+    if (is_pi) {
+        sb_log("BKS_SEND_SYNC: conn=%p name='%s' msg=%p", (void *)conn, conn_name, (void *)message);
+    }
+
+    /* Intercept messages to com.apple.backboard.system-app-server.
+     * This port has no real listener — purple_fb_server pre-created it
+     * as a dummy. SpringBoard's BKSSystemApplicationClient sends:
+     *   - messageType=5 (ping): expects any valid XPC dict reply
+     *   - messageType=1 (checkIn): expects reply with data migration signal
+     * Without replies, SpringBoard blocks forever in FBSystemAppMain. */
+    if (is_sas && message) {
+        int64_t msgType = xpc_dictionary_get_int64(message, "BKSSystemApplicationMessageKeyMessageType");
+        sb_log("SAS_INTERCEPT: conn=%p msgType=%lld (5=ping, 1=checkIn)", (void *)conn, msgType);
+
+        /* Return a synthetic reply — empty dict signals "success" for both ping and checkIn */
+        xpc_object_t synthetic = xpc_dictionary_create(NULL, NULL, 0);
+        if (msgType == 1) {
+            /* checkIn reply: include data migration completed flag.
+             * BKSSystemApplicationClient checks for this to unblock
+             * checkInAndWaitForDataMigration's dispatch_semaphore. */
+            xpc_dictionary_set_int64(synthetic, "BKSSystemApplicationMessageKeyMessageType", 1);
+        }
+        sb_log("SAS_INTERCEPT: returning synthetic reply for msgType=%lld", msgType);
+        return synthetic;
+    }
+
+    /* Call real function via dlsym(RTLD_NEXT) */
+    static xpc_object_t (*real_send_sync)(xpc_connection_t, xpc_object_t) = NULL;
+    if (!real_send_sync) {
+        real_send_sync = dlsym(RTLD_NEXT, "xpc_connection_send_message_with_reply_sync");
+    }
+    xpc_object_t reply = real_send_sync ? real_send_sync(conn, message) : NULL;
+
+    if (is_pi) {
+        sb_log("BKS_SEND_SYNC REPLY: conn=%p reply=%p (NULL=%s)",
+               (void *)conn, (void *)reply, reply ? "NO" : "YES");
+    }
+
+    return reply;
+}
+
+static void install_bks_bootstrap_swizzle(void) {
+    /* Delay until BKSProcess class is loaded */
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        for (int i = 0; i < 200; i++) {
+            if (g_bks_bootstrap_logged) return;
+            Class cls = objc_getClass("BKSProcess");
+            if (cls) {
+                SEL sel = sel_registerName("_bootstrapWithError:");
+                Method m = class_getInstanceMethod(cls, sel);
+                if (m) {
+                    g_orig_bks_bootstrapWithError = method_getImplementation(m);
+                    method_setImplementation(m, (IMP)replacement_bks_bootstrapWithError);
+                    g_bks_bootstrap_logged = 1;
+                    sb_log("BKS_BOOTSTRAP: swizzled -[BKSProcess _bootstrapWithError:]");
+                    return;
+                }
+            }
+            usleep(50000);
+        }
+        sb_log("BKS_BOOTSTRAP: FAILED to install swizzle (BKSProcess not found after 10s)");
+    });
+}
+
+/* ================================================================
+ * BSDeserialize ProcessHandle fix
+ *
+ * When assertiond's reply lacks BKSProcessInfoServiceMessageKeyProcessHandle,
+ * synthesize a BSProcessHandle for SpringBoard's own PID so the bootstrap
+ * succeeds. This is the minimal intervention to unblock the lifecycle.
+ * ================================================================ */
+extern id BSDeserializeBSXPCEncodableObjectFromXPCDictionaryWithKey(
+    xpc_object_t dict, id key);
+extern const char *xpc_dictionary_get_string(xpc_object_t dict, const char *key);
+
+static id replacement_BSDeserialize(xpc_object_t dict, id key) {
+    /* Call real function first — only intervene if it returns nil */
+    static id (*real_fn)(xpc_object_t, id) = NULL;
+    if (!real_fn) {
+        real_fn = dlsym(RTLD_NEXT, "BSDeserializeBSXPCEncodableObjectFromXPCDictionaryWithKey");
+    }
+    id result = real_fn ? real_fn(dict, key) : nil;
+
+    /* If result is nil AND we're inside _bootstrapWithError AND the result
+     * would be a BSProcessHandle type, inject one.
+     * We detect the ProcessHandle call by checking if the result's expected
+     * class is BSProcessHandle — if real_fn returned nil and we're in
+     * bootstrap, try to synthesize a handle. */
+    if (!result && g_bks_bootstrap_in_progress) {
+        /* Nil deserialization during bootstrap. Always try to inject a
+         * BSProcessHandle. If this was actually the Error key (1st call),
+         * the caller checks [result isKindOfClass:[NSError class]] and
+         * ignores it. If it's the ProcessHandle key (2nd call), this
+         * is exactly what's needed. Safe either way. */
+        {
+            /* Synthesize a BSProcessHandle for the current process */
+            Class handleClass = objc_getClass("BSProcessHandle");
+            if (handleClass) {
+                SEL pidSel = sel_registerName("processHandleForPID:");
+                result = ((id(*)(id, SEL, int))objc_msgSend)(
+                    (id)handleClass, pidSel, getpid());
+                if (result) {
+                    sb_log("HANDLE_FIX: synthesized BSProcessHandle=%p for pid=%d",
+                           (void *)result, getpid());
+                } else {
+                    sb_log("HANDLE_FIX: processHandleForPID:%d returned nil", getpid());
+                }
+            } else {
+                sb_log("HANDLE_FIX: BSProcessHandle class not found");
+            }
+        }
+    }
+
+    return result;
+}
+
+/* ================================================================
+ * NSLog interpose — capture return address when "Bootstrap failed" is logged.
+ * This tells us which of the two NSLog sites in _bootstrapWithError: fires
+ * (0x5c89 vs 0x5d2a in AssertionServices x86_64).
+ * ================================================================ */
+#include <execinfo.h>
+
+extern void NSLog(id format, ...);
+typedef void (*NSLog_fn)(id format, ...);
+
+static void replacement_NSLog(id format, ...) {
+    /* Check if this is the "Bootstrap failed" log */
+    const char *fmt_str = NULL;
+    if (format) {
+        fmt_str = ((const char *(*)(id, SEL))objc_msgSend)(
+            format, sel_registerName("UTF8String"));
+    }
+
+    int is_bootstrap_fail = (fmt_str && strstr(fmt_str, "Bootstrap failed"));
+
+    if (is_bootstrap_fail) {
+        void *ret_addr = __builtin_return_address(0);
+        void *bt[8];
+        int n = backtrace(bt, 8);
+        sb_log("NSLOG_TRAP: 'Bootstrap failed' from ret_addr=%p", ret_addr);
+        for (int i = 0; i < n; i++) {
+            Dl_info info;
+            if (dladdr(bt[i], &info)) {
+                sb_log("  bt[%d]: %p %s + %ld (%s)",
+                       i, bt[i], info.dli_sname ? info.dli_sname : "?",
+                       (long)((char *)bt[i] - (char *)info.dli_saddr),
+                       info.dli_fname ? strrchr(info.dli_fname, '/') + 1 : "?");
+            } else {
+                sb_log("  bt[%d]: %p (no dladdr)", i, bt[i]);
+            }
+        }
+    }
+
+    /* Forward to real NSLog via dlsym */
+    static NSLog_fn real_nslog = NULL;
+    if (!real_nslog) {
+        real_nslog = (NSLog_fn)dlsym(RTLD_NEXT, "NSLog");
+    }
+    if (real_nslog) {
+        va_list ap;
+        va_start(ap, format);
+        /* NSLog doesn't have a va_list variant easily accessible.
+         * Use NSLogv instead: */
+        extern void NSLogv(id format, va_list args);
+        typedef void (*NSLogv_fn)(id, va_list);
+        static NSLogv_fn real_nslogv = NULL;
+        if (!real_nslogv) real_nslogv = (NSLogv_fn)dlsym(RTLD_NEXT, "NSLogv");
+        if (real_nslogv) real_nslogv(format, ap);
+        va_end(ap);
+    }
+}
+
 /* DYLD interposition table */
 typedef struct {
     const void *replacement;
@@ -474,6 +730,12 @@ __attribute__((section("__DATA,__interpose"))) = {
       (const void *)xpc_connection_create_mach_service },
     { (const void *)replacement_xpc_connection_resume,
       (const void *)xpc_connection_resume },
+    { (const void *)replacement_xpc_send_sync,
+      (const void *)xpc_connection_send_message_with_reply_sync },
+    { (const void *)replacement_NSLog,
+      (const void *)NSLog },
+    { (const void *)replacement_BSDeserialize,
+      (const void *)BSDeserializeBSXPCEncodableObjectFromXPCDictionaryWithKey },
 };
 
 /* Constructor — runs before SpringBoard's main */
@@ -481,4 +743,5 @@ __attribute__((constructor))
 static void sb_shim_init(void) {
     sb_log("SpringBoard shim loaded (PID %d)", getpid());
     init_broker_port();
+    install_bks_bootstrap_swizzle();
 }
