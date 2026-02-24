@@ -12,6 +12,8 @@ clang -arch x86_64 -x objective-c -dynamiclib \
     -F"$SDK/System/Library/PrivateFrameworks" \
     -framework Foundation \
     -framework BaseBoard \
+    -framework GraphicsServices \
+    -framework UIKit \
     -install_name @rpath/springboard_shim.dylib \
     -o "$OUT" "$SRC"
 

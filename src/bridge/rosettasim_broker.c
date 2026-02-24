@@ -3203,7 +3203,7 @@ int main(int argc, char *argv[]) {
              * Key service: com.apple.frontboard.workspace (FBSWorkspace) */
             broker_log("[broker] waiting for SpringBoard services...\n");
             int sb_ready = 0;
-            for (int attempt = 0; attempt < 40 && !sb_ready; attempt++) {
+            for (int attempt = 0; attempt < 120 && !sb_ready; attempt++) {
                 memset(tmp_buf, 0, sizeof(tmp_buf));
                 kern_return_t msg_kr = mach_msg(tmp_req, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
                                                  0, sizeof(tmp_buf), g_port_set,

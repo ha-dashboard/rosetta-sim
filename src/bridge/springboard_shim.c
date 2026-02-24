@@ -109,9 +109,11 @@ static void sb_log_listener_fields(const char *name, xpc_connection_t conn) {
 }
 static void sb_track_assertiond_conn(const char *name, xpc_connection_t conn) {
     if (!name || !conn) return;
-    /* Track assertiond AND backboard system-app-server connections */
+    /* Track assertiond, system-app-server, AND workspace connections */
     if (strncmp(name, "com.apple.assertiond.", 21) != 0 &&
-        strstr(name, "system-app-server") == NULL) return;
+        strstr(name, "system-app-server") == NULL &&
+        strstr(name, "frontboard.workspace") == NULL &&
+        strstr(name, "frontboard.systemappservices") == NULL) return;
     for (int i = 0; i < SB_CONN_TRACK_SLOTS; i++) {
         if (g_sb_conn_track[i].conn == conn || g_sb_conn_track[i].conn == NULL) {
             g_sb_conn_track[i].conn = conn;
@@ -713,6 +715,27 @@ static void replacement_NSLog(id format, ...) {
     }
 }
 
+/* ================================================================
+ * GSEventRun manual pump interposition
+ *
+ * Call chain: FBSystemAppMain → UIApplicationMain → [UIApplication _run]
+ *   → GSEventRun → CFRunLoopRunInMode → returns immediately (Rosetta 2)
+ *   → GSEventRun returns → _run returns → main returns → exit(0)
+ *
+ * Under Rosetta 2, CFRunLoopRunInMode returns immediately because
+ * Mach port sources never wake the run loop. Fix: replace GSEventRun
+ * with a manual pump that repeatedly runs the run loop for short
+ * intervals and drains the main dispatch queue (for XPC handlers).
+ * ================================================================ */
+
+extern void GSEventRun(void);
+static void sb_pump_loop(const char *label);
+
+static void replacement_GSEventRun(void) {
+    sb_pump_loop("GSEventRun");
+    /* unreachable */
+}
+
 /* DYLD interposition table */
 typedef struct {
     const void *replacement;
@@ -738,6 +761,88 @@ __attribute__((section("__DATA,__interpose"))) = {
       (const void *)NSLog },
     { (const void *)replacement_BSDeserialize,
       (const void *)BSDeserializeBSXPCEncodableObjectFromXPCDictionaryWithKey },
+    { (const void *)replacement_GSEventRun,
+      (const void *)GSEventRun },
+};
+
+/* UIApplicationMain interposition — catches the tail call from FBSystemAppMain.
+ * Calls original (which returns because _run's GSEventRun returns immediately),
+ * then enters the manual pump to keep SpringBoard alive. */
+extern int UIApplicationMain(int argc, char *argv[],
+    id principalClassName, id delegateClassName);
+
+static int replacement_UIApplicationMain_sb(int argc, char *argv[],
+    id principalClassName, id delegateClassName) {
+    sb_log("RUNLOOP_FIX: UIApplicationMain intercepted");
+
+    /* Call original UIApplicationMain which does:
+     * 1. Creates UIApplication singleton (or subclass)
+     * 2. Creates app delegate
+     * 3. Calls [UIApplication _run] which calls GSEventRun → CFRunLoopRunInMode
+     *
+     * Under Rosetta 2, the run loop returns immediately, _run returns,
+     * UIApplicationMain returns. We catch the return and enter our pump. */
+
+    typedef int (*uiam_fn)(int, char **, id, id);
+    static uiam_fn real_uiam = NULL;
+    if (!real_uiam) real_uiam = (uiam_fn)dlsym(RTLD_NEXT, "UIApplicationMain");
+
+    /* The real UIApplicationMain will:
+     * 1. Create UIApplication singleton
+     * 2. Call _run → GSEventRun → CFRunLoopRunInMode → returns immediately
+     * 3. Return from _run → return from UIApplicationMain
+     * 4. Since FBSystemAppMain used jmp (tail call), returning from
+     *    UIApplicationMain returns from main() → CRT calls exit(0)
+     *
+     * We interpose exit() to catch this and enter the manual pump. */
+    if (real_uiam) {
+        sb_log("RUNLOOP_FIX: calling original UIApplicationMain");
+        int ret = real_uiam(argc, argv, principalClassName, delegateClassName);
+        sb_log("RUNLOOP_FIX: UIApplicationMain returned %d", ret);
+    }
+
+    /* If we get here, UIApplicationMain actually returned (didn't exit).
+     * Enter manual pump to keep SpringBoard alive. */
+    sb_log("RUNLOOP_FIX: entering manual pump (UIApplicationMain returned)");
+
+    typedef void (*drain_fn)(void);
+    drain_fn drain_main = (drain_fn)dlsym(RTLD_DEFAULT,
+        "_dispatch_main_queue_callback_4CF");
+
+    while (1) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.016, true);
+        if (drain_main) drain_main();
+        usleep(1000);
+    }
+    return 0;
+}
+
+/* exit() interposition — catches main() returning after UIApplicationMain.
+ * Instead of exiting, enter the manual pump to keep SpringBoard alive. */
+static volatile int g_exit_count = 0;
+
+static void replacement_exit_sb(int status) {
+    int count = __sync_add_and_fetch(&g_exit_count, 1);
+    if (status == 0) {
+        sb_log("RUNLOOP_FIX: exit(0) #%d caught — blocking", count);
+        /* Block ALL exit(0) calls — SpringBoard must stay alive.
+         * Sleep forever on whatever thread called exit. */
+        while (1) {
+            sleep(60);
+        }
+    }
+    /* Non-zero exit — let through */
+    sb_log("RUNLOOP_FIX: exit(%d) — letting through", status);
+    _exit(status);
+}
+
+__attribute__((used))
+static const interpose_t uiam_interposer[]
+__attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)replacement_UIApplicationMain_sb,
+      (const void *)UIApplicationMain },
+    { (const void *)replacement_exit_sb,
+      (const void *)exit },
 };
 
 /* ================================================================
@@ -890,23 +995,83 @@ static void install_fb_applib_swizzle(void) {
 static IMP g_orig_fetchInfoPlistFlags = NULL;
 
 static void replacement_fetchInfoPlistFlags(id self, SEL _cmd) {
-    /* Check if main bundle has an info dictionary. If not, skip to
-     * avoid the xpc_copy_bootstrap crash. For SpringBoard, the main
-     * bundle is the SpringBoard.app bundle. */
-    id mainBundle = ((id(*)(id, SEL))objc_msgSend)(
-        (id)objc_getClass("NSBundle"), sel_registerName("mainBundle"));
-    id info = mainBundle ?
-        ((id(*)(id, SEL))objc_msgSend)(mainBundle, sel_registerName("infoDictionary")) : NULL;
+    /* Always skip — the original calls xpc_copy_bootstrap() which
+     * segfaults under our broker (not real launchd). The flags
+     * it reads (launch storyboard, etc.) aren't critical for SB. */
+    sb_log("FETCHINFO: _fetchInfoPlistFlags skipped (xpc_copy_bootstrap unsafe)");
+}
 
-    if (!info) {
-        sb_log("FETCHINFO: _fetchInfoPlistFlags skipped — no infoDictionary");
+/* ================================================================
+ * [UIApplication _run] swizzle — manual pump for SpringBoard
+ *
+ * GSEventRun DYLD interposition doesn't fire (possibly intra-image
+ * binding in UIKit). Instead, swizzle _run which is the ObjC method
+ * that calls GSEventRun. Our replacement does the critical _run setup
+ * and then enters the manual pump instead of calling GSEventRun.
+ * ================================================================ */
+
+static IMP g_orig_uiapp_run = NULL;
+
+static volatile int g_run_entered = 0;
+
+static void sb_pump_loop(const char *label) {
+    typedef void (*drain_fn)(void);
+    drain_fn drain_main = (drain_fn)dlsym(RTLD_DEFAULT,
+        "_dispatch_main_queue_callback_4CF");
+
+    sb_log("RUNLOOP_FIX: %s — entering permanent pump (drain=%p)", label, (void *)drain_main);
+
+    /* This loop NEVER exits. The calling function never returns.
+     * Everything above us in the call stack stays on the stack. */
+    while (1) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.016, true);
+        if (drain_main) drain_main();
+        usleep(1000);
+    }
+}
+
+static void replacement_uiapp_run(id self, SEL _cmd) {
+    if (!__sync_bool_compare_and_swap(&g_run_entered, 0, 1)) {
+        /* Re-entrant — just return to prevent infinite loop */
         return;
     }
 
-    /* infoDictionary exists — try calling original but guard against crash */
-    if (g_orig_fetchInfoPlistFlags) {
-        sb_log("FETCHINFO: _fetchInfoPlistFlags calling original");
-        ((void(*)(id, SEL))g_orig_fetchInfoPlistFlags)(self, _cmd);
+    sb_log("RUNLOOP_FIX: [UIApplication _run] intercepted (first call)");
+
+    /* Call original _run — it does setup (observers, event sources,
+     * registerAsSystemApp) then calls GSEventRun which returns
+     * immediately under Rosetta 2 since CFRunLoopRunInMode doesn't block. */
+    if (g_orig_uiapp_run) {
+        sb_log("RUNLOOP_FIX: calling original _run (setup + GSEventRun)");
+        ((void(*)(id, SEL))g_orig_uiapp_run)(self, _cmd);
+        sb_log("RUNLOOP_FIX: original _run returned — GSEventRun didn't block");
+    }
+
+    /* _run returned because GSEventRun didn't block. Enter our pump.
+     * This function NEVER returns. _run stays on the stack forever.
+     * UIApplicationMain stays on the stack. main() stays on the stack.
+     * exit() is never called. All state persists. */
+    sb_pump_loop("[UIApplication _run]");
+    /* unreachable */
+}
+
+static void install_uiapp_run_swizzle(void) {
+    /* Try UIApplication first, then SpringBoard class */
+    const char *class_names[] = {"UIApplication", "SpringBoard", "FBSystemApp", NULL};
+    for (int i = 0; class_names[i]; i++) {
+        Class cls = objc_getClass(class_names[i]);
+        if (cls) {
+            SEL sel = sel_registerName("_run");
+            Method m = class_getInstanceMethod(cls, sel);
+            if (m) {
+                g_orig_uiapp_run = method_setImplementation(m, (IMP)replacement_uiapp_run);
+                sb_log("RUNLOOP: swizzled [%s _run]", class_names[i]);
+                /* Don't break — swizzle all that have it, to be thorough */
+            }
+        }
+    }
+    if (!g_orig_uiapp_run) {
+        sb_log("RUNLOOP: WARNING — could not find _run on any class");
     }
 }
 
@@ -952,9 +1117,81 @@ static void install_fetchinfo_swizzle(void) {
 __attribute__((constructor))
 static void sb_shim_init(void) {
     sb_log("SpringBoard shim loaded (PID %d)", getpid());
+
+    /* Verify interposition targets — log the address of GSEventRun to
+     * confirm it's the right symbol */
+    void *gs_addr = dlsym(RTLD_DEFAULT, "GSEventRun");
+    void *uiam_addr = dlsym(RTLD_DEFAULT, "UIApplicationMain");
+    sb_log("INTERPOSE_CHECK: GSEventRun=%p replacement=%p", gs_addr, (void *)replacement_GSEventRun);
+    sb_log("INTERPOSE_CHECK: UIApplicationMain=%p replacement=%p", uiam_addr, (void *)replacement_UIApplicationMain_sb);
+
     init_broker_port();
     install_assertion_suppression();
     install_fb_applib_swizzle();
     install_fetchinfo_swizzle();
+    install_uiapp_run_swizzle();
     install_bks_bootstrap_swizzle();
+
+    /* Run loop keep-alive.
+     *
+     * CFRunLoopRun under Rosetta 2 returns immediately if there are no
+     * persistent sources. SpringBoard's UIApplicationMain → _run →
+     * CFRunLoopRun exits, causing the process to terminate before it
+     * can service any workspace connections.
+     *
+     * Fix: add a Mach port source to the main run loop before
+     * UIApplicationMain is called. The port never receives messages —
+     * its sole purpose is to keep CFRunLoopRun blocking. */
+    {
+        extern CFRunLoopRef CFRunLoopGetMain(void);
+        CFRunLoopRef rl = CFRunLoopGetMain();
+        if (rl) {
+            /* Create a Mach receive right and wrap it as a CFMachPort source */
+            mach_port_t keep_alive;
+            kern_return_t kr = mach_port_allocate(mach_task_self(),
+                                                   MACH_PORT_RIGHT_RECEIVE, &keep_alive);
+            if (kr == KERN_SUCCESS) {
+                extern CFMachPortRef CFMachPortCreateWithPort(CFAllocatorRef, mach_port_t,
+                    CFMachPortCallBack, CFMachPortContext *, Boolean *);
+                extern CFRunLoopSourceRef CFMachPortCreateRunLoopSource(CFAllocatorRef,
+                    CFMachPortRef, CFIndex);
+
+                Boolean shouldFree = false;
+                CFMachPortRef mp = CFMachPortCreateWithPort(NULL, keep_alive,
+                    NULL, NULL, &shouldFree);
+                if (mp) {
+                    CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(NULL, mp, 0);
+                    if (src) {
+                        CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
+                        sb_log("SB_RUNLOOP: installed keep-alive Mach port source (port=0x%x)", keep_alive);
+                    }
+                } else {
+                    sb_log("SB_RUNLOOP: CFMachPortCreateWithPort failed, using dispatch source fallback");
+                    /* Fallback: create a dispatch source on the Mach port and add to main queue */
+                    dispatch_source_t dsrc = dispatch_source_create(
+                        DISPATCH_SOURCE_TYPE_MACH_RECV, keep_alive, 0,
+                        dispatch_get_main_queue());
+                    if (dsrc) {
+                        dispatch_source_set_event_handler(dsrc, ^{
+                            sb_log("SB_RUNLOOP: keep-alive port received message (unexpected)");
+                        });
+                        dispatch_resume(dsrc);
+                        sb_log("SB_RUNLOOP: installed dispatch source keep-alive (port=0x%x)", keep_alive);
+                    }
+                }
+            }
+        } else {
+            sb_log("SB_RUNLOOP: WARNING — main run loop not available at constructor time");
+        }
+
+        /* Diagnostic dispatches */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            sb_log("SB_RUNLOOP: main queue alive at +5s");
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            sb_log("SB_RUNLOOP: main queue alive at +30s");
+        });
+    }
 }
