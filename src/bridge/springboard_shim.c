@@ -20,6 +20,7 @@
 #include <mach/ndr.h>
 #include <dlfcn.h>
 #include <dispatch/dispatch.h>
+#include <pthread.h>
 #include <CoreFoundation/CoreFoundation.h>
 
 /* Bootstrap API — not available in iOS simulator SDK headers */
@@ -95,7 +96,10 @@ static void sb_log(const char *fmt, ...) {
  * from libxpc disassembly offsets used in bootstrap_fix.c. */
 static void sb_log_listener_fields(const char *name, xpc_connection_t conn) {
     if (!name || !conn) return;
-    if (strncmp(name, "com.apple.assertiond.", 21) != 0) return;
+    /* Log fields for assertiond AND workspace connections */
+    if (strncmp(name, "com.apple.assertiond.", 21) != 0 &&
+        strstr(name, "frontboard.workspace") == NULL &&
+        strstr(name, "frontboard.systemappservices") == NULL) return;
     uint8_t *obj = (uint8_t *)conn;
     sb_log("  ASSERTIOND conn '%s': ptr=%p state=0x%x port1=0x%x send=0x%x port2=0x%x channel=%p flags_d8=0x%x flags_d9=0x%x",
            name, conn,
@@ -137,7 +141,7 @@ static void replacement_xpc_connection_resume(xpc_connection_t connection) {
     }
     const char *name = sb_lookup_assertiond_conn(connection);
     if (name) {
-        sb_log("xpc_connection_resume ASSERTIOND '%s' conn=%p", name, connection);
+        sb_log("xpc_connection_resume '%s' conn=%p", name, connection);
         sb_log_listener_fields(name, connection);
     }
     if (g_real_xpc_connection_resume) {
@@ -146,8 +150,17 @@ static void replacement_xpc_connection_resume(xpc_connection_t connection) {
         xpc_connection_resume(connection);
     }
     if (name) {
-        sb_log("xpc_connection_resume ASSERTIOND DONE '%s' conn=%p", name, connection);
+        sb_log("xpc_connection_resume DONE '%s' conn=%p", name, connection);
         sb_log_listener_fields(name, connection);
+        if (strstr(name, "frontboard.workspace") ||
+            strstr(name, "frontboard.systemappservices")) {
+            uint8_t *obj = (uint8_t *)connection;
+            sb_log("WORKSPACE_POST_RESUME: port1=0x%x port2=0x%x send=0x%x channel=%p",
+                   *(mach_port_t *)(obj + 0x34),
+                   *(mach_port_t *)(obj + 0x3c),
+                   *(mach_port_t *)(obj + 0x38),
+                   *(void **)(obj + 0x58));
+        }
     }
 }
 static void init_broker_port(void) {
@@ -424,9 +437,88 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
         sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
         if (g_real_xpc_create_mach_service) {
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
-            sb_log("  real LISTENER '%s' → %p", name, conn);
+            sb_log("  real LISTENER '%s' → %p (queue=%p main=%p)", name, conn,
+                   (void *)targetq, (void *)dispatch_get_main_queue());
             sb_log_listener_fields(name, conn);
             sb_track_assertiond_conn(name, conn);
+
+            /* After xpc_connection_create_mach_service returns, the 805 check-in
+             * has already happened internally. But libxpc may not have correctly
+             * parsed our broker's 805 reply, leaving port1 (obj+0x34) as 0.
+             *
+             * Fix: if port1 is NULL, do a manual MIG check_in to get the
+             * receive right and store it. This MUST happen before resume. */
+            if (conn) {
+                uint8_t *obj = (uint8_t *)conn;
+                mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
+
+                sb_log("LISTENER_PORT_CHECK: '%s' port1=0x%x flags=0x%x/0x%x",
+                       name, port1,
+                       (unsigned)*(uint8_t *)(obj + 0xd8),
+                       (unsigned)*(uint8_t *)(obj + 0xd9));
+
+                /* Get recv port via check_in (regardless of current port1 state).
+                 * _xpc_connection_check_in already ran inside create_mach_service
+                 * with port1=0 or a send right, so we need to re-connect the
+                 * dispatch_mach channel with the correct recv port. */
+                mach_port_t recv_port = MACH_PORT_NULL;
+                kern_return_t kr = bootstrap_check_in(g_broker_port,
+                    name, &recv_port);
+                if (kr == KERN_SUCCESS && recv_port != MACH_PORT_NULL) {
+                    *(mach_port_t *)(obj + 0x34) = recv_port;
+                    *(mach_port_t *)(obj + 0x3c) = recv_port;
+                    sb_log("LISTENER_PORT_FIX: '%s' recv port 0x%x (was 0x%x)",
+                           name, recv_port, port1);
+
+                    /* Re-connect the dispatch_mach channel with the recv port.
+                     * The channel at obj+0x58 was already set up by the internal
+                     * check_in, but with the wrong port. We call dispatch_mach_connect
+                     * again with the correct recv port. */
+                    void *channel = *(void **)(obj + 0x58);
+                    if (channel) {
+                        typedef void (*dmc_fn)(void *, mach_port_t, mach_port_t, void *);
+                        dmc_fn dmc = (dmc_fn)dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
+                        if (dmc) {
+                            /* Build 52-byte registration message for broker */
+                            extern void *dispatch_mach_msg_create(void *, size_t, void *,
+                                mach_msg_header_t **);
+                            mach_msg_header_t *msg_ptr = NULL;
+                            void *dmsg = dispatch_mach_msg_create(NULL, 0x34, NULL, &msg_ptr);
+                            if (dmsg && msg_ptr) {
+                                uint8_t *m = (uint8_t *)msg_ptr;
+                                *(uint32_t *)(m + 0x00) = 0x80000013;
+                                *(uint32_t *)(m + 0x04) = 0x34;
+                                *(uint32_t *)(m + 0x08) = g_broker_port;
+                                *(uint32_t *)(m + 0x0c) = 0;
+                                *(uint32_t *)(m + 0x10) = 0;
+                                *(uint32_t *)(m + 0x14) = 0x77303074;
+                                *(uint32_t *)(m + 0x18) = 2;
+                                *(uint32_t *)(m + 0x1c) = recv_port;
+                                *(uint32_t *)(m + 0x20) = 0;
+                                *(uint16_t *)(m + 0x24) = 0;
+                                *(uint8_t *)(m + 0x26) = 0x14;
+                                *(uint8_t *)(m + 0x27) = 0x00;
+                                *(uint32_t *)(m + 0x28) = recv_port;
+                                *(uint32_t *)(m + 0x2c) = 0;
+                                *(uint16_t *)(m + 0x30) = 0;
+                                *(uint8_t *)(m + 0x32) = 0x10;
+                                *(uint8_t *)(m + 0x33) = 0x00;
+                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect(channel=%p, recv=0x%x, dmsg=%p)",
+                                       name, channel, recv_port, dmsg);
+                                dmc(channel, recv_port, recv_port, dmsg);
+                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect DONE", name);
+                            } else {
+                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect (no reg msg)",
+                                       name);
+                                dmc(channel, recv_port, recv_port, NULL);
+                            }
+                        }
+                    }
+                } else {
+                    sb_log("LISTENER_PORT_FIX: '%s' check_in FAILED (kr=%d)", name, kr);
+                }
+            }
+
             return conn;
         }
 
@@ -824,9 +916,23 @@ static volatile int g_exit_count = 0;
 static void replacement_exit_sb(int status) {
     int count = __sync_add_and_fetch(&g_exit_count, 1);
     if (status == 0) {
-        sb_log("RUNLOOP_FIX: exit(0) #%d caught — blocking", count);
-        /* Block ALL exit(0) calls — SpringBoard must stay alive.
-         * Sleep forever on whatever thread called exit. */
+        /* Check if we're on the main thread */
+        int is_main = pthread_main_np();
+        sb_log("RUNLOOP_FIX: exit(0) #%d caught (main_thread=%d)", count, is_main);
+
+        if (is_main && count == 1) {
+            /* First exit(0) on the main thread — this is the CRT calling
+             * exit after main() returned (FBSystemAppMain → jmp UIApplicationMain
+             * → _run → GSEventRun → returns → _run returns → UIApplicationMain
+             * returns → main returns → exit(0)).
+             *
+             * Enter the pump HERE on the main thread. This keeps the entire
+             * process alive with all dispatch queues and XPC handlers intact. */
+            sb_pump_loop("exit(0) main thread");
+            /* unreachable */
+        }
+
+        /* Background thread or subsequent exit — just block */
         while (1) {
             sleep(60);
         }

@@ -312,6 +312,9 @@ typedef union {
 } bootstrap_reply_t;
 
 /* Replacement bootstrap_look_up */
+static void bfix_remember_port_name(mach_port_t port, const char *name);
+static const char *bfix_lookup_port_name(mach_port_t port);
+
 kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
                                              const name_t service_name,
                                              mach_port_t *service_port) {
@@ -368,6 +371,7 @@ kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
     if (reply.head.msgh_bits & MACH_MSGH_BITS_COMPLEX) {
         *service_port = reply.port_reply.port.name;
         bfix_log("[bfix] look_up('%s'): found port 0x%x\n", service_name, *service_port);
+        bfix_remember_port_name(*service_port, service_name);
         return KERN_SUCCESS;
     }
 
@@ -434,6 +438,7 @@ kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
     if (reply.head.msgh_bits & MACH_MSGH_BITS_COMPLEX) {
         *service_port = reply.port_reply.port.name;
         bfix_log("[bfix] check_in('%s'): got port 0x%x\n", service_name, *service_port);
+        bfix_remember_port_name(*service_port, service_name);
         /* Track processinfoservice port unconditionally (any process) */
         if (strstr(service_name, "processinfoservice")) {
             g_processinfoservice_port = *service_port;
@@ -1637,6 +1642,19 @@ static void replacement_xpc_connection_check_in(void *conn) {
     }
     int is_assertiond = (conn_name && strncmp(conn_name, "com.apple.assertiond.", 21) == 0);
 
+    /* Force is_listener for known SpringBoard LISTENER services.
+     * The is_listener flag at obj[0xd9] & 0x2 is unreliable in this
+     * libxpc version (shows 0 for actual listeners). */
+    int is_sb_listener = (conn_name && (
+        strstr(conn_name, "frontboard.workspace") ||
+        strstr(conn_name, "frontboard.systemappservices") ||
+        strstr(conn_name, "springboard.gsEvents") ||
+        strstr(conn_name, "PurpleSystemAppPort")));
+    if (is_sb_listener && !is_listener) {
+        is_listener = 1;
+        bfix_log("[bfix] _xpc_connection_check_in: forcing is_listener=1 for '%s'\n", conn_name);
+    }
+
     if (is_assertiond) {
         bfix_log("[bfix] CHECK_IN ASSERTIOND '%s' conn=%p listener=%d\n",
                  conn_name, conn, is_listener);
@@ -1658,6 +1676,75 @@ static void replacement_xpc_connection_check_in(void *conn) {
     mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
     mach_port_t port2 = *(mach_port_t *)(obj + 0x3c);
     mach_port_t send_right = *(mach_port_t *)(obj + 0x38);
+
+    /* If name not found via offsets, try the port→name table, then
+     * try to identify the service by doing look_ups for known listener names */
+    if ((!conn_name || strcmp(conn_name, "?") == 0) && port1 != MACH_PORT_NULL) {
+        const char *table_name = bfix_lookup_port_name(port1);
+        if (table_name) {
+            conn_name = table_name;
+        } else {
+            /* Try known listener service names */
+            static const char *known_listeners[] = {
+                "com.apple.frontboard.workspace",
+                "com.apple.frontboard.systemappservices",
+                NULL
+            };
+            for (int i = 0; known_listeners[i]; i++) {
+                mach_port_t test_port = MACH_PORT_NULL;
+                kern_return_t kr = replacement_bootstrap_look_up(
+                    get_bootstrap_port(), (char *)known_listeners[i], &test_port);
+                if (kr == KERN_SUCCESS && test_port == port1) {
+                    conn_name = known_listeners[i];
+                    bfix_remember_port_name(port1, conn_name);
+                    bfix_log("[bfix] _xpc_connection_check_in: identified port 0x%x as '%s'\n",
+                             port1, conn_name);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Log all check-ins with service name for debugging */
+    bfix_log("[bfix] _xpc_connection_check_in: '%s' conn=%p listener=%d port1=0x%x port2=0x%x send=0x%x\n",
+             conn_name ? conn_name : "?", conn, is_listener, port1, port2, send_right);
+
+    /* For LISTENER connections, we need a RECEIVE right, not a SEND right.
+     * _xpc_look_up_endpoint always does look_up (returns send right).
+     * For LISTENER mode, we need check_in (returns receive right).
+     *
+     * Detection: check if we have a send right but not a receive right
+     * for this port. If so, do check_in to get the receive right. */
+    if (port1 != MACH_PORT_NULL && conn_name && strcmp(conn_name, "?") != 0) {
+        /* We have a name — check if this should be a listener (check_in) */
+        int needs_recv = (strstr(conn_name, "frontboard.workspace") ||
+                          strstr(conn_name, "frontboard.systemappservices"));
+        if (needs_recv) {
+            mach_port_t recv_port = MACH_PORT_NULL;
+            kern_return_t kr = replacement_bootstrap_check_in(
+                get_bootstrap_port(), (char *)conn_name, &recv_port);
+            if (kr == KERN_SUCCESS && recv_port != MACH_PORT_NULL) {
+                bfix_log("[bfix] _xpc_connection_check_in: '%s' upgraded send→recv: "
+                         "old=0x%x new=0x%x\n", conn_name, port1, recv_port);
+                port1 = recv_port;
+                *(mach_port_t *)(obj + 0x34) = port1;
+                port2 = recv_port;
+                *(mach_port_t *)(obj + 0x3c) = port2;
+            }
+        }
+    }
+    /* If port1 is 0 but we can identify the service, try check_in */
+    if (port1 == MACH_PORT_NULL && conn_name && strcmp(conn_name, "?") != 0) {
+        mach_port_t checked_in_port = MACH_PORT_NULL;
+        kern_return_t kr = replacement_bootstrap_check_in(
+            get_bootstrap_port(), (char *)conn_name, &checked_in_port);
+        if (kr == KERN_SUCCESS && checked_in_port != MACH_PORT_NULL) {
+            port1 = checked_in_port;
+            *(mach_port_t *)(obj + 0x34) = port1;
+            bfix_log("[bfix] _xpc_connection_check_in: '%s' check_in → port 0x%x\n",
+                     conn_name, port1);
+        }
+    }
 
     /* If send_right is 0 (not populated by _xpc_look_up_endpoint), use the
      * bootstrap port as the registration target. The broker will receive and
@@ -1940,6 +2027,11 @@ static mach_port_t replacement_xpc_look_up_endpoint(
         } else {
             bfix_log("[bfix] _xpc_look_up_endpoint '%s': port=0x%x\n", name, port);
         }
+    }
+
+    /* Remember port→name mapping for _xpc_connection_check_in lookup */
+    if (port != MACH_PORT_NULL && name) {
+        bfix_remember_port_name(port, name);
     }
 
     return port;
