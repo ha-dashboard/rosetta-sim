@@ -1642,17 +1642,86 @@ static void replacement_xpc_connection_check_in(void *conn) {
     }
     int is_assertiond = (conn_name && strncmp(conn_name, "com.apple.assertiond.", 21) == 0);
 
-    /* Force is_listener for known SpringBoard LISTENER services.
-     * The is_listener flag at obj[0xd9] & 0x2 is unreliable in this
-     * libxpc version (shows 0 for actual listeners). */
+    /* For known SpringBoard LISTENER services, handle the full LISTENER
+     * check_in ourselves. The springboard_shim already populated port1
+     * with the recv port via bootstrap_check_in. We just need to do:
+     * state=6, flag 0x40, port_destroyed, 52-byte reg msg, dispatch_mach_connect.
+     *
+     * We return early to prevent the CLIENT path from double-connecting. */
     int is_sb_listener = (conn_name && (
         strstr(conn_name, "frontboard.workspace") ||
-        strstr(conn_name, "frontboard.systemappservices") ||
-        strstr(conn_name, "springboard.gsEvents") ||
-        strstr(conn_name, "PurpleSystemAppPort")));
-    if (is_sb_listener && !is_listener) {
-        is_listener = 1;
-        bfix_log("[bfix] _xpc_connection_check_in: forcing is_listener=1 for '%s'\n", conn_name);
+        strstr(conn_name, "frontboard.systemappservices")));
+
+    if (is_sb_listener) {
+        mach_port_t fl_port1 = *(mach_port_t *)(obj + 0x34);
+        mach_port_t fl_port2 = *(mach_port_t *)(obj + 0x3c);
+        mach_port_t fl_send = *(mach_port_t *)(obj + 0x38);
+        void *fl_channel = *(void **)(obj + 0x58);
+
+        bfix_log("[bfix] FORCE_LISTENER '%s': port1=0x%x port2=0x%x send=0x%x channel=%p\n",
+                 conn_name, fl_port1, fl_port2, fl_send, fl_channel);
+
+        if (fl_port1 == MACH_PORT_NULL) {
+            mach_port_t recv = MACH_PORT_NULL;
+            replacement_bootstrap_check_in(get_bootstrap_port(), (char *)conn_name, &recv);
+            if (recv != MACH_PORT_NULL) {
+                fl_port1 = recv;
+                fl_port2 = recv;
+                *(mach_port_t *)(obj + 0x34) = fl_port1;
+                *(mach_port_t *)(obj + 0x3c) = fl_port2;
+            }
+        }
+
+        if (fl_port1 == MACH_PORT_NULL || !fl_channel) {
+            bfix_log("[bfix] FORCE_LISTENER '%s': ABORT — port1=0x%x channel=%p\n",
+                     conn_name, fl_port1, fl_channel);
+            return;
+        }
+
+        if (fl_send == MACH_PORT_NULL) {
+            fl_send = get_bootstrap_port();
+            *(mach_port_t *)(obj + 0x38) = fl_send;
+        }
+
+        /* Set flag 0x40 */
+        *(uint16_t *)(obj + 0xd8) = *(uint16_t *)(obj + 0xd8) | 0x40;
+
+        /* Port destroyed notification */
+        {
+            typedef int (*setup_fn)(mach_port_t, mach_port_t, int *);
+            static setup_fn g_setup = NULL;
+            if (!g_setup) {
+                g_setup = (setup_fn)dlsym(RTLD_DEFAULT, "_xpc_mach_port_setup_port_destroyed");
+                if (!g_setup) g_setup = (setup_fn)find_original_function("_xpc_mach_port_setup_port_destroyed");
+            }
+            if (g_setup) { int result = 0; g_setup(fl_port2, fl_port1, &result); }
+        }
+
+        /* dispatch_mach_connect with registration message */
+        if (!g_dispatch_mach_connect)
+            g_dispatch_mach_connect = (dispatch_mach_connect_fn)dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
+
+        mach_msg_header_t *msg_ptr = NULL;
+        dispatch_mach_msg_t dmsg = dispatch_mach_msg_create(NULL, 0x34, NULL, &msg_ptr);
+        if (dmsg && msg_ptr) {
+            uint8_t *m = (uint8_t *)msg_ptr;
+            *(uint32_t *)(m+0x00)=0x80000013; *(uint32_t *)(m+0x04)=0x34;
+            *(uint32_t *)(m+0x08)=fl_send; *(uint32_t *)(m+0x0c)=0;
+            *(uint32_t *)(m+0x10)=0; *(uint32_t *)(m+0x14)=0x77303074;
+            *(uint32_t *)(m+0x18)=2;
+            *(uint32_t *)(m+0x1c)=fl_port1; *(uint32_t *)(m+0x20)=0;
+            *(uint16_t *)(m+0x24)=0; *(uint8_t *)(m+0x26)=0x14; *(uint8_t *)(m+0x27)=0;
+            *(uint32_t *)(m+0x28)=fl_port2; *(uint32_t *)(m+0x2c)=0;
+            *(uint16_t *)(m+0x30)=0; *(uint8_t *)(m+0x32)=0x10; *(uint8_t *)(m+0x33)=0;
+            bfix_log("[bfix] FORCE_LISTENER '%s': dispatch_mach_connect(recv=0x%x send=0x%x)\n",
+                     conn_name, fl_port1, fl_send);
+            g_dispatch_mach_connect(fl_channel, fl_port1, fl_port2, dmsg);
+        } else {
+            g_dispatch_mach_connect(fl_channel, fl_port1, fl_port2, NULL);
+        }
+
+        bfix_log("[bfix] FORCE_LISTENER '%s': DONE recv=0x%x\n", conn_name, fl_port1);
+        return;
     }
 
     if (is_assertiond) {
@@ -1769,7 +1838,14 @@ static void replacement_xpc_connection_check_in(void *conn) {
     }
 
     if (!is_listener) {
-        /* CLIENT: same as original — no registration message */
+        /* CLIENT: same as original — no registration message.
+         * BUT skip for known SB listener services — we handle them above
+         * and don't want a double dispatch_mach_connect. */
+        if (is_sb_listener) {
+            bfix_log("[bfix] _xpc_connection_check_in: SKIP CLIENT connect for SB listener '%s'\n",
+                     conn_name ? conn_name : "?");
+            return;
+        }
         g_dispatch_mach_connect(channel, port1, port2, NULL);
         bfix_log("[bfix] _xpc_connection_check_in: CLIENT channel=%p port1=0x%x\n",
                  channel, port1);

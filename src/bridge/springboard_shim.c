@@ -434,91 +434,49 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
         /* === LISTENER MODE === */
 
         /* Call real function — bootstrap_fix trampolines handle routing */
+        /* For known SB listener services: get the recv port FIRST, then
+         * create the connection as CLIENT (to prevent internal check_in from
+         * calling dispatch_mach_connect with port=0). The recv port is set
+         * on the connection object before returning, so when resume triggers
+         * _xpc_connection_check_in, our FORCE_LISTENER path in bootstrap_fix
+         * handles it with the correct port. */
+        int is_workspace = (strstr(name, "frontboard.workspace") ||
+                            strstr(name, "frontboard.systemappservices"));
+
+        if (is_workspace) {
+            /* Step 1: Get recv port via MIG check_in */
+            mach_port_t recv_port = MACH_PORT_NULL;
+            kern_return_t kr = bootstrap_check_in(g_broker_port, name, &recv_port);
+            sb_log("LISTENER_PRECHECK: '%s' check_in → port 0x%x (kr=%d)", name, recv_port, kr);
+
+            /* Step 2: Create as CLIENT (flag=0) to avoid internal LISTENER check_in.
+             * The internal check_in for CLIENT does dispatch_mach_connect(port, port, NULL)
+             * which is safe and doesn't send a registration message. */
+            sb_log("xpc_create_mach_service CLIENT-AS-LISTENER '%s'", name);
+            xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, 0);
+            sb_log("  real CLIENT-AS-LISTENER '%s' → %p", name, conn);
+
+            if (conn && recv_port != MACH_PORT_NULL) {
+                uint8_t *obj = (uint8_t *)conn;
+                /* Set the recv port so FORCE_LISTENER in bootstrap_fix uses it */
+                *(mach_port_t *)(obj + 0x34) = recv_port;
+                *(mach_port_t *)(obj + 0x3c) = recv_port;
+                /* Set LISTENER flag so bootstrap_fix check_in knows */
+                *(uint8_t *)(obj + 0xd9) |= 0x2;
+                sb_log("LISTENER_PORT_FIX: '%s' set recv=0x%x + listener flag", name, recv_port);
+            }
+
+            sb_track_assertiond_conn(name, conn);
+            return conn;
+        }
+
+        /* Non-workspace LISTENER: pass through as-is */
         sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
         if (g_real_xpc_create_mach_service) {
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
-            sb_log("  real LISTENER '%s' → %p (queue=%p main=%p)", name, conn,
-                   (void *)targetq, (void *)dispatch_get_main_queue());
+            sb_log("  real LISTENER '%s' → %p", name, conn);
             sb_log_listener_fields(name, conn);
             sb_track_assertiond_conn(name, conn);
-
-            /* After xpc_connection_create_mach_service returns, the 805 check-in
-             * has already happened internally. But libxpc may not have correctly
-             * parsed our broker's 805 reply, leaving port1 (obj+0x34) as 0.
-             *
-             * Fix: if port1 is NULL, do a manual MIG check_in to get the
-             * receive right and store it. This MUST happen before resume. */
-            if (conn) {
-                uint8_t *obj = (uint8_t *)conn;
-                mach_port_t port1 = *(mach_port_t *)(obj + 0x34);
-
-                sb_log("LISTENER_PORT_CHECK: '%s' port1=0x%x flags=0x%x/0x%x",
-                       name, port1,
-                       (unsigned)*(uint8_t *)(obj + 0xd8),
-                       (unsigned)*(uint8_t *)(obj + 0xd9));
-
-                /* Get recv port via check_in (regardless of current port1 state).
-                 * _xpc_connection_check_in already ran inside create_mach_service
-                 * with port1=0 or a send right, so we need to re-connect the
-                 * dispatch_mach channel with the correct recv port. */
-                mach_port_t recv_port = MACH_PORT_NULL;
-                kern_return_t kr = bootstrap_check_in(g_broker_port,
-                    name, &recv_port);
-                if (kr == KERN_SUCCESS && recv_port != MACH_PORT_NULL) {
-                    *(mach_port_t *)(obj + 0x34) = recv_port;
-                    *(mach_port_t *)(obj + 0x3c) = recv_port;
-                    sb_log("LISTENER_PORT_FIX: '%s' recv port 0x%x (was 0x%x)",
-                           name, recv_port, port1);
-
-                    /* Re-connect the dispatch_mach channel with the recv port.
-                     * The channel at obj+0x58 was already set up by the internal
-                     * check_in, but with the wrong port. We call dispatch_mach_connect
-                     * again with the correct recv port. */
-                    void *channel = *(void **)(obj + 0x58);
-                    if (channel) {
-                        typedef void (*dmc_fn)(void *, mach_port_t, mach_port_t, void *);
-                        dmc_fn dmc = (dmc_fn)dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
-                        if (dmc) {
-                            /* Build 52-byte registration message for broker */
-                            extern void *dispatch_mach_msg_create(void *, size_t, void *,
-                                mach_msg_header_t **);
-                            mach_msg_header_t *msg_ptr = NULL;
-                            void *dmsg = dispatch_mach_msg_create(NULL, 0x34, NULL, &msg_ptr);
-                            if (dmsg && msg_ptr) {
-                                uint8_t *m = (uint8_t *)msg_ptr;
-                                *(uint32_t *)(m + 0x00) = 0x80000013;
-                                *(uint32_t *)(m + 0x04) = 0x34;
-                                *(uint32_t *)(m + 0x08) = g_broker_port;
-                                *(uint32_t *)(m + 0x0c) = 0;
-                                *(uint32_t *)(m + 0x10) = 0;
-                                *(uint32_t *)(m + 0x14) = 0x77303074;
-                                *(uint32_t *)(m + 0x18) = 2;
-                                *(uint32_t *)(m + 0x1c) = recv_port;
-                                *(uint32_t *)(m + 0x20) = 0;
-                                *(uint16_t *)(m + 0x24) = 0;
-                                *(uint8_t *)(m + 0x26) = 0x14;
-                                *(uint8_t *)(m + 0x27) = 0x00;
-                                *(uint32_t *)(m + 0x28) = recv_port;
-                                *(uint32_t *)(m + 0x2c) = 0;
-                                *(uint16_t *)(m + 0x30) = 0;
-                                *(uint8_t *)(m + 0x32) = 0x10;
-                                *(uint8_t *)(m + 0x33) = 0x00;
-                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect(channel=%p, recv=0x%x, dmsg=%p)",
-                                       name, channel, recv_port, dmsg);
-                                dmc(channel, recv_port, recv_port, dmsg);
-                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect DONE", name);
-                            } else {
-                                sb_log("LISTENER_PORT_FIX: '%s' dispatch_mach_connect (no reg msg)",
-                                       name);
-                                dmc(channel, recv_port, recv_port, NULL);
-                            }
-                        }
-                    }
-                } else {
-                    sb_log("LISTENER_PORT_FIX: '%s' check_in FAILED (kr=%d)", name, kr);
-                }
-            }
-
             return conn;
         }
 
