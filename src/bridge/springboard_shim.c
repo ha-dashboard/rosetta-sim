@@ -740,10 +740,221 @@ __attribute__((section("__DATA,__interpose"))) = {
       (const void *)BSDeserializeBSXPCEncodableObjectFromXPCDictionaryWithKey },
 };
 
+/* ================================================================
+ * NSAssertionHandler suppression (diagnostic — log instead of abort)
+ *
+ * SpringBoard init hits various assertions in our minimal env.
+ * We keep assertion suppression as a safety net but the primary fix
+ * for step 12 is the FBApplicationLibrary swizzle below.
+ * ================================================================ */
+
+static IMP g_orig_handleFailureInMethod = NULL;
+static IMP g_orig_handleFailureInFunction = NULL;
+
+static void replacement_handleFailureInMethod(id self, SEL _cmd,
+    SEL method, id object, id file, NSInteger line, id desc, ...) {
+    const char *method_name = method ? sel_getName(method) : "?";
+    const char *file_str = "?";
+    if (file)
+        file_str = ((const char *(*)(id, SEL))objc_msgSend)(file, sel_registerName("UTF8String"));
+    const char *desc_str = desc ?
+        ((const char *(*)(id, SEL))objc_msgSend)(desc, sel_registerName("UTF8String")) : "?";
+    sb_log("ASSERT_SUPPRESSED [method] -%s in %s:%ld: %s",
+           method_name, file_str, (long)line, desc_str);
+}
+
+static void replacement_handleFailureInFunction(id self, SEL _cmd,
+    id function, id file, NSInteger line, id desc, ...) {
+    const char *func_str = function ?
+        ((const char *(*)(id, SEL))objc_msgSend)(function, sel_registerName("UTF8String")) : "?";
+    const char *file_str = file ?
+        ((const char *(*)(id, SEL))objc_msgSend)(file, sel_registerName("UTF8String")) : "?";
+    const char *desc_str = desc ?
+        ((const char *(*)(id, SEL))objc_msgSend)(desc, sel_registerName("UTF8String")) : "?";
+    sb_log("ASSERT_SUPPRESSED [function] %s in %s:%ld: %s",
+           func_str, file_str, (long)line, desc_str);
+}
+
+static void install_assertion_suppression(void) {
+    Class cls = objc_getClass("NSAssertionHandler");
+    if (!cls) { sb_log("ASSERT: NSAssertionHandler class not found"); return; }
+
+    SEL methodSel = sel_registerName("handleFailureInMethod:object:file:lineNumber:description:");
+    Method m = class_getInstanceMethod(cls, methodSel);
+    if (m) {
+        g_orig_handleFailureInMethod = method_setImplementation(m, (IMP)replacement_handleFailureInMethod);
+        sb_log("ASSERT: swizzled handleFailureInMethod");
+    }
+
+    SEL funcSel = sel_registerName("handleFailureInFunction:file:lineNumber:description:");
+    Method m2 = class_getInstanceMethod(cls, funcSel);
+    if (m2) {
+        g_orig_handleFailureInFunction = method_setImplementation(m2, (IMP)replacement_handleFailureInFunction);
+        sb_log("ASSERT: swizzled handleFailureInFunction");
+    }
+}
+
+/* ================================================================
+ * FBApplicationLibrary — empty app catalog
+ *
+ * Step 12 of FBSystemAppMain calls [FBSystemApp sharedApplicationLibrary]
+ * which inits FBApplicationLibrary and calls _load, enumerating apps
+ * via LSApplicationWorkspace. In our minimal env, this returns nil
+ * proxies → assertions → NSException (nil URL).
+ *
+ * Fix: swizzle _load to no-op and allInstalledApplications to return @[].
+ * This lets SB proceed past step 12 without touching LaunchServices.
+ * ================================================================ */
+
+static IMP g_orig_fb_applib_load = NULL;
+static IMP g_orig_fb_applib_allInstalled = NULL;
+
+/* Replacement for -[FBApplicationLibrary _load] — no-op */
+static void replacement_fb_applib_load(id self, SEL _cmd) {
+    sb_log("FB_APPLIB: _load intercepted — returning empty (no app enumeration)");
+    /* Don't call original — it would enumerate LSApplicationWorkspace */
+}
+
+/* Replacement for -[FBApplicationLibrary allInstalledApplications] — return @[] */
+static id replacement_fb_applib_allInstalled(id self, SEL _cmd) {
+    sb_log("FB_APPLIB: allInstalledApplications → empty array");
+    return ((id(*)(id, SEL))objc_msgSend)(
+        (id)objc_getClass("NSArray"), sel_registerName("array"));
+}
+
+static void install_fb_applib_swizzle(void) {
+    /* Try synchronously first — FrontBoard may already be loaded */
+    Class cls = objc_getClass("FBApplicationLibrary");
+    if (!cls) {
+        /* Force-load FrontBoard framework so the class is available */
+        void *fb = dlopen("/System/Library/PrivateFrameworks/FrontBoard.framework/FrontBoard", RTLD_LAZY);
+        if (fb) sb_log("FB_APPLIB: force-loaded FrontBoard");
+        cls = objc_getClass("FBApplicationLibrary");
+    }
+    if (!cls) {
+        /* Fall back to async polling if still not available */
+        sb_log("FB_APPLIB: class not available yet, deferring to async poll");
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            for (int i = 0; i < 200; i++) {
+                Class c = objc_getClass("FBApplicationLibrary");
+                if (c) {
+                    SEL loadSel = sel_registerName("_load");
+                    Method loadM = class_getInstanceMethod(c, loadSel);
+                    if (loadM) {
+                        g_orig_fb_applib_load = method_setImplementation(loadM, (IMP)replacement_fb_applib_load);
+                        sb_log("FB_APPLIB: swizzled _load (async)");
+                    }
+                    SEL allSel = sel_registerName("allInstalledApplications");
+                    Method allM = class_getInstanceMethod(c, allSel);
+                    if (allM) {
+                        g_orig_fb_applib_allInstalled = method_setImplementation(allM, (IMP)replacement_fb_applib_allInstalled);
+                        sb_log("FB_APPLIB: swizzled allInstalledApplications (async)");
+                    }
+                    return;
+                }
+                usleep(50000);
+            }
+            sb_log("FB_APPLIB: FAILED — class not found after 10s");
+        });
+        return;
+    }
+
+    /* Synchronous install */
+    SEL loadSel = sel_registerName("_load");
+    Method loadM = class_getInstanceMethod(cls, loadSel);
+    if (loadM) {
+        g_orig_fb_applib_load = method_setImplementation(loadM, (IMP)replacement_fb_applib_load);
+        sb_log("FB_APPLIB: swizzled _load (sync)");
+    }
+
+    SEL allSel = sel_registerName("allInstalledApplications");
+    Method allM = class_getInstanceMethod(cls, allSel);
+    if (allM) {
+        g_orig_fb_applib_allInstalled = method_setImplementation(allM, (IMP)replacement_fb_applib_allInstalled);
+        sb_log("FB_APPLIB: swizzled allInstalledApplications (sync)");
+    }
+}
+
+/* ================================================================
+ * UIApplication._fetchInfoPlistFlags crash fix
+ *
+ * SpringBoard's UIApplication init calls _fetchInfoPlistFlags which
+ * calls xpc_copy_bootstrap() — a private libxpc function that tries
+ * to get the bootstrap dictionary from launchd. In our environment
+ * this segfaults because we're not running under real launchd.
+ *
+ * Fix: swizzle _fetchInfoPlistFlags to skip when bundle info is nil.
+ * Same approach as rosettasim_bridge.m uses for the app process.
+ * ================================================================ */
+
+static IMP g_orig_fetchInfoPlistFlags = NULL;
+
+static void replacement_fetchInfoPlistFlags(id self, SEL _cmd) {
+    /* Check if main bundle has an info dictionary. If not, skip to
+     * avoid the xpc_copy_bootstrap crash. For SpringBoard, the main
+     * bundle is the SpringBoard.app bundle. */
+    id mainBundle = ((id(*)(id, SEL))objc_msgSend)(
+        (id)objc_getClass("NSBundle"), sel_registerName("mainBundle"));
+    id info = mainBundle ?
+        ((id(*)(id, SEL))objc_msgSend)(mainBundle, sel_registerName("infoDictionary")) : NULL;
+
+    if (!info) {
+        sb_log("FETCHINFO: _fetchInfoPlistFlags skipped — no infoDictionary");
+        return;
+    }
+
+    /* infoDictionary exists — try calling original but guard against crash */
+    if (g_orig_fetchInfoPlistFlags) {
+        sb_log("FETCHINFO: _fetchInfoPlistFlags calling original");
+        ((void(*)(id, SEL))g_orig_fetchInfoPlistFlags)(self, _cmd);
+    }
+}
+
+static void install_fetchinfo_swizzle(void) {
+    /* Try synchronous first — UIKit should be loaded by SpringBoard */
+    Class cls = objc_getClass("UIApplication");
+    if (!cls) {
+        /* Force-load UIKit */
+        void *uikit = dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY);
+        if (uikit) sb_log("FETCHINFO: force-loaded UIKit");
+        cls = objc_getClass("UIApplication");
+    }
+    if (cls) {
+        SEL sel = sel_registerName("_fetchInfoPlistFlags");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            g_orig_fetchInfoPlistFlags = method_setImplementation(m, (IMP)replacement_fetchInfoPlistFlags);
+            sb_log("FETCHINFO: swizzled UIApplication._fetchInfoPlistFlags (sync)");
+            return;
+        }
+    }
+    /* Fallback: async poll */
+    sb_log("FETCHINFO: UIApplication not available yet, deferring");
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        for (int i = 0; i < 200; i++) {
+            Class c = objc_getClass("UIApplication");
+            if (c) {
+                SEL s = sel_registerName("_fetchInfoPlistFlags");
+                Method mt = class_getInstanceMethod(c, s);
+                if (mt) {
+                    g_orig_fetchInfoPlistFlags = method_setImplementation(mt, (IMP)replacement_fetchInfoPlistFlags);
+                    sb_log("FETCHINFO: swizzled (async)");
+                    return;
+                }
+            }
+            usleep(50000);
+        }
+        sb_log("FETCHINFO: FAILED — not found after 10s");
+    });
+}
+
 /* Constructor — runs before SpringBoard's main */
 __attribute__((constructor))
 static void sb_shim_init(void) {
     sb_log("SpringBoard shim loaded (PID %d)", getpid());
     init_broker_port();
+    install_assertion_suppression();
+    install_fb_applib_swizzle();
+    install_fetchinfo_swizzle();
     install_bks_bootstrap_swizzle();
 }
