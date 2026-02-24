@@ -54,6 +54,205 @@ static void bfix_log(const char *fmt, ...) {
     if (len > 0) write(STDERR_FILENO, buf, len);
 }
 
+/* Track processinfoservice receive port for diagnostic probing.
+ * Set when assertiond checks in for com.apple.assertiond.processinfoservice
+ * via the MIG check_in path. If the XPC pipe check_in (routine=805)
+ * delivers the port instead, this stays NULL. */
+static mach_port_t g_processinfoservice_port = MACH_PORT_NULL;
+static int g_is_assertiond = 0; /* set in constructor if process is assertiond */
+
+/* Forward declarations for functions defined later */
+static mach_port_t get_bootstrap_port(void);
+kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
+                                              const name_t service_name,
+                                              mach_port_t *service_port);
+
+/* ================================================================
+ * MobileGestalt stub (ROSETTASIM_MG_STUB=1)
+ *
+ * Interposes MGCopyAnswer, MGCopyAnswerWithError, and MGGetBoolAnswer
+ * to bypass the NSXPC path to com.apple.mobilegestalt.xpc which returns
+ * corrupted replies in our environment. Returns sane iPhone simulator
+ * defaults for common keys; NULL/false for unknown keys.
+ * ================================================================ */
+#include <CoreFoundation/CoreFoundation.h>
+
+/* Original function pointers (saved before trampoline) */
+typedef CFPropertyListRef (*MGCopyAnswer_fn)(CFStringRef key);
+typedef CFPropertyListRef (*MGCopyAnswerWithError_fn)(CFStringRef key, void *unused, int *err);
+typedef int (*MGGetBoolAnswer_fn)(CFStringRef key);
+
+static MGCopyAnswer_fn g_orig_MGCopyAnswer = NULL;
+static int g_mg_stub_active = 0;
+static int g_mg_log_count = 0;
+
+/* Rate-limited key logger — logs first 50 unique keys */
+static void mg_log_key(const char *func, CFStringRef key) {
+    if (g_mg_log_count >= 50) return;
+    char buf[256] = {0};
+    if (key) CFStringGetCString(key, buf, sizeof(buf), kCFStringEncodingUTF8);
+    bfix_log("[bfix] MG_STUB %s('%s')\n", func, buf);
+    g_mg_log_count++;
+}
+
+static CFPropertyListRef replacement_MGCopyAnswer(CFStringRef key) {
+    if (!g_mg_stub_active || !key) {
+        return g_orig_MGCopyAnswer ? g_orig_MGCopyAnswer(key) : NULL;
+    }
+    mg_log_key("MGCopyAnswer", key);
+
+    /* Common simulator defaults (iPhone 6s / iPhone8,1) */
+    if (CFStringCompare(key, CFSTR("ProductType"), 0) == 0)
+        return CFRetain(CFSTR("iPhone8,1"));
+    if (CFStringCompare(key, CFSTR("HWModelStr"), 0) == 0)
+        return CFRetain(CFSTR("N71AP"));
+    if (CFStringCompare(key, CFSTR("DeviceClassNumber"), 0) == 0)
+        return CFRetain((__bridge CFTypeRef)@(1)); /* 1 = iPhone */
+    if (CFStringCompare(key, CFSTR("DeviceClass"), 0) == 0)
+        return CFRetain(CFSTR("iPhone"));
+    if (CFStringCompare(key, CFSTR("DeviceName"), 0) == 0)
+        return CFRetain(CFSTR("iPhone"));
+    if (CFStringCompare(key, CFSTR("UserAssignedDeviceName"), 0) == 0)
+        return CFRetain(CFSTR("RosettaSim iPhone"));
+    if (CFStringCompare(key, CFSTR("BuildVersion"), 0) == 0)
+        return CFRetain(CFSTR("14E8301"));
+    if (CFStringCompare(key, CFSTR("ProductVersion"), 0) == 0)
+        return CFRetain(CFSTR("10.3.1"));
+    if (CFStringCompare(key, CFSTR("UniqueDeviceID"), 0) == 0)
+        return CFRetain(CFSTR("ROSETTASIM-0000-0000-0000-000000000000"));
+    if (CFStringCompare(key, CFSTR("ComputerName"), 0) == 0)
+        return CFRetain(CFSTR("RosettaSim"));
+    if (CFStringCompare(key, CFSTR("DeviceSupportsNavigationUI"), 0) == 0)
+        return CFRetain(kCFBooleanTrue);
+    if (CFStringCompare(key, CFSTR("DeviceSupports3DMaps"), 0) == 0)
+        return CFRetain(kCFBooleanTrue);
+    if (CFStringCompare(key, CFSTR("ArtworkTraits"), 0) == 0)
+        return NULL; /* complex — skip */
+
+    /* For unknown keys, return NULL (not found) rather than calling
+     * the real function which would hit the broken NSXPC path. */
+    return NULL;
+}
+
+static CFPropertyListRef replacement_MGCopyAnswerWithError(
+    CFStringRef key, void *unused, int *err) {
+    if (!g_mg_stub_active) return NULL;
+    /* Delegate to MGCopyAnswer stub (ignore unused). */
+    (void)unused;
+    if (err) *err = 0;
+    return replacement_MGCopyAnswer(key);
+}
+
+static int replacement_MGGetBoolAnswer(CFStringRef key) {
+    if (!g_mg_stub_active || !key) return 0;
+    mg_log_key("MGGetBoolAnswer", key);
+
+    /* Common boolean queries */
+    if (CFStringCompare(key, CFSTR("HasBaseband"), 0) == 0) return 0;
+    if (CFStringCompare(key, CFSTR("IsSimulator"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("IsClassic"), 0) == 0) return 0;
+    if (CFStringCompare(key, CFSTR("SupportsForceTouch"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("DeviceSupportsNavigation"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("DeviceSupports1080p"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("DeviceSupports720p"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("wifi"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("telephony"), 0) == 0) return 0;
+    if (CFStringCompare(key, CFSTR("multitasking"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("opengles-2"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("armv7"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("accelerometer"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("gyroscope"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("magnetometer"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("camera-flash"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("front-facing-camera"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("auto-focus-camera"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("bluetooth"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("location-services"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("gps"), 0) == 0) return 1;
+    if (CFStringCompare(key, CFSTR("microphone"), 0) == 0) return 1;
+
+    /* Unknown bool key — default false */
+    return 0;
+}
+
+/* XPC public API declarations (from libxpc). */
+typedef void *xpc_object_t;
+typedef void *xpc_pipe_t;
+extern xpc_object_t xpc_dictionary_create(const char * const *keys,
+                                           const xpc_object_t *values,
+                                           size_t count);
+extern void xpc_dictionary_set_int64(xpc_object_t dict, const char *key, int64_t val);
+extern void xpc_dictionary_set_mach_recv(xpc_object_t dict, const char *key, mach_port_t port);
+extern int64_t xpc_dictionary_get_int64(xpc_object_t dict, const char *key);
+extern const char *xpc_dictionary_get_string(xpc_object_t dict, const char *key);
+extern void xpc_release(xpc_object_t obj);
+
+/* Original _xpc_pipe_routine saved here by trampoline setup.
+ * Since we trampoline the code, calling the original by address is complex.
+ * Instead, we handle routine=805 locally and let other routines fall through
+ * by calling the ORIGINAL function via a saved pointer. */
+typedef int (*xpc_pipe_routine_fn)(xpc_pipe_t pipe, xpc_object_t dict, xpc_object_t *reply);
+static xpc_pipe_routine_fn g_orig_xpc_pipe_routine = NULL;
+
+/* Replacement _xpc_pipe_routine for assertiond.
+ *
+ * For routine=805 (CheckIn): build the reply locally using libxpc's own
+ * dictionary API. Get the service port from our MIG bootstrap_check_in.
+ * This avoids the broken XPC pipe wire format entirely — libxpc creates
+ * the XPC dict natively, so __xpc_serializer_unpack never runs.
+ *
+ * For all other routines: fall through to the real implementation. */
+static int replacement_xpc_pipe_routine(xpc_pipe_t pipe, xpc_object_t dict,
+                                         xpc_object_t *reply) {
+    int64_t routine = xpc_dictionary_get_int64(dict, "routine");
+
+    if (routine == 805) {
+        /* CheckIn — handle locally */
+        const char *name = xpc_dictionary_get_string(dict, "name");
+        int64_t handle = xpc_dictionary_get_int64(dict, "handle");
+
+        if (!name) {
+            bfix_log("[bfix] xpc_pipe_routine 805: no service name\n");
+            if (reply) *reply = NULL;
+            return 5; /* EIO */
+        }
+
+        /* Get the port from our MIG check_in path */
+        mach_port_t svc_port = MACH_PORT_NULL;
+        kern_return_t kr = replacement_bootstrap_check_in(
+            get_bootstrap_port(), name, &svc_port);
+
+        if (kr != KERN_SUCCESS || svc_port == MACH_PORT_NULL) {
+            bfix_log("[bfix] xpc_pipe_routine 805 '%s': MIG check_in failed (kr=%d)\n",
+                     name, kr);
+            if (reply) *reply = NULL;
+            return 5;
+        }
+
+        /* Build reply dict using libxpc's own API — correct format guaranteed */
+        xpc_object_t resp = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_int64(resp, "subsystem", 3);
+        xpc_dictionary_set_int64(resp, "error", 0);
+        xpc_dictionary_set_int64(resp, "routine", 805);
+        xpc_dictionary_set_int64(resp, "handle", handle);
+        xpc_dictionary_set_mach_recv(resp, "port", svc_port);
+
+        if (reply) *reply = resp;
+        bfix_log("[bfix] xpc_pipe_routine 805 '%s': LOCAL reply with port 0x%x\n",
+                 name, svc_port);
+        return 0;
+    }
+
+    /* Non-805: fall through to real implementation.
+     * We can't easily call the original since we trampolined it.
+     * For assertiond, the only pipe routines are 805 (CheckIn) and
+     * 100 (GetJobs). GetJobs is handled by launch_msg interception.
+     * Any other routine: return error. */
+    bfix_log("[bfix] xpc_pipe_routine %lld: not handled (assertiond)\n", routine);
+    if (reply) *reply = NULL;
+    return 5; /* EIO */
+}
+
 /* Get the real bootstrap port from the kernel */
 static mach_port_t get_bootstrap_port(void) {
     mach_port_t bp = MACH_PORT_NULL;
@@ -188,7 +387,8 @@ kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
         return MACH_SEND_INVALID_DEST;
     }
 
-    bfix_log("[bfix] check_in('%s') via port 0x%x\n", service_name, real_bp);
+    bfix_log("[bfix] check_in('%s') via port 0x%x pid=%d proc=%s\n",
+             service_name, real_bp, getpid(), getprogname() ? getprogname() : "?");
 
     /* Build MIG request (same format as look_up) */
     bootstrap_lookup_request_t req;
@@ -233,6 +433,12 @@ kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
     if (reply.head.msgh_bits & MACH_MSGH_BITS_COMPLEX) {
         *service_port = reply.port_reply.port.name;
         bfix_log("[bfix] check_in('%s'): got port 0x%x\n", service_name, *service_port);
+        /* Track processinfoservice port unconditionally (any process) */
+        if (strstr(service_name, "processinfoservice")) {
+            g_processinfoservice_port = *service_port;
+            bfix_log("[bfix] *** TRACKING processinfoservice recv port 0x%x (is_assertiond=%d) ***\n",
+                     *service_port, g_is_assertiond);
+        }
         return KERN_SUCCESS;
     }
 
@@ -473,102 +679,6 @@ static launch_data_t replacement_launch_msg(launch_data_t msg) {
             bfix_log("[bfix] launch_msg CheckIn: no services found, falling through\n");
         }
 
-        /* Handle GetJobs — assertiond calls this to get its job dictionary.
-         * Without a proper response, assertiond logs "Error getting job
-         * dictionaries. Error: Input/output error (5)". */
-        if (cmd && strcmp(cmd, LAUNCH_KEY_GETJOBS) == 0) {
-            const char *progname = getprogname();
-            bfix_log("[bfix] launch_msg('GetJobs') intercepted (process: %s)\n",
-                     progname ? progname : "unknown");
-
-            static const char *assertiond_services[] = {
-                "com.apple.assertiond.applicationstateconnection",
-                "com.apple.assertiond.appwatchdog",
-                "com.apple.assertiond.expiration",
-                "com.apple.assertiond.processassertionconnection",
-                "com.apple.assertiond.processinfoservice",
-                NULL
-            };
-
-            const char *job_label = NULL;
-            const char **svc_list = NULL;
-            if (progname && strstr(progname, "assertiond")) {
-                job_label = "com.apple.assertiond";
-                svc_list = assertiond_services;
-            }
-
-            if (job_label && svc_list) {
-                /* Build: { job_label → { Label → job_label, MachServices → { svc → true } } } */
-                launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-                launch_data_t job_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-                launch_data_t ms_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-
-                int count = 0;
-                for (int i = 0; svc_list[i]; i++) {
-                    launch_data_dict_insert(ms_dict, launch_data_new_bool(1), svc_list[i]);
-                    count++;
-                }
-
-                launch_data_dict_insert(job_dict, launch_data_new_string(job_label), LAUNCH_JOBKEY_LABEL);
-                launch_data_dict_insert(job_dict, ms_dict, LAUNCH_JOBKEY_MACHSERVICES);
-                launch_data_dict_insert(resp, job_dict, job_label);
-
-                bfix_log("[bfix] launch_msg GetJobs: returning %d MachServices for %s\n",
-                         count, job_label);
-                return resp;
-            }
-
-            bfix_log("[bfix] launch_msg GetJobs: no job data for '%s', falling through\n",
-                     progname ? progname : "unknown");
-        }
-    }
-
-    /* Handle DICTIONARY form of GetJobs: { LAUNCH_KEY_GETJOBS → ... } */
-    if (msg && launch_data_get_type(msg) == LAUNCH_DATA_DICTIONARY) {
-        if (launch_data_dict_lookup(msg, LAUNCH_KEY_GETJOBS) != NULL) {
-            const char *progname = getprogname();
-            bfix_log("[bfix] launch_msg(dict GetJobs) intercepted (process: %s)\n",
-                     progname ? progname : "unknown");
-
-            static const char *assertiond_services_d[] = {
-                "com.apple.assertiond.applicationstateconnection",
-                "com.apple.assertiond.appwatchdog",
-                "com.apple.assertiond.expiration",
-                "com.apple.assertiond.processassertionconnection",
-                "com.apple.assertiond.processinfoservice",
-                NULL
-            };
-
-            const char *job_label = NULL;
-            const char **svc_list = NULL;
-            if (progname && strstr(progname, "assertiond")) {
-                job_label = "com.apple.assertiond";
-                svc_list = assertiond_services_d;
-            }
-
-            if (job_label && svc_list) {
-                launch_data_t resp = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-                launch_data_t job_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-                launch_data_t ms_dict = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
-
-                int count = 0;
-                for (int i = 0; svc_list[i]; i++) {
-                    launch_data_dict_insert(ms_dict, launch_data_new_bool(1), svc_list[i]);
-                    count++;
-                }
-
-                launch_data_dict_insert(job_dict, launch_data_new_string(job_label), LAUNCH_JOBKEY_LABEL);
-                launch_data_dict_insert(job_dict, ms_dict, LAUNCH_JOBKEY_MACHSERVICES);
-                launch_data_dict_insert(resp, job_dict, job_label);
-
-                bfix_log("[bfix] launch_msg dict GetJobs: returning %d MachServices for %s\n",
-                         count, job_label);
-                return resp;
-            }
-
-            bfix_log("[bfix] launch_msg dict GetJobs: no job data for '%s', falling through\n",
-                     progname ? progname : "unknown");
-        }
     }
 
     /* Pass through to original for unhandled messages */
@@ -1119,19 +1229,12 @@ static xpc_object_t_bfix replacement_xpc_send_sync(
 
 /* Replacement for _xpc_look_up_endpoint inside libxpc.
  *
- * This is the function that builds the XPC pipe check-in request and sends it
- * via _xpc_domain_routine. We bypass the XPC pipe protocol entirely and use
- * our broker's bootstrap_check_in/look_up directly.
+ * iOS 10.3 sim libxpc's __xpc_look_up_endpoint issues domain routine 804
+ * (endpoint lookup) and extracts reply["port"] as a mach_send.
  *
- * Signature (from disassembly):
- *   mach_port_t _xpc_look_up_endpoint(
- *     const char *name,        // rdi — service name
- *     int type,                // esi — 5=client, 7=listener
- *     uint64_t handle,         // rdx
- *     uint64_t lookup_handle,  // rcx
- *     void *something,         // r8
- *     uint64_t flags           // r9
- *   );
+ * Therefore, this replacement MUST return a send right (bootstrap_look_up),
+ * and must NOT attempt to return a receive right (check_in), regardless of
+ * the 'type' argument.
  */
 static mach_port_t replacement_xpc_look_up_endpoint(
     const char *name, int type, uint64_t handle,
@@ -1139,6 +1242,11 @@ static mach_port_t replacement_xpc_look_up_endpoint(
 
     mach_port_t port = MACH_PORT_NULL;
     mach_port_t bp = get_bootstrap_port();
+    (void)type;
+    (void)handle;
+    (void)lookup_handle;
+    (void)something;
+    (void)flags;
 
     int is_assertiond = (name && strncmp(name, "com.apple.assertiond.", 21) == 0);
     if (is_assertiond) {
@@ -1150,38 +1258,31 @@ static mach_port_t replacement_xpc_look_up_endpoint(
     }
 
     if (!name || bp == MACH_PORT_NULL) return MACH_PORT_NULL;
-
-    if (type == 7) {
-        /* LISTENER check-in: get receive right from broker */
-        kern_return_t kr = replacement_bootstrap_check_in(bp, name, &port);
-        if (kr == KERN_SUCCESS && port != MACH_PORT_NULL) {
-            bfix_remember_port_name(port, name);
-        }
+    /* Endpoint lookup: return a mach_send right. */
+    kern_return_t kr = replacement_bootstrap_look_up(bp, name, &port);
+    if (kr != KERN_SUCCESS || port == MACH_PORT_NULL) {
+        /* Service not found. Return a DEAD port instead of NULL.
+         * With NULL, xpc_connection_send_message_with_reply_sync can hang
+         * forever waiting for a dispatch event that never fires.
+         * With a dead port, the send fails immediately with
+         * MACH_SEND_INVALID_DEST and libxpc reports an error. */
+        mach_port_t dead = MACH_PORT_NULL;
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &dead);
+        /* Deallocate immediately → port becomes dead name for anyone holding send right */
+        mach_port_deallocate(mach_task_self(), dead);
+        port = dead;
         if (is_assertiond) {
-            bfix_log("[bfix] _xpc_look_up_endpoint ASSERTIOND LISTENER '%s': port=0x%x kr=%d\n",
-                     name, port, kr);
-        } else {
-            bfix_log("[bfix] _xpc_look_up_endpoint LISTENER '%s': port=0x%x (kr=%d)\n",
-                     name, port, kr);
-        }
-    } else {
-        /* CLIENT look-up: get send right from broker */
-        kern_return_t kr = replacement_bootstrap_look_up(bp, name, &port);
-        if (kr != KERN_SUCCESS || port == MACH_PORT_NULL) {
-            /* Service not found. Return a DEAD port instead of NULL.
-             * With NULL, xpc_connection_send_message_with_reply_sync hangs
-             * forever waiting for a dispatch event that never fires.
-             * With a dead port, the send fails immediately with
-             * MACH_SEND_INVALID_DEST and libxpc reports an error. */
-            mach_port_t dead = MACH_PORT_NULL;
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &dead);
-            /* Deallocate immediately → port becomes dead name for anyone holding send right */
-            mach_port_deallocate(mach_task_self(), dead);
-            port = dead;
-            bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': NOT FOUND → dead port 0x%x\n",
+            bfix_log("[bfix] _xpc_look_up_endpoint ASSERTIOND '%s': NOT FOUND → dead port 0x%x\n",
                      name, port);
         } else {
-            bfix_log("[bfix] _xpc_look_up_endpoint CLIENT '%s': port=0x%x\n", name, port);
+            bfix_log("[bfix] _xpc_look_up_endpoint '%s': NOT FOUND → dead port 0x%x\n",
+                     name, port);
+        }
+    } else {
+        if (is_assertiond) {
+            bfix_log("[bfix] _xpc_look_up_endpoint ASSERTIOND '%s': port=0x%x\n", name, port);
+        } else {
+            bfix_log("[bfix] _xpc_look_up_endpoint '%s': port=0x%x\n", name, port);
         }
     }
 
@@ -1204,23 +1305,75 @@ static void patch_bootstrap_functions(void) {
         { "bootstrap_check_in2", (void *)replacement_bootstrap_check_in },
         { "bootstrap_check_in3", (void *)replacement_bootstrap_check_in },
         { "bootstrap_register",  (void *)replacement_bootstrap_register },
-        /* Bypass the XPC pipe protocol entirely for endpoint lookups.
-         * _xpc_look_up_endpoint would send an XPC pipe message to launchd
-         * and parse the response. We replace it with direct broker calls. */
-        { "_xpc_look_up_endpoint", (void *)replacement_xpc_look_up_endpoint },
-        /* Listener registration: builds proper 52-byte registration message
-         * for dispatch_mach_connect (required for LISTENER mode to work). */
-        { "_xpc_connection_check_in", (void *)replacement_xpc_connection_check_in },
+        /* In compat mode: bypass XPC pipe protocol for endpoint lookups.
+         * In strict mode: let libxpc use the XPC pipe natively (the 805
+         * reply format is now correct with MACH_RECV=0x15000). */
+        { "_xpc_look_up_endpoint", NULL },  /* filled conditionally below */
+        { "_xpc_connection_check_in", NULL },
         /* NOTE: launch_msg runtime trampoline REMOVED — causes infinite recursion
          * because fallthrough calls the patched function. DYLD interposition handles
          * cross-library calls; intra-library calls need saved-original approach. */
     };
     int n_patches = sizeof(patches) / sizeof(patches[0]);
 
+    /* In compat mode, patch _xpc_look_up_endpoint + _xpc_connection_check_in
+     * to bypass XPC pipe and use direct MIG bootstrap calls.
+     * In strict mode, leave them NULL (unpatched) so libxpc uses the native
+     * XPC pipe protocol — which now works with correct type constants. */
+    {
+        const char *lifecycle = getenv("ROSETTASIM_LIFECYCLE_MODE");
+        int strict = (lifecycle && strcmp(lifecycle, "strict") == 0);
+        if (!strict) {
+            for (int i = 0; i < n_patches; i++) {
+                if (strcmp(patches[i].name, "_xpc_look_up_endpoint") == 0)
+                    patches[i].replacement = (void *)replacement_xpc_look_up_endpoint;
+                else if (strcmp(patches[i].name, "_xpc_connection_check_in") == 0)
+                    patches[i].replacement = (void *)replacement_xpc_connection_check_in;
+            }
+        } else {
+            bfix_log("[bfix] STRICT: skipping _xpc_look_up_endpoint + _xpc_connection_check_in patches\n");
+        }
+    }
+
     for (int i = 0; i < n_patches; i++) {
+        if (!patches[i].replacement) continue;  /* skip NULL (strict mode) */
         void *orig = find_original_function(patches[i].name);
         if (orig) {
             write_trampoline(orig, patches[i].replacement, patches[i].name);
+        }
+    }
+
+    /* Detect assertiond for diagnostic probing */
+    {
+        const char *pn = getprogname();
+        if (pn && strstr(pn, "assertiond")) g_is_assertiond = 1;
+    }
+
+    /* MobileGestalt stub: bypass NSXPC to avoid corrupted replies.
+     * Gate behind ROSETTASIM_MG_STUB=1 (set by broker for all processes). */
+    {
+        const char *mg_env = getenv("ROSETTASIM_MG_STUB");
+        if (mg_env && mg_env[0] == '1') {
+            g_mg_stub_active = 1;
+            /* Force-load libMobileGestalt.dylib so find_original_function can find it */
+            dlopen("libMobileGestalt.dylib", RTLD_LAZY);
+            void *orig_copy = find_original_function("MGCopyAnswer");
+            if (orig_copy) {
+                g_orig_MGCopyAnswer = (MGCopyAnswer_fn)orig_copy;
+                write_trampoline(orig_copy, (void *)replacement_MGCopyAnswer,
+                                 "MGCopyAnswer");
+            }
+            void *orig_copy_err = find_original_function("MGCopyAnswerWithError");
+            if (orig_copy_err) {
+                write_trampoline(orig_copy_err, (void *)replacement_MGCopyAnswerWithError,
+                                 "MGCopyAnswerWithError");
+            }
+            void *orig_bool = find_original_function("MGGetBoolAnswer");
+            if (orig_bool) {
+                write_trampoline(orig_bool, (void *)replacement_MGGetBoolAnswer,
+                                 "MGGetBoolAnswer");
+            }
+            bfix_log("[bfix] MobileGestalt stub ACTIVE (bypassing NSXPC)\n");
         }
     }
 
@@ -1332,5 +1485,53 @@ static void bootstrap_fix_constructor(void) {
         } else {
             bfix_log("[bfix] constructor: CARenderServer not found (kr=0x%x) — app process?\n", kr);
         }
+    }
+
+    /* Detect assertiond and schedule a diagnostic probe.
+     * After 8 seconds (well into the workspace handshake window), enumerate
+     * all ports and check for queued messages. This tells us if messages
+     * arrive at assertiond's listener ports but aren't being processed. */
+    const char *pn = getprogname();
+    if (pn && strstr(pn, "assertiond")) {
+        g_is_assertiond = 1;
+        bfix_log("[bfix] constructor: assertiond detected — scheduling qcount sampler\n");
+
+        /* Tight-loop qcount sampler: sample g_processinfoservice_port every 50ms
+         * for 5 seconds, starting 3 seconds after launch. This captures whether
+         * SpringBoard's bootstrap message actually arrives at the port. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{
+            mach_port_t port = g_processinfoservice_port;
+            bfix_log("[bfix] === QCOUNT SAMPLER START: port=0x%x ===\n", port);
+
+            if (port == MACH_PORT_NULL) {
+                bfix_log("[bfix] QCOUNT SAMPLER: port is NULL (not tracked)\n");
+                return;
+            }
+
+            int max_qcount = 0;
+            int max_seqno = 0;
+            for (int i = 0; i < 100; i++) { /* 100 * 50ms = 5 seconds */
+                mach_port_status_t status;
+                mach_msg_type_number_t cnt = MACH_PORT_RECEIVE_STATUS_COUNT;
+                kern_return_t kr = mach_port_get_attributes(mach_task_self(), port,
+                    MACH_PORT_RECEIVE_STATUS, (mach_port_info_t)&status, &cnt);
+
+                if (kr == KERN_SUCCESS) {
+                    if (status.mps_msgcount > 0 || (i < 5) || (i % 20 == 0)) {
+                        bfix_log("[bfix] QCOUNT[%d]: port=0x%x qcount=%d seqno=%d\n",
+                                 i, port, status.mps_msgcount, status.mps_seqno);
+                    }
+                    if (status.mps_msgcount > max_qcount) max_qcount = status.mps_msgcount;
+                    if (status.mps_seqno > max_seqno) max_seqno = status.mps_seqno;
+                } else {
+                    bfix_log("[bfix] QCOUNT[%d]: port=0x%x DEAD (kr=%d)\n", i, port, kr);
+                    break;
+                }
+                usleep(50000); /* 50ms */
+            }
+            bfix_log("[bfix] === QCOUNT SAMPLER END: max_qcount=%d max_seqno=%d ===\n",
+                     max_qcount, max_seqno);
+        });
     }
 }

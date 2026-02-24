@@ -389,6 +389,14 @@ static int _force_cpu_mode(void) {
     return (mode && strcmp(mode, "cpu") == 0);
 }
 
+/* Strict lifecycle mode: ROSETTASIM_LIFECYCLE_MODE=strict
+ * Disables UIKit lifecycle bypasses so the real FBSWorkspace/scene flow runs.
+ * Default (compat) keeps the existing swizzles/timeout/exit-blocking. */
+static int _strict_lifecycle(void) {
+    const char *m = getenv("ROSETTASIM_LIFECYCLE_MODE");
+    return (m && strcmp(m, "strict") == 0);
+}
+
 /* GPU rendering mode — when active, CARenderServer handles display compositing.
  * Set after UIKit init if CADisplay is available from CARenderServer.
  * In this mode, frame_capture_tick skips CPU rendering and copies from
@@ -812,6 +820,13 @@ static void replacement_exit(int status) {
     bridge_log("exit(%d) #%d on %s thread — source: %s",
                status, call_num, is_main ? "main" : "background", source);
 
+    /* Strict lifecycle mode: log but don't block — let the real exit happen */
+    if (_strict_lifecycle()) {
+        bridge_log("  STRICT MODE: allowing exit(%d) (real process termination)", status);
+        syscall(1, status); /* SYS_exit = 1 */
+        __builtin_unreachable();
+    }
+
     /* During startup: block ALL exits (workspace disconnect is expected) */
     if (_init_phase) {
         if (!is_main) {
@@ -929,51 +944,53 @@ static int replacement_UIApplicationMain(int argc, char *argv[],
     _saved_delegate_class_name = delegateClassName;
     _main_thread = pthread_self();
 
-    /* Install SIGUSR1 handler for workspace timeout */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = _uiam_timeout_handler;
-    sa.sa_flags = 0;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, NULL);
+    if (!_strict_lifecycle()) {
+        /* Install SIGUSR1 handler for workspace timeout (compat mode only) */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = _uiam_timeout_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+    }
 
     /* Set abort guard */
     _abort_guard_active = 1;
     int abort_result = setjmp(_abort_recovery);
 
     if (abort_result == 0) {
-        /* Safety timeout: if UIApplicationMain blocks before calling _run
-         * (e.g., FBSWorkspace handshake stalls), interrupt the main thread
-         * with SIGUSR1 after 5 seconds. The signal handler siglongjmps to
-         * _uiam_recovery which bypasses the blocked UIApplicationMain. */
-        int jmp_val = sigsetjmp(_uiam_recovery, 1);
-        if (jmp_val == 99) {
-            /* We were interrupted by the workspace timeout. UIApplicationMain
-             * is blocked — proceed with our replacement lifecycle. */
-            bridge_log("UIApplicationMain: workspace timeout fired — running replacement lifecycle");
-            _abort_guard_active = 0;
-            id app = ((id(*)(id, SEL))objc_msgSend)(
-                (id)objc_getClass("UIApplication"),
-                sel_registerName("sharedApplication"));
-            if (app) {
-                replacement_runWithMainScene(app,
-                    sel_registerName("_runWithMainScene:transitionContext:completion:"),
-                    nil, nil, nil);
-            }
-            return 0;
-        }
-
-        /* Arm the timeout */
-        _uiam_timeout_armed = 1;
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                if (_uiam_timeout_armed && !_runWithMainScene_entered) {
-                    bridge_log("UIApplicationMain TIMEOUT: _run not called after 5s — "
-                               "sending SIGUSR1 to main thread");
-                    pthread_kill(_main_thread, SIGUSR1);
+        if (!_strict_lifecycle()) {
+            /* Safety timeout: if UIApplicationMain blocks before calling _run
+             * (e.g., FBSWorkspace handshake stalls), interrupt the main thread
+             * with SIGUSR1 after 5 seconds. (compat mode only) */
+            int jmp_val = sigsetjmp(_uiam_recovery, 1);
+            if (jmp_val == 99) {
+                bridge_log("UIApplicationMain: workspace timeout fired — running replacement lifecycle");
+                _abort_guard_active = 0;
+                id app = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)objc_getClass("UIApplication"),
+                    sel_registerName("sharedApplication"));
+                if (app) {
+                    replacement_runWithMainScene(app,
+                        sel_registerName("_runWithMainScene:transitionContext:completion:"),
+                        nil, nil, nil);
                 }
-            });
+                return 0;
+            }
+
+            _uiam_timeout_armed = 1;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    if (_uiam_timeout_armed && !_runWithMainScene_entered) {
+                        bridge_log("UIApplicationMain TIMEOUT: _run not called after 5s — "
+                                   "sending SIGUSR1 to main thread");
+                        pthread_kill(_main_thread, SIGUSR1);
+                    }
+                });
+        } else {
+            bridge_log("  STRICT MODE: no SIGUSR1 timeout (real FBSWorkspace lifecycle)");
+        }
 
         /* First pass - try the original UIApplicationMain */
         bridge_log("  Calling original UIApplicationMain (attempt 1)");
@@ -7993,8 +8010,14 @@ static void rosettasim_bridge_init(void) {
         bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
     }
 
-    /* CRITICAL: Swizzle UIApplication._run/_runWithMainScene BEFORE UIApplicationMain calls _run. */
-    swizzle_uiapplication_run_methods();
+    /* Swizzle UIApplication._run/_runWithMainScene BEFORE UIApplicationMain calls _run.
+     * In strict lifecycle mode, skip these swizzles so the real FBSWorkspace
+     * connection flow runs end-to-end. */
+    if (_strict_lifecycle()) {
+        bridge_log("  STRICT MODE: skipping _run/_runWithMainScene swizzles (real FBSWorkspace lifecycle)");
+    } else {
+        swizzle_uiapplication_run_methods();
+    }
 
     /* Defer CARenderServer initialization and BKS swizzles.
      * CARenderServer init triggers framework loading (CoreText → GraphicsServices
