@@ -7728,14 +7728,27 @@ static void swizzle_bks_methods(void) {
 
                 id (^swizzleBlock)(id, NSDictionary *) = ^id(id _self, NSDictionary *opts) {
                     NSMutableDictionary *newOpts = opts ? [opts mutableCopy] : [NSMutableDictionary new];
-                    if (!newOpts[@"display"]) {
-                        newOpts[@"display"] = @(1);
+                    /* Use actual CA constant key names:
+                     * kCAContextDisplayId = "displayId" (not "display")
+                     * kCAContextDisplayable = "displayable" */
+                    if (!newOpts[@"displayId"]) {
+                        newOpts[@"displayId"] = @(1);
                     }
                     if (!newOpts[@"displayable"]) {
                         newOpts[@"displayable"] = @YES;
                     }
-                    bridge_log("remoteContextWithOptions SWIZZLE: display=%u displayable=%d (orig keys: %lu)",
-                               [newOpts[@"display"] unsignedIntValue],
+                    /* Also try the resolved constant symbols if available */
+                    {
+                        void *ptr = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
+                        if (ptr) {
+                            id key = *(id *)ptr;
+                            if (key && ![newOpts objectForKey:key]) {
+                                [newOpts setObject:@(1) forKey:key];
+                            }
+                        }
+                    }
+                    bridge_log("remoteContextWithOptions SWIZZLE: displayId=%u displayable=%d (orig keys: %lu)",
+                               [newOpts[@"displayId"] unsignedIntValue],
                                [newOpts[@"displayable"] boolValue],
                                (unsigned long)(opts ? [opts count] : 0));
                     id ctx = ((id(*)(id, SEL, id))g_orig_remoteCtxOpts)(_self, remoteCtxSel, newOpts);

@@ -608,6 +608,25 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
         displays, sel_registerName("objectAtIndex:"), (unsigned long)0);
     pfb_log("Display[0] = %p", (void *)display);
 
+    /* Log displayId — need to know what ID the display has for context binding */
+    {
+        SEL didSel = sel_registerName("displayId");
+        if (class_respondsToSelector(object_getClass(display), didSel)) {
+            unsigned int did = ((unsigned int(*)(id, SEL))objc_msgSend)(display, didSel);
+            pfb_log("Display[0] displayId = %u", did);
+        } else {
+            pfb_log("Display[0] has no displayId selector");
+        }
+        /* Also check allContexts from CAContext */
+        Class caCtxCls = (Class)objc_getClass("CAContext");
+        if (caCtxCls) {
+            SEL acSel = sel_registerName("allContexts");
+            id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, acSel);
+            unsigned long ctxCount = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(ctxs, sel_registerName("count")) : 0;
+            pfb_log("CAContext.allContexts count = %lu (server-side)", ctxCount);
+        }
+    }
+
     /* Get the display's layer (the root layer of the compositing tree).
      * CAWindowServerDisplay has a 'layer' property that is the root of
      * the layer tree composited onto that display by CARenderServer. */
