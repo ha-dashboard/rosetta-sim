@@ -608,22 +608,63 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
         displays, sel_registerName("objectAtIndex:"), (unsigned long)0);
     pfb_log("Display[0] = %p", (void *)display);
 
-    /* Log displayId — need to know what ID the display has for context binding */
+    /* Log displayId and scan C++ impl for function pointers */
     {
         SEL didSel = sel_registerName("displayId");
         if (class_respondsToSelector(object_getClass(display), didSel)) {
             unsigned int did = ((unsigned int(*)(id, SEL))objc_msgSend)(display, didSel);
             pfb_log("Display[0] displayId = %u", did);
-        } else {
-            pfb_log("Display[0] has no displayId selector");
         }
-        /* Also check allContexts from CAContext */
         Class caCtxCls = (Class)objc_getClass("CAContext");
         if (caCtxCls) {
             SEL acSel = sel_registerName("allContexts");
             id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, acSel);
             unsigned long ctxCount = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(ctxs, sel_registerName("count")) : 0;
             pfb_log("CAContext.allContexts count = %lu (server-side)", ctxCount);
+        }
+
+        /* Scan Display C++ impl for function pointers (find render callback) */
+        Ivar implIvar = class_getInstanceVariable(object_getClass(display), "_impl");
+        if (implIvar) {
+            void *displayImpl = *(void **)((uint8_t *)display + ivar_getOffset(implIvar));
+            pfb_log("Display C++ impl: %p", displayImpl);
+            if (displayImpl) {
+                /* Scan for function pointers in the impl object */
+                for (int off = 0; off < 0x200; off += 8) {
+                    uint64_t val = *(uint64_t *)((uint8_t *)displayImpl + off);
+                    if (val > 0x100000 && val < 0x7fffffffffffULL) {
+                        Dl_info info;
+                        if (dladdr((void *)val, &info) && info.dli_sname) {
+                            long delta = (long)(val - (uint64_t)info.dli_saddr);
+                            if (delta >= 0 && delta < 0x1000) {
+                                pfb_log("  IMPL+0x%x: %p (%s+%ld)", off, (void *)val,
+                                         info.dli_sname, delta);
+                            }
+                        }
+                    }
+                }
+                /* Get C++ CA::Display::Server* from _impl+0x40 */
+                {
+                    void *server = *(void **)((uint8_t *)displayImpl + 0x40);
+                    pfb_log("CA::Display::Server* at _impl+0x40: %p", server);
+                    if (server && (uint64_t)server > 0x100000) {
+                        /* Dump Server vtable */
+                        void **vtable = *(void **)server;
+                        if (vtable && (uint64_t)vtable > 0x100000) {
+                            pfb_log("Server vtable: %p", (void *)vtable);
+                            for (int i = 0; i < 30; i++) {
+                                if (!vtable[i]) break;
+                                Dl_info info;
+                                if (dladdr(vtable[i], &info) && info.dli_sname) {
+                                    pfb_log("  svt[%d]: %s", i, info.dli_sname);
+                                } else {
+                                    pfb_log("  svt[%d]: %p", i, vtable[i]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -881,6 +922,36 @@ static void *pfb_sync_thread(void *arg) {
                 }
             }
             ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
+
+            /* Direct call to CA::WindowServer::Server::attach_contexts()
+             * via ASLR slide calculation. This is the function that binds
+             * registered contexts to the display (contextIdAtPosition). */
+            {
+                static void *g_server_cpp = NULL;
+                static int _attach_init = 0;
+                static void (*g_attach_fn)(void *) = NULL;
+                if (!_attach_init) {
+                    _attach_init = 1;
+                    /* Get server C++ object */
+                    Ivar implI = class_getInstanceVariable(
+                        object_getClass(g_cached_display), "_impl");
+                    if (implI) {
+                        void *impl = *(void **)((uint8_t *)g_cached_display + ivar_getOffset(implI));
+                        if (impl) g_server_cpp = *(void **)((uint8_t *)impl + 0x40);
+                    }
+                    /* Calculate ASLR slide from exported symbol */
+                    void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+                    if (known) {
+                        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
+                        g_attach_fn = (void (*)(void *))((uint8_t *)0x1286de + slide);
+                        pfb_log("ATTACH_CONTEXTS: server=%p slide=0x%lx fn=%p",
+                                g_server_cpp, (long)slide, (void *)g_attach_fn);
+                    }
+                }
+                if (g_server_cpp && g_attach_fn) {
+                    g_attach_fn(g_server_cpp);
+                }
+            }
 
             /* Call CARenderServerRenderDisplay to trigger the full render pipeline.
              * This should invoke attach_contexts → add_context → set_display_info. */

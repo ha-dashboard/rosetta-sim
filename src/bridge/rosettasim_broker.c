@@ -2795,6 +2795,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* CPU default. GPU needs PurpleDisplay render callback timer (mk_timer).
      * Architecture fully mapped but display render cycle not triggerable
      * without deep display driver integration. ROSETTASIM_CA_MODE=gpu to test. */
+    /* CPU default. GPU: attach_contexts callable but doesn't bind contexts.
+     * Need to investigate Render::Server vs WindowServer::Server relationship. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
