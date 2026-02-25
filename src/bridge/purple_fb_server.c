@@ -274,6 +274,7 @@ static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
 static volatile int g_layer_host_created; /* defined later, declared here for pfb_sync_to_shared */
 static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
 static volatile int g_gpu_inject_done = 0; /* set by GPU_INJECT after mutex reinit */
+static volatile void *g_display_surface = NULL; /* Display+0x138: actual rendered surface */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
 typedef void *CGColorSpaceRef;
@@ -341,8 +342,11 @@ static void pfb_sync_to_shared(void) {
     }
 
 fallback:
-    /* Fallback: copy from PurpleDisplay surface (may be empty/black) */
-    if (g_surface_addr != 0) {
+    /* Copy from Display's actual rendered surface (Display+0x138) if available,
+     * otherwise fall back to g_surface_addr (our memory entry, usually empty). */
+    if (g_display_surface != NULL) {
+        memcpy(pixel_dest, (void *)g_display_surface, PFB_SURFACE_SIZE);
+    } else if (g_surface_addr != 0) {
         memcpy(pixel_dest, (void *)g_surface_addr, PFB_SURFACE_SIZE);
     }
     hdr->frame_counter++;
@@ -980,6 +984,38 @@ static void *pfb_sync_thread(void *arg) {
             if (!g_update_logged) {
                 g_update_logged = 1;
                 pfb_log("RENDER_DIRECT: calling vtable[5] (immediate_render) each tick");
+
+                /* Surface check: scan g_surface_addr for RGB content */
+                if (g_surface_addr != 0) {
+                    uint8_t *pixels = (uint8_t *)g_surface_addr;
+                    int rgb_nz = 0;
+                    for (int i = 0; i < 7500; i++) {
+                        int off = i * 4;
+                        if (pixels[off] != 0 || pixels[off+1] != 0 || pixels[off+2] != 0)
+                            rgb_nz++;
+                    }
+                    pfb_log("SURFACE_CHECK: g_surface_addr=%p RGB non-zero=%d/7500",
+                            (void *)g_surface_addr, rgb_nz);
+                    /* Also check the vm_map'd address (Display surface) */
+                    /* Display+0x138 stores the mapped surface address */
+                    if (_server_cpp) {
+                        void *display_cpp = *(void **)((uint8_t *)_server_cpp + 0x58);
+                        if (display_cpp) {
+                            void *mapped = *(void **)((uint8_t *)display_cpp + 0x138);
+                            pfb_log("SURFACE_CHECK: Display+0x138 (mapped surface)=%p", mapped);
+                            if (mapped && mapped != (void *)g_surface_addr) {
+                                uint8_t *mp = (uint8_t *)mapped;
+                                int mnz = 0;
+                                for (int i = 0; i < 7500; i++) {
+                                    int off = i * 4;
+                                    if (mp[off] != 0 || mp[off+1] != 0 || mp[off+2] != 0)
+                                        mnz++;
+                                }
+                                pfb_log("SURFACE_CHECK: mapped surface RGB non-zero=%d/7500", mnz);
+                            }
+                        }
+                    }
+                }
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
             {
@@ -1942,6 +1978,27 @@ static void pfb_init(void) {
         /* Set g_cached_display for the sync thread to use */
         g_cached_display = disp;
         pfb_log("GPU_INJECT: set g_cached_display=%p", (void *)disp);
+
+        /* Cache the Display's actual render surface (Display+0x138)
+         * This is where CARenderServer writes rendered pixels. */
+        {
+            void *display_cpp_early = NULL;
+            Ivar iI = class_getInstanceVariable(object_getClass(disp), "_impl");
+            if (iI) {
+                void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(iI));
+                if (impl) {
+                    void *srv = *(void **)((uint8_t *)impl + 0x40);
+                    if (srv) display_cpp_early = *(void **)((uint8_t *)srv + 0x58);
+                }
+            }
+            if (display_cpp_early) {
+                void *mapped = *(void **)((uint8_t *)display_cpp_early + 0x138);
+                if (mapped) {
+                    g_display_surface = mapped;
+                    pfb_log("GPU_INJECT: set g_display_surface=%p (Display+0x138)", mapped);
+                }
+            }
+        }
 
         /* ============================================================
          * Step 1: Fix Display Transform
