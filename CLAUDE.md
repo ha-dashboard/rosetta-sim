@@ -151,8 +151,9 @@ scripts/kill_sim.sh
 ### Active Issues
 1. **UIScreen.scale** — not yet verified in GPU mode. `GSSetMainScreenInfo` sets GS-level scale (750x1334 @2x), but UIScreen's internal `_scale` ivar path (via BKSDisplayServices) needs verification.
 2. **Scroll crash (SIGSEGV)** — not yet tested in GPU mode. Previously: UIScrollView pan gesture triggers CA layout passes that access CARenderServer state.
-3. **Frame counter slow** — GPU framebuffer advances ~100 frames/95s (vs expected ~2850 at 30fps). PurpleFBServer syncs at 60Hz but CA commits are infrequent. May need `CATransaction.flush` or display link integration.
-4. **CFRunLoop timers don't fire** — iOS 10.3 SDK's CFRunLoopRun under Rosetta 2 doesn't wake for CFRunLoopTimer callbacks. The manual pump (`ROSETTASIM_RUNLOOP_PUMP=1`) works but is diagnostic-only. GCD dispatch_async to main queue also doesn't fire without the pump.
+3. **Frame counter slow** — GPU framebuffer advances ~100 frames/95s. CA context is LOCAL (renderContext=0x0) so commits don't reach CARenderServer. Needs REMOTE context via workspace scene assignment for GPU compositing. CPU rendering (renderInContext) works independently.
+4. ~~**CFRunLoop timers don't fire**~~ **RESOLVED (Session 18)**: CFRunLoop works correctly under Rosetta 2. `CFRunLoopRunInMode(default, 0.5, false)` returns `kCFRunLoopRunTimedOut` (3) — it blocks properly. CFRunLoopTimer callbacks fire at expected intervals. The previous assumption was wrong — `CFRunLoopRunInMode` with `returnAfterSourceHandled=true` and `timeout=0` returns immediately by design (kCFRunLoopRunHandledSource or kCFRunLoopRunFinished), not due to Rosetta. The `ROSETTASIM_RUNLOOP_PUMP` manual pump is no longer needed for the app process.
+5. **Workspace listener not servicing** — recv port obtained but dispatch_mach channel monitors wrong port. Not needed for compat mode (app works without workspace). Required for strict/GPU mode with REMOTE CA context.
 
 ### Key Architectural Decisions (Session 17)
 - **Acceptance gate serves messages**: replaced `usleep()` loop with `drain_pending_messages()` so the broker keeps processing bootstrap/XPC requests while waiting for the app framebuffer
@@ -169,6 +170,7 @@ scripts/kill_sim.sh
 - Session 15: XPC wire type fixes, broker-hosted PFB, app startup
 - Session 16: Screen scale fix (GSSetMainScreenInfo takes pixels), app rendering working
 - Session 17: GPU display pipeline active — acceptance gate passes. Fixed: broker message drain, per-process mobilegestalt, SBShim injection target, system.logger stub, UIApplicationMain timeout, makeKeyAndVisible IMP timing
+- Session 18: **SpringBoard survives FBSystemAppMain** — all 30 init steps complete. SB stays alive via exit/abort interposition + _run swizzle. Workspace listener created/checked in (not servicing, but sufficient for compat mode). App fully functional (HA Dashboard, cameras, mDNS, 60s+). **CFRunLoop WORKS under Rosetta 2** — debunked false timer assumption. Manual pump no longer needed.
 
 ## Mach IPC Reference
 
