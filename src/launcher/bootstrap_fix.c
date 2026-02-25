@@ -184,6 +184,7 @@ extern xpc_object_t xpc_dictionary_create(const char * const *keys,
                                            size_t count);
 extern void xpc_dictionary_set_int64(xpc_object_t dict, const char *key, int64_t val);
 extern void xpc_dictionary_set_mach_recv(xpc_object_t dict, const char *key, mach_port_t port);
+extern void xpc_dictionary_set_mach_send(xpc_object_t dict, const char *key, mach_port_t port);
 extern int64_t xpc_dictionary_get_int64(xpc_object_t dict, const char *key);
 extern const char *xpc_dictionary_get_string(xpc_object_t dict, const char *key);
 extern void xpc_release(xpc_object_t obj);
@@ -203,6 +204,10 @@ static xpc_pipe_routine_fn g_orig_xpc_pipe_routine = NULL;
  * the XPC dict natively, so __xpc_serializer_unpack never runs.
  *
  * For all other routines: fall through to the real implementation. */
+/* Cached recv ports from first check_in — used by FORCE_LISTENER */
+static mach_port_t g_cached_workspace_recv = MACH_PORT_NULL;
+static mach_port_t g_cached_sysappsvcs_recv = MACH_PORT_NULL;
+
 static int replacement_xpc_pipe_routine(xpc_pipe_t pipe, xpc_object_t dict,
                                          xpc_object_t *reply) {
     int64_t routine = xpc_dictionary_get_int64(dict, "routine");
@@ -230,7 +235,36 @@ static int replacement_xpc_pipe_routine(xpc_pipe_t pipe, xpc_object_t dict,
             return 5;
         }
 
-        /* Build reply dict using libxpc's own API — correct format guaranteed */
+        /* For workspace/systemappservices: cache the recv port and give
+         * libxpc a send right. FORCE_LISTENER uses the cached recv port. */
+        int is_ws = (strstr(name, "frontboard.workspace") ||
+                     strstr(name, "frontboard.systemappservices"));
+
+        if (is_ws) {
+            /* svc_port is recv right from check_in. Add a send right too. */
+            mach_port_insert_right(mach_task_self(), svc_port, svc_port,
+                                    MACH_MSG_TYPE_MAKE_SEND);
+            /* Cache recv for FORCE_LISTENER */
+            if (strstr(name, "frontboard.workspace") &&
+                !strstr(name, "systemappservices"))
+                g_cached_workspace_recv = svc_port;
+            else if (strstr(name, "systemappservices"))
+                g_cached_sysappsvcs_recv = svc_port;
+
+            bfix_log("[bfix] xpc_pipe_routine 805 '%s': CACHED recv 0x%x\n", name, svc_port);
+
+            /* Give libxpc a send right (it just needs something valid) */
+            xpc_object_t resp = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_int64(resp, "subsystem", 3);
+            xpc_dictionary_set_int64(resp, "error", 0);
+            xpc_dictionary_set_int64(resp, "routine", 805);
+            xpc_dictionary_set_int64(resp, "handle", handle);
+            xpc_dictionary_set_mach_send(resp, "port", svc_port);
+            if (reply) *reply = resp;
+            return 0;
+        }
+
+        /* Non-workspace: normal flow with MOVE_RECEIVE */
         xpc_object_t resp = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_int64(resp, "subsystem", 3);
         xpc_dictionary_set_int64(resp, "error", 0);
@@ -316,8 +350,7 @@ static void bfix_remember_port_name(mach_port_t port, const char *name);
 static const char *bfix_lookup_port_name(mach_port_t port);
 
 /* Cached recv ports from first check_in — used by FORCE_LISTENER */
-static mach_port_t g_cached_workspace_recv = MACH_PORT_NULL;
-static mach_port_t g_cached_sysappsvcs_recv = MACH_PORT_NULL;
+/* (cache declarations moved earlier, near replacement_xpc_pipe_routine) */
 
 kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
                                              const name_t service_name,
@@ -2249,6 +2282,7 @@ static void patch_bootstrap_functions(void) {
          * reply format is now correct with MACH_RECV=0x15000). */
         { "_xpc_look_up_endpoint", NULL },  /* filled conditionally below */
         { "_xpc_connection_check_in", NULL },
+        { "_xpc_pipe_routine", NULL },  /* filled for assertiond and SpringBoard */
         /* NOTE: launch_msg runtime trampoline REMOVED — causes infinite recursion
          * because fallthrough calls the patched function. DYLD interposition handles
          * cross-library calls; intra-library calls need saved-original approach. */
@@ -2263,12 +2297,19 @@ static void patch_bootstrap_functions(void) {
         const char *lifecycle = getenv("ROSETTASIM_LIFECYCLE_MODE");
         int strict = (lifecycle && strcmp(lifecycle, "strict") == 0);
         if (!strict) {
+            const char *pn_compat = getprogname();
+            int is_sb_compat = (pn_compat && strstr(pn_compat, "SpringBoard"));
             for (int i = 0; i < n_patches; i++) {
                 if (strcmp(patches[i].name, "_xpc_look_up_endpoint") == 0)
                     patches[i].replacement = (void *)replacement_xpc_look_up_endpoint;
                 else if (strcmp(patches[i].name, "_xpc_connection_check_in") == 0)
                     patches[i].replacement = (void *)replacement_xpc_connection_check_in;
+                /* SpringBoard also needs _xpc_pipe_routine for workspace recv caching */
+                else if (is_sb_compat && strcmp(patches[i].name, "_xpc_pipe_routine") == 0)
+                    patches[i].replacement = (void *)replacement_xpc_pipe_routine;
             }
+            if (is_sb_compat)
+                bfix_log("[bfix] COMPAT+SpringBoard: added _xpc_pipe_routine patch\n");
         } else {
             const char *pn = getprogname();
             int is_sb = (pn && strstr(pn, "SpringBoard"));
@@ -2277,19 +2318,19 @@ static void patch_bootstrap_functions(void) {
                      pn ? pn : "(null)", is_sb, is_assertiond);
 
             if (is_sb) {
-                /* STRICT+SpringBoard: STILL patch _xpc_look_up_endpoint +
-                 * _xpc_connection_check_in. SpringBoard's native libxpc never
-                 * sends a routine=805 check_in for frontboard.workspace (the
-                 * 805 message never reaches the broker). Without our patches,
-                 * the workspace port is never owned by SpringBoard and the
-                 * app hangs forever. */
+                /* STRICT+SpringBoard: patch _xpc_look_up_endpoint,
+                 * _xpc_connection_check_in, AND _xpc_pipe_routine.
+                 * The pipe routine 805 handler caches the recv port for
+                 * workspace/systemappservices so FORCE_LISTENER can use it. */
                 for (int i = 0; i < n_patches; i++) {
                     if (strcmp(patches[i].name, "_xpc_look_up_endpoint") == 0)
                         patches[i].replacement = (void *)replacement_xpc_look_up_endpoint;
                     else if (strcmp(patches[i].name, "_xpc_connection_check_in") == 0)
                         patches[i].replacement = (void *)replacement_xpc_connection_check_in;
+                    else if (strcmp(patches[i].name, "_xpc_pipe_routine") == 0)
+                        patches[i].replacement = (void *)replacement_xpc_pipe_routine;
                 }
-                bfix_log("[bfix] STRICT+SpringBoard: _xpc_look_up_endpoint + _xpc_connection_check_in PATCHED\n");
+                bfix_log("[bfix] STRICT+SpringBoard: _xpc_look_up_endpoint + _xpc_connection_check_in + _xpc_pipe_routine PATCHED\n");
             } else if (is_assertiond) {
                 /* STRICT+assertiond:
                  * Do NOT trampoline _xpc_connection_check_in.
