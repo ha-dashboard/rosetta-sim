@@ -46,8 +46,48 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <dispatch/dispatch.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
+#include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
+#include <mach-o/loader.h>
+
+/* Mach-O nlist symbol scanner — same technique as bootstrap_fix.c */
+static void *pfb_find_symbol(const char *func_name) {
+    char mangled[256];
+    snprintf(mangled, sizeof(mangled), "_%s", func_name);
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)mh;
+        const uint8_t *ptr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
+        const struct symtab_command *symtab_cmd = NULL;
+        const struct segment_command_64 *linkedit_seg = NULL;
+        for (uint32_t j = 0; j < hdr->ncmds; j++) {
+            const struct load_command *cmd = (const struct load_command *)ptr;
+            if (cmd->cmd == LC_SYMTAB) symtab_cmd = (const struct symtab_command *)cmd;
+            else if (cmd->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit_seg = seg;
+            }
+            ptr += cmd->cmdsize;
+        }
+        if (!symtab_cmd || !linkedit_seg) continue;
+        uintptr_t base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+        const struct nlist_64 *syms = (const struct nlist_64 *)(base + symtab_cmd->symoff);
+        const char *strs = (const char *)(base + symtab_cmd->stroff);
+        for (uint32_t k = 0; k < symtab_cmd->nsyms; k++) {
+            if ((syms[k].n_type & N_TYPE) != N_SECT) continue;
+            uint32_t strx = syms[k].n_un.n_strx;
+            if (strx && strcmp(strs + strx, mangled) == 0)
+                return (void *)(syms[k].n_value + slide);
+        }
+    }
+    return NULL;
+}
 
 /* Forward declarations for APIs not in the iOS simulator SDK headers */
 extern mach_port_t bootstrap_port;
@@ -508,7 +548,41 @@ static void pfb_handle_message(PurpleFBRequest *req) {
         } else {
             pfb_sync_to_shared();
         }
-        pfb_log("flush_shmem: syncing to shared framebuffer");
+        /* Try glReadPixels on THIS thread — the server just finished rendering
+         * and the GL context may still be current. */
+        {
+            static void *_glRP = NULL;
+            static void *_glGetErr = NULL;
+            static int _gl_init = 0;
+            if (!_gl_init) {
+                _gl_init = 1;
+                _glRP = dlsym(RTLD_DEFAULT, "glReadPixels");
+                _glGetErr = dlsym(RTLD_DEFAULT, "glGetError");
+                pfb_log("FLUSH_GL: glReadPixels=%p glGetError=%p tid=%p main=%d",
+                        _glRP, _glGetErr, (void *)pthread_self(), pthread_main_np());
+            }
+            if (_glRP && g_shared_fb != MAP_FAILED) {
+                uint8_t *pixel_dest = (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE;
+                RosettaSimFramebufferHeader *fhdr = (RosettaSimFramebufferHeader *)g_shared_fb;
+                typedef void (*glReadPixelsFn)(int, int, int, int, unsigned int, unsigned int, void *);
+                /* GL_BGRA=0x80E1 GL_UNSIGNED_BYTE=0x1401 */
+                ((glReadPixelsFn)_glRP)(0, 0, PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT,
+                                        0x80E1, 0x1401, pixel_dest);
+                /* Check for content */
+                static int _flush_gl_logged = 0;
+                if (!_flush_gl_logged) {
+                    _flush_gl_logged = 1;
+                    int nz = 0;
+                    for (int i = 0; i < 1000; i++)
+                        if (pixel_dest[i*4] || pixel_dest[i*4+1] || pixel_dest[i*4+2]) nz++;
+                    unsigned int err = _glGetErr ? ((unsigned int(*)(void))_glGetErr)() : 0xFFFF;
+                    pfb_log("FLUSH_GL: glReadPixels result: %d/1000 non-zero, glError=0x%x, px[0]=(%u,%u,%u,%u)",
+                            nz, err, pixel_dest[0], pixel_dest[1], pixel_dest[2], pixel_dest[3]);
+                }
+                fhdr->frame_counter++;
+                fhdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+            }
+        }
 
         /* Send a simple 72-byte non-complex reply */
         uint8_t reply_buf[72];
@@ -1175,33 +1249,44 @@ static void *pfb_sync_thread(void *arg) {
                             total_nz, alpha_only, has_alpha);
                 }
 
-                /* OpenGL readback diagnostic — check if we can read the GPU framebuffer */
-                {
-                    void *gl_read = dlsym(RTLD_DEFAULT, "glReadPixels");
-                    void *cgl_ctx = dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
-                    pfb_log("GL_READBACK: glReadPixels=%p CGLGetCurrentContext=%p", gl_read, cgl_ctx);
-                    if (cgl_ctx) {
-                        typedef void *(*CGLGetCtxFn)(void);
-                        void *ctx = ((CGLGetCtxFn)cgl_ctx)();
-                        pfb_log("GL_READBACK: current CGL context = %p", ctx);
-                    }
-                    if (gl_read) {
-                        /* Try reading 1 pixel to test */
-                        uint8_t test_pixel[4] = {0};
-                        typedef void (*glReadPixelsFn)(int, int, int, int, unsigned int, unsigned int, void *);
-                        /* GL_BGRA = 0x80E1, GL_UNSIGNED_BYTE = 0x1401 */
-                        ((glReadPixelsFn)gl_read)(0, 0, 1, 1, 0x80E1, 0x1401, test_pixel);
-                        pfb_log("GL_READBACK: test pixel (0,0) = (%u,%u,%u,%u)",
-                                test_pixel[0], test_pixel[1], test_pixel[2], test_pixel[3]);
-                        /* Check GL error */
-                        typedef unsigned int (*glGetErrorFn)(void);
-                        glGetErrorFn getErr = (glGetErrorFn)dlsym(RTLD_DEFAULT, "glGetError");
-                        if (getErr) {
-                            unsigned int err = getErr();
-                            pfb_log("GL_READBACK: glGetError = 0x%x (%s)",
-                                    err, err == 0 ? "GL_NO_ERROR" : "ERROR");
+                /* OpenGL readback: scan for GL context in server/display objects */
+                if (_server_cpp) {
+                    pfb_log("GL_SCAN: scanning server for GL/EAGL contexts...");
+                    for (int off = 0; off < 0x200; off += 8) {
+                        uint64_t val = *(uint64_t *)((uint8_t *)_server_cpp + off);
+                        if (val > 0x100000 && val < 0x7fffffffffffULL) {
+                            Class cls = object_getClass((id)val);
+                            if (cls) {
+                                const char *name = class_getName(cls);
+                                if (name && (strstr(name, "EAGL") || strstr(name, "CGL") ||
+                                             strstr(name, "GL") || strstr(name, "Render") ||
+                                             strstr(name, "Context"))) {
+                                    pfb_log("GL_SCAN: server+0x%x = %p (%s)", off, (void *)val, name);
+                                }
+                            }
                         }
                     }
+                    /* Also scan Display (server+0x58) */
+                    void *disp_cpp = *(void **)((uint8_t *)_server_cpp + 0x58);
+                    if (disp_cpp) {
+                        for (int off = 0; off < 0x200; off += 8) {
+                            uint64_t val = *(uint64_t *)((uint8_t *)disp_cpp + off);
+                            if (val > 0x100000 && val < 0x7fffffffffffULL) {
+                                Class cls = object_getClass((id)val);
+                                if (cls) {
+                                    const char *name = class_getName(cls);
+                                    if (name && (strstr(name, "EAGL") || strstr(name, "CGL") ||
+                                                 strstr(name, "GL") || strstr(name, "Render") ||
+                                                 strstr(name, "Context"))) {
+                                        pfb_log("GL_SCAN: display+0x%x = %p (%s)", off, (void *)val, name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Class eaglCls = (Class)objc_getClass("EAGLContext");
+                    pfb_log("GL_SCAN: EAGLContext class=%p glReadPixels=%p",
+                            (void *)eaglCls, dlsym(RTLD_DEFAULT, "glReadPixels"));
                 }
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
@@ -2485,6 +2570,52 @@ static void pfb_init(void) {
         }
 
         /* Display surface scan removed — double-dereference causes SIGBUS */
+
+        /* Execute glReadPixels on the PurpleServer's render thread via CFRunLoop. */
+        pfb_log("GL_READBACK: about to schedule, server_cpp=%p", server_cpp);
+        if (server_cpp) {
+            CFRunLoopRef serverRL = *(CFRunLoopRef *)((uint8_t *)server_cpp + 0x168);
+            pfb_log("GL_READBACK: server runloop = %p, scheduling glReadPixels block", serverRL);
+            if (serverRL) {
+                void *glRP = dlsym(RTLD_DEFAULT, "glReadPixels");
+                void *glErr = dlsym(RTLD_DEFAULT, "glGetError");
+                if (glRP) {
+                    typedef void (*glRPFn)(int,int,int,int,unsigned,unsigned,void*);
+                    glRPFn _glRP = (glRPFn)glRP;
+                    typedef unsigned (*glErrFn)(void);
+                    glErrFn _glErr = (glErrFn)glErr;
+                    uint8_t *dest = (g_shared_fb != MAP_FAILED) ?
+                        (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE : NULL;
+
+                    CFRunLoopPerformBlock(serverRL, kCFRunLoopDefaultMode, ^{
+                        pfb_log("GL_READBACK: executing on server thread tid=%p", (void *)pthread_self());
+                        /* Check if GL context is current here */
+                        typedef void *(*EAGLGetCtxFn)(id, SEL);
+                        Class eaglCls = (Class)objc_getClass("EAGLContext");
+                        if (eaglCls) {
+                            id ctx = ((id(*)(id, SEL))objc_msgSend)((id)eaglCls, sel_registerName("currentContext"));
+                            pfb_log("GL_READBACK: EAGLContext.currentContext = %p", (void *)ctx);
+                        }
+                        /* Try glReadPixels */
+                        uint8_t test[4] = {0};
+                        _glRP(0, 0, 1, 1, 0x80E1, 0x1401, test);
+                        unsigned err = _glErr ? _glErr() : 0xFFFF;
+                        pfb_log("GL_READBACK: server thread px=(%u,%u,%u,%u) err=0x%x",
+                                test[0], test[1], test[2], test[3], err);
+                        if (test[0] || test[1] || test[2]) {
+                            pfb_log("GL_READBACK: NON-ZERO PIXELS! Reading full framebuffer...");
+                            if (dest) {
+                                _glRP(0, 0, PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, 0x80E1, 0x1401, dest);
+                                RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_shared_fb;
+                                hdr->frame_counter++;
+                                hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+                            }
+                        }
+                    });
+                    CFRunLoopWakeUp(serverRL);
+                }
+            }
+        }
 
         pfb_log("GPU_INJECT: session 21 complete — enabling sync thread render");
         g_gpu_inject_done = 1;
