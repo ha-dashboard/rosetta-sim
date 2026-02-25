@@ -45,6 +45,7 @@ clang -arch x86_64 -dynamiclib \
     -framework Foundation \
     -framework GraphicsServices \
     -framework QuartzCore \
+    -framework CoreGraphics \
     -install_name @rpath/purple_fb_server.dylib \
     -o "$OUT" \
     "$SRC"

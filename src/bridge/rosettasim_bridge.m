@@ -4123,6 +4123,12 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                 if (_force_full_refresh) _force_full_refresh = 0;
             }
 
+            /* Force root layer dirty EVERY frame so CARenderServer
+             * re-composites the display surface. Without this, CA only
+             * commits when layers change organically — a static UI
+             * produces zero new composites after the initial one. */
+            ((void(*)(id, SEL))objc_msgSend)(layer, sel_registerName("setNeedsDisplay"));
+
             /* Commit populated layers to CARenderServer */
             if (catClass) {
                 ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
@@ -6294,7 +6300,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                         displayableKey: @YES
                                                     };
                                                 }
-                                                bridge_log("Display Pipeline: Creating displayable CAContext (display=%u)", displayId);
+                                                bridge_log("Display Pipeline: Creating displayable CAContext (display=%u, displayable=YES, clientPort=%u)", displayId, ucp);
 
                                                 id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
                                                     (id)caCtxClass, remoteCtxSel, opts);
@@ -6311,14 +6317,36 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                     if ([(id)remoteCtx respondsToSelector:ctxIdSel]) {
                                                         unsigned int ctxId = ((unsigned int(*)(id, SEL))objc_msgSend)(
                                                             remoteCtx, ctxIdSel);
-                                                        bridge_log("Display Pipeline: Displayable context ID = %u (NOT writing to file — UIKit contextId already written)", ctxId);
+                                                        bridge_log("Display Pipeline: Displayable context ID = %u — writing to file (display=1 binding)", ctxId);
+                                                        /* Write the DISPLAYABLE context's ID — this is the one
+                                                         * CARenderServer will composite onto PurpleDisplay.
+                                                         * UIKit's _layerContext contextId has no display binding. */
+                                                        {
+                                                            char buf[32];
+                                                            snprintf(buf, sizeof(buf), "%u", ctxId);
+                                                            int fd = open(ROSETTASIM_FB_CONTEXT_PATH,
+                                                                          O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                                                            if (fd >= 0) {
+                                                                write(fd, buf, strlen(buf));
+                                                                close(fd);
+                                                                bridge_log("Display Pipeline: Wrote displayable contextId=%u to %s",
+                                                                           ctxId, ROSETTASIM_FB_CONTEXT_PATH);
+                                                            }
+                                                        }
                                                     }
 
-                                                    /* Flush to push the context creation to server */
-                                                    ((void(*)(id, SEL))objc_msgSend)(
-                                                        (id)objc_getClass("CATransaction"),
-                                                        sel_registerName("flush"));
-                                                    bridge_log("Display Pipeline: Flushed displayable context");
+                                                    /* Force a full dirty+commit so CARenderServer receives
+                                                     * initial content for this context on the display.
+                                                     * setLayer alone doesn't trigger a commit. */
+                                                    {
+                                                        Class catCls = objc_getClass("CATransaction");
+                                                        ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("begin"));
+                                                        ((void(*)(id, SEL))objc_msgSend)(rootLayer, sel_registerName("setNeedsDisplay"));
+                                                        ((void(*)(id, SEL))objc_msgSend)(rootLayer, sel_registerName("setNeedsLayout"));
+                                                        ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
+                                                        ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("commit"));
+                                                        bridge_log("Display Pipeline: Forced full dirty+commit on displayable context");
+                                                    }
 
                                                     /* Retain to prevent deallocation */
                                                     ((id(*)(id, SEL))objc_msgSend)(remoteCtx, sel_registerName("retain"));

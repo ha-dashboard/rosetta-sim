@@ -263,16 +263,76 @@ static void pfb_setup_shared_framebuffer(void) {
  * Called periodically from the server thread or could be triggered on
  * flush_shmem from PurpleDisplay. For now we'll use a simple periodic copy. */
 static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
+static volatile int g_layer_host_created; /* defined later, declared here for pfb_sync_to_shared */
+
+/* CoreGraphics types and functions for CALayerHost rendering */
+typedef void *CGColorSpaceRef;
+typedef void *CGContextRef;
+extern CGColorSpaceRef CGColorSpaceCreateDeviceRGB(void);
+extern void CGColorSpaceRelease(CGColorSpaceRef);
+extern CGContextRef CGBitmapContextCreate(void *data, size_t width, size_t height,
+    size_t bitsPerComponent, size_t bytesPerRow, CGColorSpaceRef space, uint32_t bitmapInfo);
+extern void CGContextRelease(CGContextRef);
+extern void CGContextTranslateCTM(CGContextRef, double, double);
+extern void CGContextScaleCTM(CGContextRef, double, double);
+/* kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 2 | (2 << 12) = 8194 */
+#define PFB_BITMAP_INFO 8194
+
+static volatile int g_layerhost_render_logged = 0;
 
 static void pfb_sync_to_shared(void) {
-    if (g_shared_fb == MAP_FAILED || g_surface_addr == 0) return;
+    if (g_shared_fb == MAP_FAILED) return;
 
     uint8_t *pixel_dest = (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE;
-
-    /* Primary: copy from CARenderServer's PurpleDisplay surface */
-    memcpy(pixel_dest, (void *)g_surface_addr, PFB_SURFACE_SIZE);
-
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_shared_fb;
+
+    /* If CALayerHost is available and has a contextId, render it into
+     * the framebuffer. This captures the app's remote CA context content
+     * through backboardd's CALayerHost which resolves the remote context.
+     * Throttle to ~30fps (every other 60Hz tick). */
+    static volatile int _render_tick = 0;
+    _render_tick++;
+    if (g_layer_host_ref && g_layer_host_created && (_render_tick % 2 == 0)) {
+        /* Render CALayerHost directly from the sync thread.
+         * CALayer renderInContext is not officially thread-safe, but works
+         * for simple layer trees. Avoid dispatch_sync to main queue
+         * which deadlocks (backboardd's main queue isn't reliably serviced). */
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        if (!cs) goto fallback;
+
+        CGContextRef ctx = CGBitmapContextCreate(
+            pixel_dest, PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT,
+            8, PFB_BYTES_PER_ROW, cs, PFB_BITMAP_INFO);
+        CGColorSpaceRelease(cs);
+        if (!ctx) goto fallback;
+
+        /* Scale 2x for retina (375x667 points → 750x1334 pixels).
+         * Then flip Y: CG origin is bottom-left, UIKit is top-left. */
+        CGContextTranslateCTM(ctx, 0, (double)PFB_PIXEL_HEIGHT);
+        CGContextScaleCTM(ctx, 2.0, -2.0);
+
+        /* Render the CALayerHost (and its hosted remote layer tree) */
+        ((void(*)(id, SEL, CGContextRef))objc_msgSend)(
+            g_layer_host_ref, sel_registerName("renderInContext:"), ctx);
+
+        CGContextRelease(ctx);
+
+        hdr->frame_counter++;
+        hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+
+        if (!g_layerhost_render_logged) {
+            g_layerhost_render_logged = 1;
+            pfb_log("RENDER: CALayerHost renderInContext succeeded (fc=%llu)",
+                    (unsigned long long)hdr->frame_counter);
+        }
+        return;
+    }
+
+fallback:
+    /* Fallback: copy from PurpleDisplay surface (may be empty/black) */
+    if (g_surface_addr != 0) {
+        memcpy(pixel_dest, (void *)g_surface_addr, PFB_SURFACE_SIZE);
+    }
     hdr->frame_counter++;
     hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
 }
@@ -681,6 +741,20 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
 
         g_layer_host_created = 1;
         pfb_log("CALayerHost setup COMPLETE — app content should now composite on display");
+
+        /* Diagnostic: check what contextId the display reports at center */
+        {
+            typedef struct { double x; double y; } CGPoint_t;
+            CGPoint_t center = { 375.0, 667.0 };
+            SEL ctxAtPosSel = sel_registerName("contextIdAtPosition:");
+            if (class_respondsToSelector(object_getClass(display), ctxAtPosSel)) {
+                unsigned int reportedCtx = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                    display, ctxAtPosSel, center);
+                pfb_log("DIAG: contextIdAtPosition(375,667) = %u", reportedCtx);
+            } else {
+                pfb_log("DIAG: display does not respond to contextIdAtPosition:");
+            }
+        }
     } else {
         pfb_log("ERROR: Could not find display layer to add CALayerHost to");
 

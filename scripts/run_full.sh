@@ -186,9 +186,10 @@ for i in $(seq 1 120); do
         echo "App framebuffer ready."
         break
     fi
-    if [[ -f "$GPU_FB" ]]; then
+    # Only fall back to GPU framebuffer if app FB doesn't appear after 30s
+    if [[ $i -gt 60 ]] && [[ -f "$GPU_FB" ]]; then
         APP_FB="$GPU_FB"
-        echo "GPU framebuffer ready."
+        echo "GPU framebuffer ready (app FB not found after 30s)."
         break
     fi
     sleep 0.5
