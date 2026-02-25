@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
 #import <Foundation/Foundation.h>
@@ -1090,6 +1091,85 @@ static void bfix_trace_received_on_pi_port(mach_msg_header_t *msg, uint32_t tota
     }
 }
 
+/* Thread-local flag: set when a CA commit (40002/40003) is received.
+ * On the NEXT mach_msg call (after MIG processes the commit), we call
+ * render_for_time to composite the newly-committed scene graph. */
+static __thread int g_commit_render_pending = 0;
+
+/* File-scope state for post-commit rendering */
+static void *g_pcr_rft_fn = NULL;   /* render_for_time function pointer */
+static void *g_pcr_rft_srv = NULL;  /* CA::Render::Server* C++ object */
+static int g_pcr_init = 0;
+static int g_pcr_render_count = 0;
+
+static void _pcr_do_render(void) {
+    /* Lazy init */
+    if (!g_pcr_init) {
+        g_pcr_init = 1;
+        const char *pn = getprogname();
+        if (!(pn && strstr(pn, "backboardd"))) return;
+
+        void *sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+        if (sym) {
+            Dl_info dinfo;
+            if (dladdr(sym, &dinfo) && dinfo.dli_fbase) {
+                uintptr_t qc_base = (uintptr_t)dinfo.dli_fbase;
+                g_pcr_rft_fn = (void *)(qc_base + 0x1287ea);
+            }
+        }
+        Class wsCls = (Class)objc_getClass("CAWindowServer");
+        if (wsCls) {
+            id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
+            if (ws) {
+                id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+                unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                    disps, sel_registerName("count")) : 0;
+                if (dcnt > 0) {
+                    id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                        disps, sel_registerName("objectAtIndex:"), 0UL);
+                    Ivar iI = class_getInstanceVariable(object_getClass(disp), "_impl");
+                    if (iI) {
+                        void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(iI));
+                        if (impl) g_pcr_rft_srv = *(void **)((uint8_t *)impl + 0x40);
+                    }
+                }
+            }
+        }
+        bfix_log("POST_COMMIT_RENDER: init fn=%p srv=%p %s",
+            g_pcr_rft_fn, g_pcr_rft_srv,
+            (g_pcr_rft_fn && g_pcr_rft_srv) ? "READY" : "FAILED");
+    }
+
+    if (!g_pcr_rft_fn || !g_pcr_rft_srv) return;
+
+    g_pcr_render_count++;
+    extern double CACurrentMediaTime(void);
+    typedef void (*RFTFn)(void*, double, void*, unsigned int);
+    ((RFTFn)g_pcr_rft_fn)(g_pcr_rft_srv, CACurrentMediaTime(), NULL, 0);
+
+    if (g_pcr_render_count <= 10 || g_pcr_render_count % 200 == 0) {
+        char tname[64] = {0};
+        pthread_getname_np(pthread_self(), tname, sizeof(tname));
+        bfix_log("POST_COMMIT_RENDER[%d]: render_for_time on thread='%s'",
+            g_pcr_render_count, tname[0] ? tname : "(unnamed)");
+
+        if (g_pcr_render_count <= 5) {
+            void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
+            if (swctx) {
+                void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                if (pixbuf && (uint64_t)pixbuf > 0x100000) {
+                    uint8_t *pp = (uint8_t *)pixbuf;
+                    int nz = 0;
+                    for (int i = 0; i < 2000; i++)
+                        if (pp[i*4]||pp[i*4+1]||pp[i*4+2]) nz++;
+                    bfix_log("POST_COMMIT_RENDER[%d]: %d/2000 nz RGB",
+                        g_pcr_render_count, nz);
+                }
+            }
+        }
+    }
+}
+
 kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                    mach_msg_option_t option,
                                    mach_msg_size_t send_size,
@@ -1109,6 +1189,13 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
     }
 
     const int is_assertiond = bfix_is_assertiond_process();
+
+    /* Fire post-commit render if a commit was received on the previous call.
+     * This runs AFTER MIG processed the commit, so the scene graph is updated. */
+    if (g_commit_render_pending && (option & MACH_RCV_MSG)) {
+        g_commit_render_pending = 0;
+        _pcr_do_render();
+    }
 
     /* Pre-send trace: capture routine=805 name/handle mapping for assertiond. */
     uint64_t pre_handle = 0;
@@ -1177,6 +1264,93 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
 
     kern_return_t kr = g_orig_mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify);
 
+    /* Handle custom "render now" message (49999) in backboardd */
+    if ((option & MACH_RCV_MSG) && kr == KERN_SUCCESS && msg && msg->msgh_id == 49999) {
+        static int _is_bbd_rn = -1;
+        if (_is_bbd_rn == -1) {
+            const char *pn = getprogname();
+            _is_bbd_rn = (pn && strstr(pn, "backboardd")) ? 1 : 0;
+        }
+        if (_is_bbd_rn) {
+            static void *_rft_fn = NULL;
+            static void *_rft_srv = NULL;
+            static int _rft_init = 0;
+            static int _rft_count = 0;
+
+            if (!_rft_init) {
+                _rft_init = 1;
+                /* Find render_for_time via QuartzCore base */
+                void *sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                if (sym) {
+                    Dl_info dinfo;
+                    if (dladdr(sym, &dinfo) && dinfo.dli_fbase) {
+                        uintptr_t qc_base = (uintptr_t)dinfo.dli_fbase;
+                        _rft_fn = (void *)(qc_base + 0x1287ea);
+                        bfix_log("RENDER_NOW: qc_base=0x%lx rft_fn=%p",
+                                (unsigned long)qc_base, _rft_fn);
+                    }
+                }
+                /* Find server C++ object via CAWindowServer */
+                Class wsCls = (Class)objc_getClass("CAWindowServer");
+                if (wsCls) {
+                    id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
+                    if (ws) {
+                        id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+                        unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                            disps, sel_registerName("count")) : 0;
+                        if (dcnt > 0) {
+                            id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                disps, sel_registerName("objectAtIndex:"), 0UL);
+                            Ivar iI = class_getInstanceVariable(object_getClass(disp), "_impl");
+                            if (iI) {
+                                void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(iI));
+                                if (impl) {
+                                    _rft_srv = *(void **)((uint8_t *)impl + 0x40);
+                                    bfix_log("RENDER_NOW: server_cpp=%p", _rft_srv);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (_rft_fn && _rft_srv)
+                    bfix_log("RENDER_NOW: ready to render");
+                else
+                    bfix_log("RENDER_NOW: FAILED init fn=%p srv=%p", _rft_fn, _rft_srv);
+            }
+
+            if (_rft_fn && _rft_srv) {
+                _rft_count++;
+                extern double CACurrentMediaTime(void);
+                typedef void (*RFTFn)(void*, double, void*, unsigned int);
+                ((RFTFn)_rft_fn)(_rft_srv, CACurrentMediaTime(), NULL, 0);
+
+                if (_rft_count <= 5 || _rft_count % 100 == 0) {
+                    bfix_log("RENDER_NOW[%d]: render_for_time called", _rft_count);
+
+                    /* Check pixels on first few calls */
+                    if (_rft_count <= 5) {
+                        void *swctx = *(void **)((uint8_t *)_rft_srv + 0xb8);
+                        if (swctx) {
+                            void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                            if (pixbuf && (uint64_t)pixbuf > 0x100000) {
+                                uint8_t *pp = (uint8_t *)pixbuf;
+                                int nz = 0;
+                                for (int i = 0; i < 2000; i++)
+                                    if (pp[i*4]||pp[i*4+1]||pp[i*4+2]) nz++;
+                                bfix_log("RENDER_NOW[%d]: %d/2000 nz RGB px[0]=(%u,%u,%u,%u)",
+                                    _rft_count, nz, pp[0], pp[1], pp[2], pp[3]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Don't let MIG dispatch see this message — return to receive loop */
+            /* We need to re-receive, so modify the msg to be a no-op */
+            msg->msgh_id = 0; /* MIG will ignore id=0 */
+        }
+    }
+
     /* Track CA MIG messages RECEIVED in backboardd */
     if ((option & MACH_RCV_MSG) && kr == KERN_SUCCESS && msg) {
         static int _recv_is_bbd = -1;
@@ -1186,6 +1360,53 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
         }
         if (_recv_is_bbd && msg->msgh_id > 40000) {
             static int _ca_recv_count = 0;
+            /* Always log 40002/40003 commit data messages with thread info */
+            if (msg->msgh_id == 40002 || msg->msgh_id == 40003) {
+                int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+                /* Identify which thread receives commits */
+                char _tname[64] = {0};
+                pthread_getname_np(pthread_self(), _tname, sizeof(_tname));
+                static int _commit_thread_logged = 0;
+                if (_commit_thread_logged < 5) {
+                    _commit_thread_logged++;
+                    bfix_log("COMMIT_RECV: id=%u size=%u port=%u complex=%d thread='%s' tid=%p",
+                        msg->msgh_id, msg->msgh_size, msg->msgh_local_port, is_complex,
+                        _tname[0] ? _tname : "(unnamed)", (void *)pthread_self());
+                } else {
+                    bfix_log("COMMIT_RECV: id=%u size=%u port=%u complex=%d",
+                        msg->msgh_id, msg->msgh_size, msg->msgh_local_port, is_complex);
+                }
+                /* Schedule render_for_time on the next mach_msg call */
+                g_commit_render_pending = 1;
+
+                /* Check for magic 0x9C42/0x9C43 at expected offset */
+                uint8_t *raw = (uint8_t *)msg;
+                if (msg->msgh_size >= 0x18) {
+                    uint32_t inner_id = *(uint32_t *)(raw + 0x14);
+                    bfix_log("COMMIT_RECV: inner_id=0x%x (expect 0x9C42 or 0x9C43)", inner_id);
+                }
+                if (is_complex) {
+                    mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
+                    bfix_log("COMMIT_RECV: desc_count=%u", body->msgh_descriptor_count);
+                    /* Dump descriptor types */
+                    uint8_t *dp = (uint8_t *)(body + 1);
+                    for (uint32_t d = 0; d < body->msgh_descriptor_count && d < 4; d++) {
+                        uint32_t dtype = *(uint32_t *)(dp + 8) & 0xFF;
+                        if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
+                            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)dp;
+                            bfix_log("COMMIT_RECV: desc[%u] PORT name=%u disp=%u", d, pd->name, pd->disposition);
+                            dp += sizeof(mach_msg_port_descriptor_t);
+                        } else if (dtype == MACH_MSG_OOL_DESCRIPTOR) {
+                            mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
+                            bfix_log("COMMIT_RECV: desc[%u] OOL addr=%p size=%u", d, od->address, od->size);
+                            dp += sizeof(mach_msg_ool_descriptor_t);
+                        } else {
+                            bfix_log("COMMIT_RECV: desc[%u] type=%u", d, dtype);
+                            dp += 12;
+                        }
+                    }
+                }
+            }
             if (_ca_recv_count < 30) {
                 _ca_recv_count++;
                 int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
@@ -1198,6 +1419,59 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                     bfix_log("CA_RECV[%d]: id=%u size=%u port=%u SIMPLE",
                         _ca_recv_count, msg->msgh_id, msg->msgh_size,
                         msg->msgh_local_port);
+                }
+
+                /* Probe 40203 (RegisterClient) — try vm_read with received task port */
+                if (msg->msgh_id == 40203 && (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
+                    mach_msg_body_t *rbody = (mach_msg_body_t *)(msg + 1);
+                    uint32_t ndesc = rbody->msgh_descriptor_count;
+                    uint8_t *dp = (uint8_t *)(rbody + 1);
+                    bfix_log("40203_RECV: %u descriptors, msg_size=%u", ndesc, msg->msgh_size);
+                    for (uint32_t d = 0; d < ndesc && d < 8; d++) {
+                        uint32_t dtype = *(uint32_t *)(dp + 8) & 0xFF;
+                        if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
+                            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)dp;
+                            mach_port_type_t pt = 0;
+                            kern_return_t tkr = mach_port_type(mach_task_self(), pd->name, &pt);
+                            bfix_log("40203_RECV: desc[%u] PORT name=%u disp=%u ptype=0x%x (kr=%d)",
+                                d, pd->name, pd->disposition, pt, tkr);
+
+                            /* If this looks like a task port (send right, no receive), try vm_read */
+                            if (tkr == KERN_SUCCESS && (pt & MACH_PORT_TYPE_SEND) && d == 0) {
+                                vm_offset_t rd = 0;
+                                mach_msg_type_number_t rc = 0;
+                                kern_return_t vkr = vm_read(pd->name, 0x100000000ULL, 64, &rd, &rc);
+                                bfix_log("40203_RECV: VM_READ(port=%u, 0x100000000) = %d (%s) got=%u",
+                                    pd->name, vkr, mach_error_string(vkr), rc);
+                                if (vkr == KERN_SUCCESS && rc > 0) {
+                                    uint8_t *rp = (uint8_t *)rd;
+                                    bfix_log("40203_RECV: first 16 bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                                        rp[0],rp[1],rp[2],rp[3],rp[4],rp[5],rp[6],rp[7],
+                                        rp[8],rp[9],rp[10],rp[11],rp[12],rp[13],rp[14],rp[15]);
+                                    vm_deallocate(mach_task_self(), rd, rc);
+                                } else {
+                                    /* Also try scanning for any readable region in the task */
+                                    vm_address_t scan = 0;
+                                    vm_size_t ssize = 0;
+                                    natural_t depth = 0;
+                                    struct vm_region_submap_info_64 sinfo;
+                                    mach_msg_type_number_t scnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                                    kern_return_t skr = vm_region_recurse_64(pd->name, &scan, &ssize,
+                                        &depth, (vm_region_info_64_t)&sinfo, &scnt);
+                                    bfix_log("40203_RECV: vm_region_recurse on port=%u: kr=%d addr=0x%lx size=0x%lx",
+                                        pd->name, skr, (unsigned long)scan, (unsigned long)ssize);
+                                }
+                            }
+                            dp += sizeof(mach_msg_port_descriptor_t);
+                        } else if (dtype == MACH_MSG_OOL_DESCRIPTOR) {
+                            mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
+                            bfix_log("40203_RECV: desc[%u] OOL addr=%p size=%u", d, od->address, od->size);
+                            dp += sizeof(mach_msg_ool_descriptor_t);
+                        } else {
+                            bfix_log("40203_RECV: desc[%u] type=%u", d, dtype);
+                            dp += 12;
+                        }
+                    }
                 }
 
                 /* Dump 40206 (commit notification) body */
