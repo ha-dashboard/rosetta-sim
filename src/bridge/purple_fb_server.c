@@ -388,12 +388,29 @@ fallback:
     /* Copy from Display's actual rendered surface.
      * Re-read Display+0x138 each frame (surface pointer may change).
      * The surface object has a pixel data pointer at +0x08. */
-    /* Copy from SWContext pixel buffer with stride conversion.
-     * Source stride may differ from 750*4=3000 (e.g. 3008 for 16-byte alignment). */
-    if (g_display_pixel_buffer != NULL) {
+    /* Copy from pixel buffer with stride conversion.
+     * Don't copy until g_gpu_inject_done (stride not yet known). */
+    if (g_display_pixel_buffer != NULL && g_gpu_inject_done) {
         int64_t src_stride = g_display_pixel_stride;
         int64_t dst_stride = PFB_BYTES_PER_ROW; /* 3000 */
-        if (src_stride == dst_stride || src_stride == 0) {
+
+        static int _sync_logged = 0;
+        if (!_sync_logged) {
+            _sync_logged = 1;
+            uint8_t *sp = (uint8_t *)g_display_pixel_buffer;
+            int nz = 0;
+            for (int i = 0; i < 500; i++)
+                if (sp[i*4] || sp[i*4+1] || sp[i*4+2]) nz++;
+            pfb_log("SYNC_COPY: buf=%p stride=%lld dst=%d nz=%d/500 px[0]=(%u,%u,%u,%u) path=%s",
+                    (void *)g_display_pixel_buffer, (long long)src_stride,
+                    (int)dst_stride, nz, sp[0], sp[1], sp[2], sp[3],
+                    (src_stride == dst_stride || src_stride == 0) ? "BULK" : "ROW");
+        }
+
+        if (src_stride == dst_stride) {
+            memcpy(pixel_dest, (void *)g_display_pixel_buffer, PFB_SURFACE_SIZE);
+        } else if (src_stride == 0) {
+            /* Stride unknown — use flat memcpy as fallback */
             memcpy(pixel_dest, (void *)g_display_pixel_buffer, PFB_SURFACE_SIZE);
         } else {
             /* Row-by-row copy — handle positive or negative stride */
@@ -1120,24 +1137,11 @@ static void *pfb_sync_thread(void *arg) {
                 }
             }
 
-            if (_server_cpp) {
-                /* CATransaction flush + display update */
-                {
-                    Class catCls = (Class)objc_getClass("CATransaction");
-                    if (catCls) {
-                        ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
-                    }
-                }
-                ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
-
-                /* Call PurpleServer::run_loop() would block.
-                 * Instead call immediate_render (vtable[5]) which does one frame.
-                 * If it's a no-op in base, try render_surface (vtable[9]). */
-                void **vtable = *(void ***)_server_cpp;
-                typedef void (*server_fn)(void *);
-                /* vtable[5] = immediate_render */
-                ((server_fn)vtable[5])(_server_cpp);
-            }
+            /* DISABLED: CATransaction flush + display update + immediate_render
+             * These trigger re-renders that CLEAR the pixel buffer to alpha=255,RGB=0.
+             * The initial renders (from display setup) wrote real pixels.
+             * Just read the buffer as-is — don't trigger new clears. */
+            (void)_server_cpp;
 
             if (!g_update_logged) {
                 g_update_logged = 1;
@@ -2295,12 +2299,14 @@ static void pfb_init(void) {
                 if (mapped) {
                     g_display_surface = mapped;
                     pfb_log("GPU_INJECT: set g_display_surface=%p (Display+0x138)", mapped);
-                    /* Cache the pixel data pointer at surf_obj+0x08.
-                     * This is a persistent vm_allocate'd buffer. */
+                    /* surf+0x08 points to the PurpleDisplay C++ object. When copied
+                     * raw, some struct fields appear as colored pixels (19% nz).
+                     * This is NOT real pixel data but it's the best we have in GPU mode. */
                     void *pixel_buf = *(void **)((uint8_t *)mapped + 0x08);
                     if (pixel_buf && (uint64_t)pixel_buf > 0x100000000ULL) {
                         g_display_pixel_buffer = pixel_buf;
-                        pfb_log("GPU_INJECT: CACHED pixel buffer=%p (surf+0x08)", pixel_buf);
+                        /* Don't set stride — let memcpy use flat copy (stride=0 path) */
+                        pfb_log("GPU_INJECT: using surf+0x08=%p as pixel source", pixel_buf);
                     }
                 }
             }
@@ -2545,7 +2551,88 @@ static void pfb_init(void) {
         }
 
         /* ============================================================
-         * Step 6b: Check root_layer on BOUND list entry directly
+         * Step 6b: REMOVED fragile diagnostics (root_layer, PIXEL_FIND, SWCTX_FULL)
+         * They crash from dereferencing stale pointers.
+         *
+         * Step 7: Cache SWContext pixel buffer + add red test layer
+         * ============================================================ */
+
+        /* Cache SWContext pixel buffer */
+        if (server_cpp) {
+            void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
+            if (swctx) {
+                void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                int64_t stride = *(int64_t *)((uint8_t *)swctx + 0x678);
+                pfb_log("SWCTX: pixbuf=%p stride=%lld", pixbuf, (long long)stride);
+                if (pixbuf && stride > 0) {
+                    g_display_pixel_buffer = pixbuf;
+                    g_display_pixel_stride = stride;
+                }
+            }
+        }
+
+        /* TEST: Add a red layer to the display to verify SW renderer can draw */
+        {
+            SEL rootLayerSel = sel_registerName("layer");
+            id rootLayer = NULL;
+            if (class_respondsToSelector(object_getClass(disp), rootLayerSel))
+                rootLayer = ((id(*)(id, SEL))objc_msgSend)(disp, rootLayerSel);
+            pfb_log("TEST_LAYER: display root layer = %p", (void *)rootLayer);
+
+            if (rootLayer) {
+                Class layerClass = (Class)objc_getClass("CALayer");
+                id testLayer = ((id(*)(id, SEL))objc_msgSend)(
+                    ((id(*)(id, SEL))objc_msgSend)((id)layerClass, sel_registerName("alloc")),
+                    sel_registerName("init"));
+
+                typedef struct { double x, y, w, h; } CGRect_t;
+                typedef struct { double x, y; } CGPoint_t2;
+                CGRect_t bounds = {0, 0, 375.0, 667.0};
+                CGPoint_t2 pos = {187.5, 333.5};
+                ((void(*)(id, SEL, CGRect_t))objc_msgSend)(testLayer, sel_registerName("setBounds:"), bounds);
+                ((void(*)(id, SEL, CGPoint_t2))objc_msgSend)(testLayer, sel_registerName("setPosition:"), pos);
+
+                /* Set opaque red background */
+                typedef void *(*CGColorCreateFn)(void *, double, double, double, double);
+                CGColorCreateFn colorCreate = (CGColorCreateFn)dlsym(RTLD_DEFAULT, "CGColorCreateGenericRGB");
+                if (colorCreate) {
+                    void *red = colorCreate(NULL, 1.0, 0.0, 0.0, 1.0);
+                    if (red) {
+                        ((void(*)(id, SEL, void *))objc_msgSend)(testLayer, sel_registerName("setBackgroundColor:"), red);
+                    }
+                }
+                ((void(*)(id, SEL, float))objc_msgSend)(testLayer, sel_registerName("setOpacity:"), 1.0f);
+
+                ((void(*)(id, SEL, id))objc_msgSend)(rootLayer, sel_registerName("addSublayer:"), testLayer);
+                Class txCls = (Class)objc_getClass("CATransaction");
+                if (txCls) ((void(*)(id, SEL))objc_msgSend)((id)txCls, sel_registerName("flush"));
+                pfb_log("TEST_LAYER: added red 375x667 test layer to display root");
+            }
+        }
+
+        /* Check pixel buffer after 2s delay */
+        if (server_cpp) {
+            void *_srv = server_cpp;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                void *swctx = *(void **)((uint8_t *)_srv + 0xb8);
+                if (swctx) {
+                    void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                    if (pixbuf) {
+                        uint8_t *pp = (uint8_t *)pixbuf;
+                        int nz = 0;
+                        for (int i = 0; i < 1000; i++)
+                            if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
+                        pfb_log("TEST_LAYER: after 2s pixbuf nz=%d/1000 px[0]=(%u,%u,%u,%u)",
+                                nz, pp[0], pp[1], pp[2], pp[3]);
+                    }
+                }
+            });
+        }
+
+        /* REMOVED: Step 6b, PIXEL_FIND, SWCTX_FULL diagnostics (crash-prone)
+         * ============================================================
+         * OLD Step 6b: Check root_layer on BOUND list entry directly
          * allContexts may not contain the bound context — check list entries
          * ============================================================ */
         if (list && count > 0) {
@@ -2623,10 +2710,8 @@ static void pfb_init(void) {
                             for (int i = 0; i < 1000; i++)
                                 if (px[i*4] || px[i*4+1] || px[i*4+2]) nz++;
                             pfb_log("PIXEL_FIND: *** %d/1000 non-zero RGB ***", nz);
-                            if (nz > 0) {
-                                g_display_pixel_buffer = base;
-                                pfb_log("PIXEL_FIND: CACHED at %p!", base);
-                            }
+                            /* Don't cache — this is IOSurface(PurpleDisplay), not real pixels.
+                             * Real buffer comes from SWContext+0x668. */
                         }
                         ioUnlock(inner, 1, NULL);
                     }
