@@ -4451,7 +4451,8 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
             }
         }
 
-        return;  /* Skip CPU renderInContext */
+        return;  /* GPU path handled pixel capture attempt — skip CPU renderInContext
+                  * which blocks when CARenderServer is active in the same process. */
     }
 
     /* CPU Rendering mode: When CARenderServer is not available or display
@@ -4690,17 +4691,17 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                 }
             }
 
-            if (srv != 0 && !_force_cpu_mode()) {
-                static int _logged_remote_skip = 0;
-                if (!_logged_remote_skip) {
-                    _logged_remote_skip = 1;
-                    bridge_log("frame_capture_tick: GPU mode — flushing CATransaction to push layer tree to server (server_port=%u)", srv);
+            /* HYBRID mode: flush to CARenderServer (for display binding / touch
+             * routing), then fall through to renderInContext for pixel capture.
+             * CARenderServer handles contextIdAtPosition; CPU renderInContext
+             * captures pixels for the host app's shared framebuffer. */
+            if (srv != 0) {
+                static int _logged_hybrid = 0;
+                if (!_logged_hybrid) {
+                    _logged_hybrid = 1;
+                    bridge_log("frame_capture_tick: HYBRID mode — flush to server + CPU renderInContext (server_port=%u)", srv);
                 }
-                /* GPU mode: one-time full commit marks ALL layers dirty so the
-                 * entire layer tree is pushed to CARenderServer. After that,
-                 * periodic flushes only push incremental changes. */
-                /* Mark root layer dirty and flush — simpler approach that avoids
-                 * crashes from deep layer tree traversal. */
+                /* Flush layer tree to CARenderServer */
                 if (_bridge_root_window) {
                     id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
                         _bridge_root_window, sel_registerName("layer"));
@@ -4712,14 +4713,7 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                 ((void(*)(id, SEL))objc_msgSend)(
                     (id)objc_getClass("CATransaction"),
                     sel_registerName("flush"));
-                /* Attempt to enable GPU capture for subsequent frames. */
-                if (!g_gpu_rendering_active || !_backboardd_fb_mmap) {
-                    (void)try_map_gpu_framebuffer();
-                }
-                _cg_Release(ctx);
-                _cg_ReleaseCS(cs);
-                _sendEvent_guard_active = 0;
-                return;
+                /* Fall through to renderInContext below */
             }
 
             hdr->frame_counter++;
@@ -4732,9 +4726,37 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
             }
         }
 
+        /* HYBRID: temporarily set server_port=0 so renderInContext treats the
+         * context as LOCAL. With a REMOTE context (server_port != 0),
+         * renderInContext tries to sync with CARenderServer and crashes. */
+        uint32_t saved_srv_port = 0;
+        void *srv_port_addr = NULL;
+        {
+            Ivar lcI2 = class_getInstanceVariable(
+                object_getClass(_bridge_root_window), "_layerContext");
+            id lctx2 = lcI2 ? *(id *)((uint8_t *)_bridge_root_window +
+                                        ivar_getOffset(lcI2)) : nil;
+            if (lctx2) {
+                Ivar implI2 = class_getInstanceVariable(object_getClass(lctx2), "_impl");
+                if (implI2) {
+                    void *imp2 = *(void **)((uint8_t *)lctx2 + ivar_getOffset(implI2));
+                    if (imp2) {
+                        srv_port_addr = (uint8_t *)imp2 + 0x98;
+                        saved_srv_port = *(uint32_t *)srv_port_addr;
+                        *(uint32_t *)srv_port_addr = 0;
+                    }
+                }
+            }
+        }
+
         /* Render the layer tree into the local buffer */
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
+
+        /* Restore server_port for CARenderServer communication */
+        if (srv_port_addr) {
+            *(uint32_t *)srv_port_addr = saved_srv_port;
+        }
 
         _cg_Release(ctx);
 
