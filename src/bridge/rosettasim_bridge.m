@@ -7183,11 +7183,28 @@ rowBytes, void *transform);
      *   callbacks don't fire (observed with iOS 10.3 SDK under Rosetta 2). */
     if (getenv("ROSETTASIM_RUNLOOP_PUMP") && atoi(getenv("ROSETTASIM_RUNLOOP_PUMP"))) {
         bridge_log("  Starting manual run loop pump (~30 FPS, ROSETTASIM_RUNLOOP_PUMP=1)...");
+        /* Resolve GCD main queue drain function once */
+        typedef void (*drain_fn)(void);
+        drain_fn drain_main_q = (drain_fn)dlsym(RTLD_DEFAULT, "_dispatch_main_queue_callback_4CF");
+        bridge_log("  Pump: drain_main_queue=%p", (void *)drain_main_q);
+        static int pump_iter = 0;
         for (;;) {
             @autoreleasepool {
                 frame_capture_tick(NULL, NULL);
+
+                /* Drain CF run loop sources */
                 while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true)
                        == kCFRunLoopRunHandledSource) { /* drain */ }
+
+                /* Drain GCD main queue — UI updates from bg threads
+                 * (camera images, network callbacks) dispatch here. */
+                if (drain_main_q) drain_main_q();
+
+                if (pump_iter % 300 == 0) {
+                    bridge_log("pump: iter=%d alive", pump_iter);
+                }
+                pump_iter++;
+
                 usleep(33000);
             }
         }
