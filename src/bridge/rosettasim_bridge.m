@@ -6657,6 +6657,29 @@ rowBytes, void *transform);
              * In GPU mode, frame_capture_tick copies from GPU framebuffer
              * instead of doing renderInContext. */
             find_root_window(_bridge_delegate);
+            /* Force the first CA commit to establish the render context on the server.
+             * renderContext=0x0 is normal initially — it gets created by CARenderServer
+             * when the first layer tree diff arrives. Without this, no commits happen
+             * and the render context is never established. */
+            if (_bridge_root_window) {
+                bridge_log("Display Pipeline: forcing first CA commit...");
+                Class catClass = objc_getClass("CATransaction");
+                if (catClass) {
+                    ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("begin"));
+                    ((void(*)(id, SEL, BOOL))objc_msgSend)((id)catClass,
+                        sel_registerName("setDisableActions:"), YES);
+                    id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
+                        _bridge_root_window, sel_registerName("layer"));
+                    if (rootLayer) {
+                        ((void(*)(id, SEL))objc_msgSend)(rootLayer,
+                            sel_registerName("setNeedsDisplay"));
+                    }
+                    ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("commit"));
+                    ((void(*)(id, SEL))objc_msgSend)((id)catClass, sel_registerName("flush"));
+                    bridge_log("Display Pipeline: first commit forced");
+                }
+            }
+
             start_frame_capture();
 
             bridge_log("Display Pipeline: Setup complete");
