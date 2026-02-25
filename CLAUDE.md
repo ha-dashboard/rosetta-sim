@@ -151,9 +151,9 @@ scripts/kill_sim.sh
 ### Active Issues
 1. **UIScreen.scale** — not yet verified in GPU mode. `GSSetMainScreenInfo` sets GS-level scale (750x1334 @2x), but UIScreen's internal `_scale` ivar path (via BKSDisplayServices) needs verification.
 2. **Scroll crash (SIGSEGV)** — not yet tested in GPU mode. Previously: UIScrollView pan gesture triggers CA layout passes that access CARenderServer state.
-3. **Frame counter slow** — GPU framebuffer advances ~100 frames/95s. CA context is LOCAL (renderContext=0x0) so commits don't reach CARenderServer. Needs REMOTE context via workspace scene assignment for GPU compositing. CPU rendering (renderInContext) works independently.
+3. ~~**Frame counter slow**~~ **PARTIALLY RESOLVED (Session 18)**: GPU framebuffer HAS pixel data (23-25% non-zero). connect_remote succeeds, RegisterClient succeeds, CA context properly initialized (client_id, server_port, local_id all valid). The "renderCtx=0x0" was at a wrong offset (reading a pthread_mutex). Frame counter advances (delta=3 in 10s) but slowly — only initial commits produce frames. Need more frequent CA commits (CADisplayLink or forced flush).
 4. ~~**CFRunLoop timers don't fire**~~ **RESOLVED (Session 18)**: CFRunLoop works correctly under Rosetta 2. `CFRunLoopRunInMode(default, 0.5, false)` returns `kCFRunLoopRunTimedOut` (3) — it blocks properly. CFRunLoopTimer callbacks fire at expected intervals. The previous assumption was wrong — `CFRunLoopRunInMode` with `returnAfterSourceHandled=true` and `timeout=0` returns immediately by design (kCFRunLoopRunHandledSource or kCFRunLoopRunFinished), not due to Rosetta. The `ROSETTASIM_RUNLOOP_PUMP` manual pump is no longer needed for the app process.
-5. **Workspace listener not servicing** — recv port obtained but dispatch_mach channel monitors wrong port. Not needed for compat mode (app works without workspace). Required for strict/GPU mode with REMOTE CA context.
+5. **Workspace listener not servicing** — recv port obtained but dispatch_mach channel monitors wrong port. Not needed for compat mode (app works without workspace). GPU compositing works WITHOUT workspace (connect_remote succeeds directly).
 
 ### Key Architectural Decisions (Session 17)
 - **Acceptance gate serves messages**: replaced `usleep()` loop with `drain_pending_messages()` so the broker keeps processing bootstrap/XPC requests while waiting for the app framebuffer
@@ -170,7 +170,7 @@ scripts/kill_sim.sh
 - Session 15: XPC wire type fixes, broker-hosted PFB, app startup
 - Session 16: Screen scale fix (GSSetMainScreenInfo takes pixels), app rendering working
 - Session 17: GPU display pipeline active — acceptance gate passes. Fixed: broker message drain, per-process mobilegestalt, SBShim injection target, system.logger stub, UIApplicationMain timeout, makeKeyAndVisible IMP timing
-- Session 18: **SpringBoard survives FBSystemAppMain** — all 30 init steps complete. SB stays alive via exit/abort interposition + _run swizzle. Workspace listener created/checked in (not servicing, but sufficient for compat mode). App fully functional (HA Dashboard, cameras, mDNS, 60s+). **CFRunLoop WORKS under Rosetta 2** — debunked false timer assumption. Manual pump no longer needed.
+- Session 18: **SpringBoard survives FBSystemAppMain** — all 30 init steps. SB alive via exit/abort interposition + _run swizzle. App fully functional (HA Dashboard, cameras, 60s+). **CFRunLoop WORKS under Rosetta 2** — debunked false timer assumption. **GPU framebuffer HAS pixel data** — connect_remote succeeds, RegisterClient succeeds, CA context properly initialized. Simplified CARenderServerGetServerPort (removed conflicting manual RegisterClient/setClientPort). Corrected CA::Context C++ object layout (4 mutexes, not encoder IDs).
 
 ## Mach IPC Reference
 
