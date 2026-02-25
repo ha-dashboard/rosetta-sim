@@ -7711,6 +7711,40 @@ static void swizzle_bks_methods(void) {
      * this with a proper stolen-bytes trampoline so the replacement can call
      * the original without re-entering itself. */
     bridge_log("  UIApplicationMain: relying on DYLD __interpose (runtime patch disabled)");
+
+    /* +[CAContext remoteContextWithOptions:] — inject display=1 and displayable=YES
+     * into ANY options dict UIKit passes. UIKit's _createContextAttached normally
+     * creates a context WITHOUT display binding (that info comes from FBSScene/workspace).
+     * By injecting display=1 here, CARenderServer binds the context to PurpleDisplay
+     * and composites it onto the display surface (GPU rendering). */
+    if (!_force_cpu_mode()) {
+        Class caCtxClass = objc_getClass("CAContext");
+        if (caCtxClass) {
+            SEL remoteCtxSel = sel_registerName("remoteContextWithOptions:");
+            Method m = class_getClassMethod(caCtxClass, remoteCtxSel);
+            if (m) {
+                static IMP g_orig_remoteCtxOpts = NULL;
+                g_orig_remoteCtxOpts = method_getImplementation(m);
+
+                id (^swizzleBlock)(id, NSDictionary *) = ^id(id _self, NSDictionary *opts) {
+                    NSMutableDictionary *newOpts = opts ? [opts mutableCopy] : [NSMutableDictionary new];
+                    if (!newOpts[@"display"]) {
+                        newOpts[@"display"] = @(1);
+                    }
+                    if (!newOpts[@"displayable"]) {
+                        newOpts[@"displayable"] = @YES;
+                    }
+                    bridge_log("remoteContextWithOptions SWIZZLE: display=%u displayable=%d (orig keys: %lu)",
+                               [newOpts[@"display"] unsignedIntValue],
+                               [newOpts[@"displayable"] boolValue],
+                               (unsigned long)(opts ? [opts count] : 0));
+                    return ((id(*)(id, SEL, id))g_orig_remoteCtxOpts)(_self, remoteCtxSel, newOpts);
+                };
+                method_setImplementation(m, imp_implementationWithBlock(swizzleBlock));
+                bridge_log("  +[CAContext remoteContextWithOptions:] → injects display=1, displayable=YES");
+            }
+        }
+    }
 }
 
 /* Global exception handler — log with full context, re-throw unknown exceptions.
