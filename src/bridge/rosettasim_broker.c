@@ -2807,6 +2807,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
      * which blocks on render_update virtual call. Need render_update fix. */
     /* CPU default. GPU: context list at server+0x68 (pointer array, stride 0x10),
      * count at server+0x78. contextItem+0x0C = context_id. Next: write directly. */
+    /* CPU default. GPU BREAKTHROUGH: contexts ARE in server list (count=8).
+     * hit_test bounds check fails — contexts need valid bounds at (375,667).
+     * Next: fix context bounds or set display bounds on contexts. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

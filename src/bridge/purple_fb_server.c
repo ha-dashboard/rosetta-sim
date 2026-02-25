@@ -2048,21 +2048,17 @@ static void pfb_init(void) {
      * with the MIG server thread. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        pfb_log("GPU_BIND: trying force-unlock + add_context on main thread...");
+        pfb_log("GPU_INJECT: direct context list injection on main thread...");
 
-        /* Patch vtable[8] (render_update) to no-op, then call add_context.
-         * add_context calls render_update which blocks waiting for display refresh.
-         * By no-opping render_update, add_context completes and binds contexts. */
-
-        /* Get server from display */
+        /* Get server C++ object */
         Class wsCls = (Class)objc_getClass("CAWindowServer");
-        if (!wsCls) { pfb_log("GPU_BIND: no CAWindowServer"); return; }
+        if (!wsCls) { pfb_log("GPU_INJECT: no CAWindowServer"); return; }
         id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
-        if (!ws) { pfb_log("GPU_BIND: no server"); return; }
+        if (!ws) { pfb_log("GPU_INJECT: no server"); return; }
         id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
         unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
             disps, sel_registerName("count")) : 0;
-        if (dcnt == 0) { pfb_log("GPU_BIND: no displays"); return; }
+        if (dcnt == 0) { pfb_log("GPU_INJECT: no displays"); return; }
         id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
             disps, sel_registerName("objectAtIndex:"), 0UL);
 
@@ -2072,56 +2068,35 @@ static void pfb_init(void) {
             void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(implI));
             if (impl) server_cpp = *(void **)((uint8_t *)impl + 0x40);
         }
-        if (!server_cpp) { pfb_log("GPU_BIND: no server_cpp"); return; }
+        if (!server_cpp) { pfb_log("GPU_INJECT: no server_cpp"); return; }
 
-        /* Force-unlock os_unfair_lock at server+0x08 */
-        uint32_t *lock_ptr = (uint32_t *)((uint8_t *)server_cpp + 0x08);
-        uint32_t old_lock = *lock_ptr;
-        *lock_ptr = 0; /* unlock */
-        pfb_log("GPU_BIND: force-unlocked server+0x08 (was 0x%x)", old_lock);
+        /* Read existing context list */
+        void *list = *(void **)((uint8_t *)server_cpp + 0x68);
+        uint64_t count = *(uint64_t *)((uint8_t *)server_cpp + 0x78);
+        pfb_log("GPU_INJECT: server+0x68=%p count=%llu", list, (unsigned long long)count);
 
-        /* Calculate add_context address. With fake vtable, render_update is
-         * a no-op so add_context should complete without blocking. */
-        void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-        if (!known) { pfb_log("GPU_BIND: dlsym failed"); return; }
-        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-        typedef void (*add_ctx_fn)(void *, void *);
-        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
-        pfb_log("GPU_BIND: add_context at %p (slide=0x%lx)", (void *)add_ctx, (long)slide);
-
-        /* Get all contexts and add them */
-        Class caCtxCls = (Class)objc_getClass("CAContext");
-        id ctxs = ((id(*)(id, SEL))objc_msgSend)(
-            (id)caCtxCls, sel_registerName("allContexts"));
-        unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
-            ctxs, sel_registerName("count")) : 0;
-        pfb_log("GPU_BIND: %lu contexts to add", cnt);
-
-        /* Replace Display vtable pointer with a FAKE vtable where slot 8
-         * (render_update at offset 0x40) is a no-op. The real vtable is in
-         * read-only memory; we can't patch it. Instead, create a copy on the
-         * heap and swap the vtable pointer on the Display object. */
-        void *display_obj = *(void **)((uint8_t *)server_cpp + 0x58);
-        pfb_log("GPU_BIND: server+0x58 = %p (this is what add_context uses)", display_obj);
-        void **orig_vtable = NULL;
-        static void *fake_vtable[40];
-        if (display_obj) {
-            orig_vtable = *(void ***)display_obj;
-            if (orig_vtable) {
-                /* Copy vtable entries */
-                for (int vi = 0; vi < 40; vi++) fake_vtable[vi] = orig_vtable[vi];
-                /* Replace slot 8 (render_update) with a no-op that returns 1 */
-                fake_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np");
-                pfb_log("GPU_BIND: orig_vtable=%p fake_vtable=%p slot8: %p → %p",
-                        (void *)orig_vtable, (void *)fake_vtable,
-                        orig_vtable[8], fake_vtable[8]);
-                /* Swap vtable pointer on heap-allocated Display object */
-                *(void ***)display_obj = fake_vtable;
-                pfb_log("GPU_BIND: swapped Display vtable pointer");
+        /* Dump existing entries to understand the structure */
+        if (list && count > 0) {
+            for (uint64_t i = 0; i < count && i < 5; i++) {
+                void *entry = *(void **)((uint8_t *)list + i * 0x10);
+                uint64_t meta = *(uint64_t *)((uint8_t *)list + i * 0x10 + 8);
+                if (entry) {
+                    uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
+                    pfb_log("  list[%llu]: ptr=%p meta=0x%llx ctx_id=%u",
+                            (unsigned long long)i, entry, (unsigned long long)meta, cid);
+                }
             }
         }
 
-        for (unsigned long i = 0; i < cnt; i++) {
+        /* Get app's Render::Context* from allContexts */
+        Class caCtxCls = (Class)objc_getClass("CAContext");
+        id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
+        unsigned long ctx_cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            ctxs, sel_registerName("count")) : 0;
+        pfb_log("GPU_INJECT: %lu server-side contexts available", ctx_cnt);
+
+        /* Try inserting the first context with a valid context_id */
+        for (unsigned long i = 0; i < ctx_cnt; i++) {
             id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
                 ctxs, sel_registerName("objectAtIndex:"), i);
             if (!ctx) continue;
@@ -2131,25 +2106,16 @@ static void pfb_init(void) {
             if (!cimpl) continue;
             unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                 ctx, sel_registerName("contextId"));
-            pfb_log("GPU_BIND: add_context ctx[%lu] id=%u impl=%p", i, cid, cimpl);
-            add_ctx(server_cpp, cimpl);
-            pfb_log("GPU_BIND: ctx[%lu] DONE", i);
+            pfb_log("GPU_INJECT: ctx[%lu] id=%u impl=%p +0x0C=%u",
+                    i, cid, cimpl, *(uint32_t *)((uint8_t *)cimpl + 0x0C));
         }
 
-        /* Restore original vtable pointer */
-        if (display_obj && orig_vtable) {
-            *(void ***)display_obj = orig_vtable;
-            pfb_log("GPU_BIND: restored original vtable pointer");
-        }
-
-        /* Check result */
-        {
-            typedef struct { double x; double y; } CGPoint_t;
-            CGPoint_t center = { 375.0, 667.0 };
-            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
-                disp, sel_registerName("contextIdAtPosition:"), center);
-            pfb_log("GPU_BIND: contextIdAtPosition=%u AFTER add_context", bound);
-        }
+        /* Check contextIdAtPosition before and after */
+        typedef struct { double x; double y; } CGPoint_t;
+        CGPoint_t center = { 375.0, 667.0 };
+        unsigned int before = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+            disp, sel_registerName("contextIdAtPosition:"), center);
+        pfb_log("GPU_INJECT: contextIdAtPosition BEFORE = %u", before);
     });
 }
 
