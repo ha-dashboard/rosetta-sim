@@ -2799,6 +2799,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
      * Need to investigate Render::Server vs WindowServer::Server relationship. */
     /* CPU default. GPU: add_context blocks on os_unfair_lock — backboardd
      * main thread not running CFRunLoop (main queue doesn't drain). */
+    /* CPU default. GPU: add_context deadlocks on os_unfair_lock held permanently
+     * by CARenderServer MIG handler. Main queue drains but lock never releases.
+     * Override: ROSETTASIM_CA_MODE=gpu */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

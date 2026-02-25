@@ -2042,6 +2042,81 @@ static void pfb_init(void) {
     }
 
     pfb_log("PurpleFBServer ready — all interpositions active");
+
+    /* Main queue IS draining — use dispatch_after for GPU context binding.
+     * add_context must run on the main thread to avoid lock contention
+     * with the MIG server thread. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        pfb_log("GPU_BIND: starting on main thread...");
+
+        /* First: try CATransaction flush on main thread — may trigger attach_contexts
+         * naturally through the server's commit processing path. */
+        {
+            Class catCls = (Class)objc_getClass("CATransaction");
+            if (catCls) {
+                ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
+                pfb_log("GPU_BIND: CATransaction flush done on main thread");
+            }
+        }
+
+        /* Get WindowServer and display */
+        Class wsClass = (Class)objc_getClass("CAWindowServer");
+        if (!wsClass) { pfb_log("GPU_BIND: no CAWindowServer"); return; }
+        id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("server"));
+        if (!ws) { pfb_log("GPU_BIND: no server"); return; }
+        id displays = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+        unsigned long dcnt = displays ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            displays, sel_registerName("count")) : 0;
+        if (dcnt == 0) { pfb_log("GPU_BIND: no displays"); return; }
+        id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+            displays, sel_registerName("objectAtIndex:"), 0UL);
+
+        /* Get C++ server from display */
+        void *server_cpp = NULL;
+        Ivar implI = class_getInstanceVariable(object_getClass(disp), "_impl");
+        if (implI) {
+            void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(implI));
+            if (impl) server_cpp = *(void **)((uint8_t *)impl + 0x40);
+        }
+        if (!server_cpp) { pfb_log("GPU_BIND: no server_cpp"); return; }
+
+        /* Calculate add_context address */
+        void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+        if (!known) { pfb_log("GPU_BIND: dlsym failed"); return; }
+        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
+        typedef void (*add_ctx_fn)(void *, void *);
+        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+
+        /* Get all contexts */
+        Class caCtxCls = (Class)objc_getClass("CAContext");
+        id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
+        unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            ctxs, sel_registerName("count")) : 0;
+        pfb_log("GPU_BIND: %lu contexts, server=%p, add_ctx=%p", cnt, server_cpp, (void *)add_ctx);
+
+        for (unsigned long i = 0; i < cnt; i++) {
+            id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                ctxs, sel_registerName("objectAtIndex:"), i);
+            if (!ctx) continue;
+            Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
+            if (!ci) continue;
+            void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
+            if (!cimpl) continue;
+            unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                ctx, sel_registerName("contextId"));
+            pfb_log("GPU_BIND: adding ctx[%lu] id=%u impl=%p", i, cid, cimpl);
+            add_ctx(server_cpp, cimpl);
+            pfb_log("GPU_BIND: ctx[%lu] added OK", i);
+        }
+
+        /* Check result */
+        typedef struct { double x; double y; } CGPoint_t;
+        CGPoint_t center = { 375.0, 667.0 };
+        unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+            disp, sel_registerName("contextIdAtPosition:"), center);
+        pfb_log("GPU_BIND: contextIdAtPosition=%u (after add_context)", bound);
+    });
 }
 
 /* ================================================================
