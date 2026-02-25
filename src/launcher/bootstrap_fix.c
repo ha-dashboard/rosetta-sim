@@ -1153,7 +1153,7 @@ static void _pcr_do_render(void) {
         bfix_log("POST_COMMIT_RENDER[%d]: render_for_time on thread='%s'",
             g_pcr_render_count, tname[0] ? tname : "(unnamed)");
 
-        if (g_pcr_render_count <= 5) {
+        if (g_pcr_render_count <= 5 || g_pcr_render_count == 100 || g_pcr_render_count == 500) {
             void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
             if (swctx) {
                 void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
@@ -1166,6 +1166,63 @@ static void _pcr_do_render(void) {
                         g_pcr_render_count, nz);
                 }
             }
+
+            /* Diagnostic: dump context states + root layer details */
+            void *srv = g_pcr_rft_srv;
+            void **ctx_list = *(void ***)((uint8_t *)srv + 0x68);
+            uint64_t ctx_count = *(uint64_t *)((uint8_t *)srv + 0x78);
+            bfix_log("CTX_DIAG[%d]: ctx_count=%llu",
+                g_pcr_render_count, (unsigned long long)ctx_count);
+
+            for (uint64_t ci = 0; ci < ctx_count && ci < 10; ci++) {
+                void *ctx = *(void **)((uint8_t *)ctx_list + ci * 0x10);
+                if (!ctx) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)ctx + 0x0C);
+                uint32_t commit_seed = *(uint32_t *)((uint8_t *)ctx + 0x24);
+                void *root_handle = *(void **)((uint8_t *)ctx + 0xB8);
+                bfix_log("CTX[%llu]: id=%u seed=%u handle=%p",
+                    (unsigned long long)ci, cid, commit_seed, root_handle);
+
+                if (!root_handle) continue;
+
+                /* Root layer at handle+0x18 (from static analysis) */
+                void *root_layer = *(void **)((uint8_t *)root_handle + 0x18);
+                if (!root_layer) {
+                    bfix_log("  ROOT: handle=%p but layer=NULL", root_handle);
+                    continue;
+                }
+
+                /* Bounds at layer+0x98 (float w) and +0x9C (float h) */
+                float fw = *(float *)((uint8_t *)root_layer + 0x98);
+                float fh = *(float *)((uint8_t *)root_layer + 0x9C);
+
+                /* Sublayer array at +0x70 */
+                void *sub_array = *(void **)((uint8_t *)root_layer + 0x70);
+                int sub_count = sub_array ? *(int *)((uint8_t *)sub_array + 0x0C) : -1;
+
+                /* Contents at +0x60 */
+                void *contents = *(void **)((uint8_t *)root_layer + 0x60);
+
+                bfix_log("  ROOT: layer=%p %.0fx%.0f sublayers=%d contents=%p",
+                    root_layer, fw, fh, sub_count, contents);
+
+                /* Dump first 2 sublayers if present */
+                if (sub_array && sub_count > 0) {
+                    for (int s = 0; s < sub_count && s < 3; s++) {
+                        void *sub = *(void **)((uint8_t *)sub_array + 0x10 + s * 8);
+                        if (!sub) continue;
+                        float sw = *(float *)((uint8_t *)sub + 0x98);
+                        float sh = *(float *)((uint8_t *)sub + 0x9C);
+                        void *sc = *(void **)((uint8_t *)sub + 0x60);
+                        void *sub_subs = *(void **)((uint8_t *)sub + 0x70);
+                        int ss_count = sub_subs ? *(int *)((uint8_t *)sub_subs + 0x0C) : -1;
+                        bfix_log("    SUB[%d]: %.0fx%.0f contents=%p sublayers=%d",
+                            s, sw, sh, sc, ss_count);
+                    }
+                }
+            }
+
+            /* Bound context check removed — struct arg passing issue */
         }
     }
 }
@@ -1383,6 +1440,26 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 }
                 /* Schedule render_for_time on the next mach_msg call */
                 g_commit_render_pending = 1;
+
+                /* Check if commit arrives on server port vs context port.
+                 * If on server port, context_by_server_port returns NULL
+                 * and run_command_stream processes with no context → commands lost. */
+                {
+                    static mach_port_t _cached_srv_port = 0;
+                    static int _port_chk_n = 0;
+                    if (!_cached_srv_port) {
+                        typedef mach_port_t (*GSPFn)(void);
+                        GSPFn gsp = (GSPFn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                        if (gsp) _cached_srv_port = gsp();
+                    }
+                    if (_port_chk_n < 10) {
+                        _port_chk_n++;
+                        bfix_log("COMMIT_PORT: local=%u srv=%u %s",
+                            msg->msgh_local_port, _cached_srv_port,
+                            (msg->msgh_local_port == _cached_srv_port)
+                                ? "ON_SERVER(ctx=NULL!)" : "ON_CONTEXT(ok)");
+                    }
+                }
 
                 /* Check for magic 0x9C42/0x9C43 at expected offset */
                 uint8_t *raw = (uint8_t *)msg;
