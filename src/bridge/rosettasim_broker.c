@@ -2797,6 +2797,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
      * without deep display driver integration. ROSETTASIM_CA_MODE=gpu to test. */
     /* CPU default. GPU: attach_contexts callable but doesn't bind contexts.
      * Need to investigate Render::Server vs WindowServer::Server relationship. */
+    /* CPU default. GPU: add_context blocks on os_unfair_lock — backboardd
+     * main thread not running CFRunLoop (main queue doesn't drain). */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

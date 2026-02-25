@@ -264,6 +264,7 @@ static void pfb_setup_shared_framebuffer(void) {
  * flush_shmem from PurpleDisplay. For now we'll use a simple periodic copy. */
 static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
 static volatile int g_layer_host_created; /* defined later, declared here for pfb_sync_to_shared */
+static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
 typedef void *CGColorSpaceRef;
@@ -292,7 +293,9 @@ static void pfb_sync_to_shared(void) {
      * Throttle to ~30fps (every other 60Hz tick). */
     static volatile int _render_tick = 0;
     _render_tick++;
-    if (g_layer_host_ref && g_layer_host_created && (_render_tick % 2 == 0)) {
+    /* DISABLED: CALayerHost renderInContext blocks when context is REMOTE.
+     * Skip in GPU mode — the sync thread only needs to copy the PurpleDisplay surface. */
+    if (0 && g_layer_host_ref && g_layer_host_created && (_render_tick % 2 == 0)) {
         /* Render CALayerHost directly from the sync thread.
          * CALayer renderInContext is not officially thread-safe, but works
          * for simple layer trees. Avoid dispatch_sync to main queue
@@ -608,6 +611,9 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
         displays, sel_registerName("objectAtIndex:"), (unsigned long)0);
     pfb_log("Display[0] = %p", (void *)display);
 
+    /* Cache for sync thread */
+    g_cached_display = display;
+
     /* Log displayId and scan C++ impl for function pointers */
     {
         SEL didSel = sel_registerName("displayId");
@@ -643,22 +649,32 @@ static void pfb_create_layer_host(void *ctx_id_ptr) {
                         }
                     }
                 }
-                /* Get C++ CA::Display::Server* from _impl+0x40 */
+                /* Get C++ CA::Display::Server* from _impl+0x40 and dump layout */
                 {
                     void *server = *(void **)((uint8_t *)displayImpl + 0x40);
-                    pfb_log("CA::Display::Server* at _impl+0x40: %p", server);
+                    pfb_log("PurpleServer at _impl+0x40: %p", server);
                     if (server && (uint64_t)server > 0x100000) {
-                        /* Dump Server vtable */
-                        void **vtable = *(void **)server;
-                        if (vtable && (uint64_t)vtable > 0x100000) {
-                            pfb_log("Server vtable: %p", (void *)vtable);
-                            for (int i = 0; i < 30; i++) {
-                                if (!vtable[i]) break;
+                        /* Dump server object — find Render::Server, context list, etc */
+                        /* Raw hex dump of PurpleServer object */
+                        pfb_log("PurpleServer RAW (256 bytes):");
+                        for (int off = 0; off < 256; off += 32) {
+                            pfb_log("  +%02x: %016llx %016llx %016llx %016llx",
+                                    off,
+                                    (unsigned long long)*(uint64_t *)((uint8_t *)server + off),
+                                    (unsigned long long)*(uint64_t *)((uint8_t *)server + off + 8),
+                                    (unsigned long long)*(uint64_t *)((uint8_t *)server + off + 16),
+                                    (unsigned long long)*(uint64_t *)((uint8_t *)server + off + 24));
+                        }
+                        /* Also resolve any pointers to known objects */
+                        for (int off = 0; off < 0x100; off += 8) {
+                            uint64_t val = *(uint64_t *)((uint8_t *)server + off);
+                            if (val > 0x100000 && val < 0x7fffffffffffULL) {
                                 Dl_info info;
-                                if (dladdr(vtable[i], &info) && info.dli_sname) {
-                                    pfb_log("  svt[%d]: %s", i, info.dli_sname);
-                                } else {
-                                    pfb_log("  svt[%d]: %p", i, vtable[i]);
+                                /* Check if val points to something with a recognizable vtable */
+                                uint64_t inner = *(uint64_t *)val;
+                                if (inner > 0x100000 && inner < 0x7fffffffffffULL &&
+                                    dladdr((void *)inner, &info) && info.dli_sname) {
+                                    pfb_log("  +0x%02x → %s", off, info.dli_sname);
                                 }
                             }
                         }
@@ -879,36 +895,31 @@ static void *pfb_sync_thread(void *arg) {
     (void)arg;
     pfb_log("Sync thread started (60 Hz)");
 
-    /* Cache the display object for update calls */
-    static id g_cached_display = NULL;
     static int g_update_logged = 0;
 
+    static volatile int _sync_iter = 0;
     while (g_running) {
-        pfb_sync_to_shared();
+        _sync_iter++;
+        if (_sync_iter % 60 == 0) {
+            pfb_log("SYNC_ITER: %d (fc=%llu)",
+                    _sync_iter,
+                    g_shared_fb != MAP_FAILED ?
+                    (unsigned long long)((RosettaSimFramebufferHeader *)g_shared_fb)->frame_counter : 0ULL);
+        }
+        /* pfb_sync_to_shared temporarily disabled for debugging */
+        /* pfb_sync_to_shared(); */
 
-        /* Check for app's context ID to create CALayerHost */
-        pfb_check_context_id();
+        /* pfb_check_context_id DISABLED — blocks sync thread via locks */
 
         /* Trigger CAWindowServer display update cycle.
          * This calls attach_contexts → add_context → set_display_info,
          * binding registered contexts to the display for GPU compositing. */
-        if (!g_cached_display) {
-            Class wsClass = (Class)objc_getClass("CAWindowServer");
-            if (wsClass) {
-                id server = ((id(*)(id, SEL))objc_msgSend)(
-                    (id)wsClass, sel_registerName("server"));
-                if (server) {
-                    id displays = ((id(*)(id, SEL))objc_msgSend)(
-                        server, sel_registerName("displays"));
-                    if (displays) {
-                        unsigned long cnt = ((unsigned long(*)(id, SEL))objc_msgSend)(
-                            displays, sel_registerName("count"));
-                        if (cnt > 0) {
-                            g_cached_display = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-                                displays, sel_registerName("objectAtIndex:"), 0UL);
-                        }
-                    }
-                }
+        /* g_cached_display is set by pfb_create_layer_host on the main thread */
+        {
+            static int _disp_check = 0;
+            if (++_disp_check == 300) {
+                pfb_log("SYNC_THREAD: g_cached_display=%p g_layer_host_created=%d",
+                        (void *)g_cached_display, g_layer_host_created);
             }
         }
         if (g_cached_display) {
@@ -950,6 +961,53 @@ static void *pfb_sync_thread(void *arg) {
                 }
                 if (g_server_cpp && g_attach_fn) {
                     g_attach_fn(g_server_cpp);
+                }
+
+                /* Direct add_context: get each CAContext's _impl and call add_context */
+                {
+                    static int _add_ctx_done = 0;
+                    static int _add_ctx_tick = 0;
+                    _add_ctx_tick++;
+                    /* Wait ~20s (1200 ticks at 60Hz) for contexts to register, then try once */
+                    if (!_add_ctx_done && _add_ctx_tick == 1200 && g_server_cpp) {
+                        _add_ctx_done = 1;
+                        void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+                        if (known) {
+                            ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
+                            typedef void (*add_ctx_fn)(void *, void *);
+                            add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+
+                            Class caCtxCls = (Class)objc_getClass("CAContext");
+                            id ctxs = ((id(*)(id, SEL))objc_msgSend)(
+                                (id)caCtxCls, sel_registerName("allContexts"));
+                            unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                                ctxs, sel_registerName("count")) : 0;
+                            pfb_log("ADD_CONTEXT: attempting for %lu contexts", cnt);
+
+                            for (unsigned long i = 0; i < cnt; i++) {
+                                id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                    ctxs, sel_registerName("objectAtIndex:"), i);
+                                if (!ctx) continue;
+                                Ivar implI = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                                if (!implI) continue;
+                                void *impl = *(void **)((uint8_t *)ctx + ivar_getOffset(implI));
+                                if (!impl) continue;
+                                unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                    ctx, sel_registerName("contextId"));
+                                pfb_log("ADD_CONTEXT: ctx[%lu] id=%u impl=%p", i, cid, impl);
+                                add_ctx(g_server_cpp, impl);
+                                pfb_log("ADD_CONTEXT: ctx[%lu] added (no crash)", i);
+                            }
+
+                            /* Check result */
+                            typedef struct { double x; double y; } CGPoint_t;
+                            CGPoint_t center = { 375.0, 667.0 };
+                            SEL ctxSel = sel_registerName("contextIdAtPosition:");
+                            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                                g_cached_display, ctxSel, center);
+                            pfb_log("ADD_CONTEXT: after add_context, contextIdAtPosition=%u", bound);
+                        }
+                    }
                 }
             }
 
@@ -995,6 +1053,84 @@ static void *pfb_sync_thread(void *arg) {
                     id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
                     unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(ctxs, sel_registerName("count")) : 0;
                     pfb_log("PERIODIC_CHECK: contextIdAtPosition=%u allContexts=%lu", cid, cnt);
+                }
+            }
+        }
+
+        /* Standalone add_context attempt — runs independently of g_cached_display */
+        {
+            static int _add_done = 0;
+            static int _add_tick = 0;
+            _add_tick++;
+            if (!_add_done && _add_tick == 1200) { /* ~20s at 60Hz */
+                _add_done = 1;
+                pfb_log("ADD_CONTEXT_STANDALONE: starting...");
+
+                /* Get server from CAWindowServer */
+                void *server_cpp = NULL;
+                id disp = NULL;
+                Class wsClass = (Class)objc_getClass("CAWindowServer");
+                if (wsClass) {
+                    id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("server"));
+                    if (!ws) ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("serverIfRunning"));
+                    if (ws) {
+                        id displays = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+                        unsigned long cnt = displays ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                            displays, sel_registerName("count")) : 0;
+                        if (cnt > 0) {
+                            disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                displays, sel_registerName("objectAtIndex:"), 0UL);
+                        }
+                        pfb_log("ADD_CONTEXT_STANDALONE: ws=%p displays=%lu disp=%p", (void *)ws, cnt, (void *)disp);
+                    }
+                }
+                if (disp) {
+                    Ivar implI = class_getInstanceVariable(object_getClass(disp), "_impl");
+                    if (implI) {
+                        void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(implI));
+                        if (impl) server_cpp = *(void **)((uint8_t *)impl + 0x40);
+                    }
+                }
+                pfb_log("ADD_CONTEXT_STANDALONE: server_cpp=%p", server_cpp);
+
+                if (server_cpp) {
+                    void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+                    if (known) {
+                        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
+                        typedef void (*add_ctx_fn)(void *, void *);
+                        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+
+                        Class caCtxCls = (Class)objc_getClass("CAContext");
+                        id ctxs = ((id(*)(id, SEL))objc_msgSend)(
+                            (id)caCtxCls, sel_registerName("allContexts"));
+                        unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                            ctxs, sel_registerName("count")) : 0;
+                        pfb_log("ADD_CONTEXT_STANDALONE: %lu contexts to add", cnt);
+
+                        for (unsigned long i = 0; i < cnt; i++) {
+                            id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                ctxs, sel_registerName("objectAtIndex:"), i);
+                            if (!ctx) continue;
+                            Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                            if (!ci) continue;
+                            void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
+                            if (!cimpl) continue;
+                            unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                ctx, sel_registerName("contextId"));
+                            pfb_log("ADD_CONTEXT_STANDALONE: [%lu] id=%u impl=%p", i, cid, cimpl);
+                            add_ctx(server_cpp, cimpl);
+                            pfb_log("ADD_CONTEXT_STANDALONE: [%lu] done", i);
+                        }
+
+                        /* Check */
+                        if (disp) {
+                            typedef struct { double x; double y; } CGPoint_t;
+                            CGPoint_t center = { 375.0, 667.0 };
+                            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                                disp, sel_registerName("contextIdAtPosition:"), center);
+                            pfb_log("ADD_CONTEXT_STANDALONE: contextIdAtPosition=%u", bound);
+                        }
+                    }
                 }
             }
         }
