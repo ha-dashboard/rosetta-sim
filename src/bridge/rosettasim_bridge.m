@@ -110,6 +110,8 @@ static void *_iosym_lock = NULL;
 static void *_iosym_unlock = NULL;
 static int _iosym_resolved = 0;
 
+static void *_iosym_create = NULL;
+
 static void resolve_iosurface_symbols(void) {
     if (_iosym_resolved) return;
     _iosym_resolved = 1;
@@ -119,6 +121,7 @@ static void resolve_iosurface_symbols(void) {
     _iosym_getBaseAddress = bridge_find_function("IOSurfaceGetBaseAddress");
     _iosym_lock = bridge_find_function("IOSurfaceLock");
     _iosym_unlock = bridge_find_function("IOSurfaceUnlock");
+    _iosym_create = bridge_find_function("IOSurfaceCreate");
 }
 
 /* Forward declarations for frame capture system */
@@ -4274,27 +4277,30 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                             _ios_log_done = 1;
                             bridge_log("GPU_CAPTURE: IOSurface nlist scan: w=%p h=%p lock=%p base=%p bpr=%p",
                                        getW, getH, lockFn, getBase, _iosym_getBytesPerRow);
-                            /* Verify function addresses via Dl_info */
-                            if (getW) {
-                                Dl_info di;
-                                if (dladdr((void *)getW, &di) && di.dli_fname)
-                                    bridge_log("GPU_CAPTURE: getW at %p → %s (%s)", (void *)getW, di.dli_sname ?: "?", di.dli_fname);
-                            }
-                            /* Test call with CFTypeID check */
-                            if (getW && ioSurface) {
-                                CFTypeID tid = CFGetTypeID((CFTypeRef)ioSurface);
-                                bridge_log("GPU_CAPTURE: ioSurface=%p CFTypeID=%lu class=%s",
-                                           ioSurface, (unsigned long)tid,
-                                           class_getName(object_getClass((id)ioSurface)));
-                                /* Try locking first, then read */
-                                if (lockFn) {
-                                    int lr = lockFn(ioSurface, 1, NULL);
-                                    bridge_log("GPU_CAPTURE: lock(%p, READ) = %d", ioSurface, lr);
+                            /* Test: create IOSurface manually to verify functions work */
+                            if (_iosym_create) {
+                                typedef void *(*IOSCreateFn)(CFDictionaryRef);
+                                IOSCreateFn createFn = (IOSCreateFn)_iosym_create;
+                                NSDictionary *props = @{
+                                    @"IOSurfaceWidth": @(750),
+                                    @"IOSurfaceHeight": @(1334),
+                                    @"IOSurfaceBytesPerRow": @(3000),
+                                    @"IOSurfaceBytesPerElement": @(4),
+                                    @"IOSurfacePixelFormat": @(0x42475241) /* BGRA */
+                                };
+                                void *testSurf = createFn((CFDictionaryRef)props);
+                                if (testSurf) {
+                                    size_t tw = getW(testSurf);
+                                    size_t th = getH(testSurf);
+                                    lockFn(testSurf, 0, NULL);
+                                    void *tb = getBase(testSurf);
+                                    bridge_log("GPU_CAPTURE: MANUAL IOSurface %zux%zu base=%p CREATE=%s",
+                                               tw, th, tb, (tw > 0 && tb) ? "SUCCESS" : "FAIL");
+                                    if (unlockFn) unlockFn(testSurf, 0, NULL);
+                                    CFRelease(testSurf);
+                                } else {
+                                    bridge_log("GPU_CAPTURE: IOSurfaceCreate returned NULL");
                                 }
-                                size_t tw = getW(ioSurface);
-                                void *tb = getBase ? getBase(ioSurface) : NULL;
-                                bridge_log("GPU_CAPTURE: after lock: getW=%zu getBase=%p", tw, tb);
-                                if (unlockFn) unlockFn(ioSurface, 1, NULL);
                             }
                         }
 

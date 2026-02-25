@@ -2812,8 +2812,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
      * Next: fix context bounds or set display bounds on contexts. */
     /* CPU default. GPU: contexts in list but no bounds (computed from committed
      * layer tree during render cycle which requires Shmem display callback). */
-    /* Session 21: GPU mode for IOSurface readback via nlist symbol scan. */
-    if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=gpu";
+    /* CPU mode: renderInContext at 50fps. GPU IOSurface readback blocked. */
+    if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
     if (env_proc_path[0]) env[ei++] = env_proc_path;
