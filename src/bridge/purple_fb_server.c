@@ -2569,50 +2569,63 @@ static void pfb_init(void) {
             }
         }
 
-        /* Display surface scan removed — double-dereference causes SIGBUS */
+        /* Find pixel buffer: check Display+0x138 inner object and PurpleServer */
+        {
+            /* 1. Check if inner at surf+0x08 is an IOSurface */
+            void *inner = g_display_surface ? *(void **)((uint8_t *)g_display_surface + 0x08) : NULL;
+            if (inner && (uint64_t)inner > 0x100000) {
+                uint64_t vt = *(uint64_t *)inner;
+                Dl_info di = {0};
+                if (vt > 0x100000 && vt < 0x7fffffffffffULL)
+                    dladdr((void *)vt, &di);
+                pfb_log("PIXEL_FIND: inner=%p vtable=%s", inner, di.dli_sname ?: "none");
 
-        /* Execute glReadPixels on the PurpleServer's render thread via CFRunLoop. */
-        pfb_log("GL_READBACK: about to schedule, server_cpp=%p", server_cpp);
-        if (server_cpp) {
-            CFRunLoopRef serverRL = *(CFRunLoopRef *)((uint8_t *)server_cpp + 0x168);
-            pfb_log("GL_READBACK: server runloop = %p, scheduling glReadPixels block", serverRL);
-            if (serverRL) {
-                void *glRP = dlsym(RTLD_DEFAULT, "glReadPixels");
-                void *glErr = dlsym(RTLD_DEFAULT, "glGetError");
-                if (glRP) {
-                    typedef void (*glRPFn)(int,int,int,int,unsigned,unsigned,void*);
-                    glRPFn _glRP = (glRPFn)glRP;
-                    typedef unsigned (*glErrFn)(void);
-                    glErrFn _glErr = (glErrFn)glErr;
-                    uint8_t *dest = (g_shared_fb != MAP_FAILED) ?
-                        (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE : NULL;
-
-                    CFRunLoopPerformBlock(serverRL, kCFRunLoopDefaultMode, ^{
-                        pfb_log("GL_READBACK: executing on server thread tid=%p", (void *)pthread_self());
-                        /* Check if GL context is current here */
-                        typedef void *(*EAGLGetCtxFn)(id, SEL);
-                        Class eaglCls = (Class)objc_getClass("EAGLContext");
-                        if (eaglCls) {
-                            id ctx = ((id(*)(id, SEL))objc_msgSend)((id)eaglCls, sel_registerName("currentContext"));
-                            pfb_log("GL_READBACK: EAGLContext.currentContext = %p", (void *)ctx);
-                        }
-                        /* Try glReadPixels */
-                        uint8_t test[4] = {0};
-                        _glRP(0, 0, 1, 1, 0x80E1, 0x1401, test);
-                        unsigned err = _glErr ? _glErr() : 0xFFFF;
-                        pfb_log("GL_READBACK: server thread px=(%u,%u,%u,%u) err=0x%x",
-                                test[0], test[1], test[2], test[3], err);
-                        if (test[0] || test[1] || test[2]) {
-                            pfb_log("GL_READBACK: NON-ZERO PIXELS! Reading full framebuffer...");
-                            if (dest) {
-                                _glRP(0, 0, PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, 0x80E1, 0x1401, dest);
-                                RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_shared_fb;
-                                hdr->frame_counter++;
-                                hdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+                /* Try IOSurface functions regardless of type — nlist found them */
+                {
+                    /* IOSurface! Use nlist-resolved functions */
+                    typedef size_t (*WFn)(void *); typedef void *(*BFn)(void *);
+                    typedef int (*LFn)(void *, uint32_t, uint32_t *);
+                    typedef size_t (*BPRFn)(void *);
+                    WFn ioW = (WFn)pfb_find_symbol("IOSurfaceGetWidth");
+                    WFn ioH = (WFn)pfb_find_symbol("IOSurfaceGetHeight");
+                    BPRFn ioBPR = (BPRFn)pfb_find_symbol("IOSurfaceGetBytesPerRow");
+                    BFn ioBase = (BFn)pfb_find_symbol("IOSurfaceGetBaseAddress");
+                    LFn ioLock = (LFn)pfb_find_symbol("IOSurfaceLock");
+                    LFn ioUnlock = (LFn)pfb_find_symbol("IOSurfaceUnlock");
+                    if (ioW && ioBase && ioLock) {
+                        ioLock(inner, 1, NULL);
+                        size_t w = ioW(inner), h = ioH(inner), bpr = ioBPR ? ioBPR(inner) : 0;
+                        void *base = ioBase(inner);
+                        pfb_log("PIXEL_FIND: IOSurface %zux%zu bpr=%zu base=%p", w, h, bpr, base);
+                        if (base && w > 0) {
+                            uint8_t *px = (uint8_t *)base;
+                            int nz = 0;
+                            for (int i = 0; i < 1000; i++)
+                                if (px[i*4] || px[i*4+1] || px[i*4+2]) nz++;
+                            pfb_log("PIXEL_FIND: *** %d/1000 non-zero RGB ***", nz);
+                            if (nz > 0) {
+                                g_display_pixel_buffer = base;
+                                pfb_log("PIXEL_FIND: CACHED at %p!", base);
                             }
                         }
-                    });
-                    CFRunLoopWakeUp(serverRL);
+                        ioUnlock(inner, 1, NULL);
+                    }
+                }
+            }
+
+            /* 2. Scan PurpleServer for Renderer (look for OGL/Renderer vtable) */
+            if (server_cpp) {
+                for (int off = 0x80; off < 0x200; off += 8) {
+                    uint64_t val = *(uint64_t *)((uint8_t *)server_cpp + off);
+                    if (val > 0x100000 && val < 0x7fffffffffffULL) {
+                        uint64_t vt = *(uint64_t *)val;
+                        if (vt > 0x100000 && vt < 0x7fffffffffffULL) {
+                            Dl_info di2;
+                            if (dladdr((void *)vt, &di2) && di2.dli_sname &&
+                                (strstr(di2.dli_sname, "OGL") || strstr(di2.dli_sname, "Render")))
+                                pfb_log("PIXEL_FIND: srv+0x%x → %p (%s)", off, (void *)val, di2.dli_sname);
+                        }
+                    }
                 }
             }
         }
