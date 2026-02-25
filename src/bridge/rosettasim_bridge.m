@@ -7973,7 +7973,6 @@ static void rsim_install_bundle_info_fallback(void) {
     }
 }
 
-__attribute__((constructor))
 /* Logging swizzle for +[CAContext setClientPort:] */
 static IMP g_orig_setClientPort_imp = NULL;
 static void logging_setClientPort(id self, SEL _cmd, mach_port_t port) {
@@ -8002,6 +8001,7 @@ static void install_setClientPort_logging(void) {
     });
 }
 
+__attribute__((constructor))
 static void rosettasim_bridge_init(void) {
     _install_crash_handler();
     bridge_log("========================================");
