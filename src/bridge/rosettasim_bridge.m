@@ -7974,11 +7974,40 @@ static void rsim_install_bundle_info_fallback(void) {
 }
 
 __attribute__((constructor))
+/* Logging swizzle for +[CAContext setClientPort:] */
+static IMP g_orig_setClientPort_imp = NULL;
+static void logging_setClientPort(id self, SEL _cmd, mach_port_t port) {
+    bridge_log("SETCLIENTPORT: port=0x%x", port);
+    if (g_orig_setClientPort_imp)
+        ((void(*)(id, SEL, mach_port_t))g_orig_setClientPort_imp)(self, _cmd, port);
+}
+
+static void install_setClientPort_logging(void) {
+    /* Defer — QuartzCore may not be loaded at constructor time */
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        for (int i = 0; i < 100; i++) {
+            Class cls = objc_getClass("CAContext");
+            if (cls) {
+                SEL sel = sel_registerName("setClientPort:");
+                Method m = class_getClassMethod(cls, sel);
+                if (m) {
+                    g_orig_setClientPort_imp = method_getImplementation(m);
+                    method_setImplementation(m, (IMP)logging_setClientPort);
+                    bridge_log("INIT: swizzled +[CAContext setClientPort:] for logging");
+                    return;
+                }
+            }
+            usleep(50000);
+        }
+    });
+}
+
 static void rosettasim_bridge_init(void) {
     _install_crash_handler();
     bridge_log("========================================");
     bridge_log("RosettaSim Bridge loaded");
     bridge_log("PID: %d", getpid());
+    install_setClientPort_logging();
     /* Install bundle/Info.plist fallback BEFORE UIKit initialization. */
     rsim_install_bundle_info_fallback();
 
