@@ -434,43 +434,9 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
         /* === LISTENER MODE === */
 
         /* Call real function — bootstrap_fix trampolines handle routing */
-        /* For known SB listener services: get the recv port FIRST, then
-         * create the connection as CLIENT (to prevent internal check_in from
-         * calling dispatch_mach_connect with port=0). The recv port is set
-         * on the connection object before returning, so when resume triggers
-         * _xpc_connection_check_in, our FORCE_LISTENER path in bootstrap_fix
-         * handles it with the correct port. */
-        int is_workspace = (strstr(name, "frontboard.workspace") ||
-                            strstr(name, "frontboard.systemappservices"));
-
-        if (is_workspace) {
-            /* Step 1: Get recv port via MIG check_in */
-            mach_port_t recv_port = MACH_PORT_NULL;
-            kern_return_t kr = bootstrap_check_in(g_broker_port, name, &recv_port);
-            sb_log("LISTENER_PRECHECK: '%s' check_in → port 0x%x (kr=%d)", name, recv_port, kr);
-
-            /* Step 2: Create as CLIENT (flag=0) to avoid internal LISTENER check_in.
-             * The internal check_in for CLIENT does dispatch_mach_connect(port, port, NULL)
-             * which is safe and doesn't send a registration message. */
-            sb_log("xpc_create_mach_service CLIENT-AS-LISTENER '%s'", name);
-            xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, 0);
-            sb_log("  real CLIENT-AS-LISTENER '%s' → %p", name, conn);
-
-            if (conn && recv_port != MACH_PORT_NULL) {
-                uint8_t *obj = (uint8_t *)conn;
-                /* Set the recv port so FORCE_LISTENER in bootstrap_fix uses it */
-                *(mach_port_t *)(obj + 0x34) = recv_port;
-                *(mach_port_t *)(obj + 0x3c) = recv_port;
-                /* Set LISTENER flag so bootstrap_fix check_in knows */
-                *(uint8_t *)(obj + 0xd9) |= 0x2;
-                sb_log("LISTENER_PORT_FIX: '%s' set recv=0x%x + listener flag", name, recv_port);
-            }
-
-            sb_track_assertiond_conn(name, conn);
-            return conn;
-        }
-
-        /* Non-workspace LISTENER: pass through as-is */
+        /* Call real function — bootstrap_fix trampolines handle routing.
+         * The dispatch_mach_connect trampoline in bootstrap_fix.c swaps
+         * send→recv for known listener services. */
         sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
         if (g_real_xpc_create_mach_service) {
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);

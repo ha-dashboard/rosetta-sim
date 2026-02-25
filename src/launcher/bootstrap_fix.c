@@ -1572,6 +1572,60 @@ static int write_trampoline(void *target, void *replacement, const char *name) {
 typedef void (*dispatch_mach_connect_fn)(void *channel, mach_port_t port1,
                                           mach_port_t port2, void *msg);
 static dispatch_mach_connect_fn g_dispatch_mach_connect = NULL;
+static dispatch_mach_connect_fn g_orig_dispatch_mach_connect = NULL;
+
+/* ================================================================
+ * Pending listener table — maps send_port → recv_port for known
+ * LISTENER services. When dispatch_mach_connect is called with a
+ * send right (from look_up), we swap it with the recv right
+ * (from check_in) so the listener gets the correct port.
+ * ================================================================ */
+#define MAX_PENDING_LISTENERS 8
+static struct {
+    mach_port_t send_port;
+    mach_port_t recv_port;
+    char name[128];
+    int pending;
+} g_pending_listeners[MAX_PENDING_LISTENERS];
+
+static void register_pending_listener(const char *name, mach_port_t send_port, mach_port_t recv_port) {
+    for (int i = 0; i < MAX_PENDING_LISTENERS; i++) {
+        if (!g_pending_listeners[i].pending) {
+            g_pending_listeners[i].send_port = send_port;
+            g_pending_listeners[i].recv_port = recv_port;
+            strncpy(g_pending_listeners[i].name, name, 127);
+            g_pending_listeners[i].name[127] = '\0';
+            g_pending_listeners[i].pending = 1;
+            bfix_log("[bfix] PENDING_LISTENER: '%s' send=0x%x recv=0x%x\n",
+                     name, send_port, recv_port);
+            return;
+        }
+    }
+    bfix_log("[bfix] PENDING_LISTENER: table full, can't register '%s'\n", name);
+}
+
+/* Replacement for dispatch_mach_connect — swaps send→recv for pending listeners */
+static void replacement_dispatch_mach_connect(void *channel, mach_port_t recv,
+                                               mach_port_t send, void *msg) {
+    /* Check if recv (first port arg) is a send right for a pending listener */
+    for (int i = 0; i < MAX_PENDING_LISTENERS; i++) {
+        if (g_pending_listeners[i].pending && g_pending_listeners[i].send_port == recv) {
+            mach_port_t real_recv = g_pending_listeners[i].recv_port;
+            bfix_log("[bfix] DMC_SWAP: '%s' send=0x%x → recv=0x%x channel=%p\n",
+                     g_pending_listeners[i].name, recv, real_recv, channel);
+            recv = real_recv;
+            /* Also fix send param if it matches */
+            if (send == g_pending_listeners[i].send_port)
+                send = real_recv;
+            g_pending_listeners[i].pending = 0;
+            break;
+        }
+    }
+
+    if (g_orig_dispatch_mach_connect) {
+        g_orig_dispatch_mach_connect(channel, recv, send, msg);
+    }
+}
 
 /* dispatch_mach_msg types */
 typedef void *dispatch_mach_msg_t;
@@ -1648,7 +1702,11 @@ static void replacement_xpc_connection_check_in(void *conn) {
      * state=6, flag 0x40, port_destroyed, 52-byte reg msg, dispatch_mach_connect.
      *
      * We return early to prevent the CLIENT path from double-connecting. */
-    int is_sb_listener = (conn_name && (
+    /* FORCE_LISTENER only applies to SpringBoard process — not the app.
+     * The app should connect as CLIENT (look_up), not check_in. */
+    const char *pn = getprogname();
+    int is_sb_proc = (pn && strstr(pn, "SpringBoard"));
+    int is_sb_listener = (is_sb_proc && conn_name && (
         strstr(conn_name, "frontboard.workspace") ||
         strstr(conn_name, "frontboard.systemappservices")));
 
@@ -1661,7 +1719,28 @@ static void replacement_xpc_connection_check_in(void *conn) {
         bfix_log("[bfix] FORCE_LISTENER '%s': port1=0x%x port2=0x%x send=0x%x channel=%p\n",
                  conn_name, fl_port1, fl_port2, fl_send, fl_channel);
 
-        if (fl_port1 == MACH_PORT_NULL) {
+        /* Look up the recv port from the pending_listeners table (populated
+         * by _xpc_look_up_endpoint when it detected this listener service).
+         * Match by NAME, not port, since the port at +0x34 may differ. */
+        mach_port_t pending_recv = MACH_PORT_NULL;
+        for (int i = 0; i < MAX_PENDING_LISTENERS; i++) {
+            if (g_pending_listeners[i].pending && conn_name &&
+                strcmp(g_pending_listeners[i].name, conn_name) == 0) {
+                pending_recv = g_pending_listeners[i].recv_port;
+                g_pending_listeners[i].pending = 0;
+                bfix_log("[bfix] FORCE_LISTENER '%s': using PENDING recv=0x%x (replacing send=0x%x)\n",
+                         conn_name, pending_recv, fl_port1);
+                break;
+            }
+        }
+
+        if (pending_recv != MACH_PORT_NULL) {
+            fl_port1 = pending_recv;
+            fl_port2 = pending_recv;
+            *(mach_port_t *)(obj + 0x34) = fl_port1;
+            *(mach_port_t *)(obj + 0x3c) = fl_port2;
+        } else {
+            /* No pending entry — try check_in as fallback */
             mach_port_t recv = MACH_PORT_NULL;
             replacement_bootstrap_check_in(get_bootstrap_port(), (char *)conn_name, &recv);
             if (recv != MACH_PORT_NULL) {
@@ -1669,6 +1748,7 @@ static void replacement_xpc_connection_check_in(void *conn) {
                 fl_port2 = recv;
                 *(mach_port_t *)(obj + 0x34) = fl_port1;
                 *(mach_port_t *)(obj + 0x3c) = fl_port2;
+                bfix_log("[bfix] FORCE_LISTENER '%s': fallback check_in recv=0x%x\n", conn_name, recv);
             }
         }
 
@@ -2110,6 +2190,27 @@ static mach_port_t replacement_xpc_look_up_endpoint(
         bfix_remember_port_name(port, name);
     }
 
+    /* For known LISTENER services in SpringBoard: also do check_in to get
+     * the recv right. Only applies to SpringBoard process. */
+    if (port != MACH_PORT_NULL && name) {
+        const char *pn2 = getprogname();
+        int is_sb2 = (pn2 && strstr(pn2, "SpringBoard"));
+        int is_known_listener = (is_sb2 &&
+            (strstr(name, "frontboard.workspace") ||
+             strstr(name, "frontboard.systemappservices")));
+        if (is_known_listener) {
+            mach_port_t recv_port = MACH_PORT_NULL;
+            kern_return_t ci_kr = replacement_bootstrap_check_in(
+                get_bootstrap_port(), (char *)name, &recv_port);
+            if (ci_kr == KERN_SUCCESS && recv_port != MACH_PORT_NULL) {
+                register_pending_listener(name, port, recv_port);
+            } else {
+                bfix_log("[bfix] _xpc_look_up_endpoint: check_in for '%s' failed (kr=%d)\n",
+                         name, ci_kr);
+            }
+        }
+    }
+
     return port;
 }
 
@@ -2196,6 +2297,51 @@ static void patch_bootstrap_functions(void) {
         void *orig = find_original_function(patches[i].name);
         if (orig) {
             write_trampoline(orig, patches[i].replacement, patches[i].name);
+        }
+    }
+
+    /* Trampoline dispatch_mach_connect for SpringBoard — swaps send→recv
+     * for LISTENER services (see pending_listeners table).
+     *
+     * We need to call the ORIGINAL after our replacement, so we create
+     * an executable thunk: save original's first 14 bytes, then jmp to
+     * original+14. Our replacement calls the thunk as the "original". */
+    {
+        const char *pn = getprogname();
+        if (pn && strstr(pn, "SpringBoard")) {
+            void *dmc_orig = dlsym(RTLD_DEFAULT, "dispatch_mach_connect");
+            if (dmc_orig) {
+                /* Allocate executable thunk page */
+                vm_address_t thunk_page = 0;
+                kern_return_t kr = vm_allocate(mach_task_self(), &thunk_page, 0x1000,
+                                                VM_FLAGS_ANYWHERE);
+                if (kr == KERN_SUCCESS) {
+                    kr = vm_protect(mach_task_self(), thunk_page, 0x1000, FALSE,
+                                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                    if (kr == KERN_SUCCESS) {
+                        uint8_t *thunk = (uint8_t *)thunk_page;
+                        /* Copy first 14 bytes of original function */
+                        memcpy(thunk, dmc_orig, 14);
+                        /* Then: movabs rax, original+14; jmp rax */
+                        uint64_t cont_addr = (uint64_t)(uintptr_t)dmc_orig + 14;
+                        thunk[14] = 0x48; thunk[15] = 0xB8;
+                        memcpy(&thunk[16], &cont_addr, 8);
+                        thunk[24] = 0xFF; thunk[25] = 0xE0;
+
+                        extern void sys_icache_invalidate(void *start, size_t len);
+                        sys_icache_invalidate(thunk, 26);
+
+                        g_orig_dispatch_mach_connect = (dispatch_mach_connect_fn)thunk;
+                        g_dispatch_mach_connect = (dispatch_mach_connect_fn)thunk;
+
+                        /* Now trampoline the original */
+                        write_trampoline(dmc_orig, (void *)replacement_dispatch_mach_connect,
+                                         "dispatch_mach_connect");
+                        bfix_log("[bfix] dispatch_mach_connect: trampolined (thunk=%p orig=%p)\n",
+                                 thunk, dmc_orig);
+                    }
+                }
+            }
         }
     }
 
