@@ -1195,10 +1195,11 @@ static void send_xpc_pipe_connattrs_reply(mach_port_t reply_port, uint64_t reque
  *   - XPC wire data containing a dictionary with:
  *     - "port" → mach_recv (consumes the port descriptor)
  */
-static void handle_xpc_checkin(mach_msg_header_t *request,
+static void handle_xpc_checkin_with_disposition(mach_msg_header_t *request,
                                 const char *service_name,
                                 mach_port_t service_port,
-                                uint64_t request_handle) {
+                                uint64_t request_handle,
+                                mach_msg_type_name_t disposition) {
     broker_log("[broker] XPC check-in: building response for '%s' port=0x%x handle=%llu\n",
                service_name, service_port, request_handle);
 
@@ -1255,7 +1256,9 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
         memset(xpc_buf + xpc_pos, 0, kpad);
         memcpy(xpc_buf + xpc_pos, k, klen);
         xpc_pos += kpad;
-        *(uint32_t *)(xpc_buf + xpc_pos) = XPC_TYPE_MACH_RECV;
+        /* Use MACH_RECV or MACH_SEND type matching the disposition */
+        *(uint32_t *)(xpc_buf + xpc_pos) = (disposition == MACH_MSG_TYPE_MOVE_RECEIVE) ?
+            XPC_TYPE_MACH_RECV : XPC_TYPE_MACH_SEND;
         xpc_pos += 4;
         root_entries++;
     }
@@ -1298,7 +1301,7 @@ static void handle_xpc_checkin(mach_msg_header_t *request,
     reply.body.msgh_descriptor_count = 1;
 
     reply.port_desc[0].name = service_port;
-    reply.port_desc[0].disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
+    reply.port_desc[0].disposition = disposition;
     reply.port_desc[0].type = MACH_MSG_PORT_DESCRIPTOR;
 
     memcpy(reply.xpc_data, xpc_buf, xpc_data_len);
@@ -1531,7 +1534,7 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
                 /* Extra send right so broker retains after MOVE_RECEIVE */
                 mach_port_insert_right(mach_task_self(), fresh_port, fresh_port,
                                         MACH_MSG_TYPE_MAKE_SEND);
-                handle_xpc_checkin(request, service_name, fresh_port, handle);
+                handle_xpc_checkin_with_disposition(request, service_name, fresh_port, handle, MACH_MSG_TYPE_MOVE_RECEIVE);
             } else {
                 send_xpc_pipe_reply(request->msgh_remote_port, request->msgh_id, routine, 12);
             }
@@ -1540,11 +1543,26 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
 
         if (slot >= 0) {
             service_port = g_services[slot].port;
-            /* Extra send right so broker retains after MOVE_RECEIVE */
+            /* Extra send right so broker retains */
             mach_port_insert_right(mach_task_self(), service_port, service_port,
                                     MACH_MSG_TYPE_MAKE_SEND);
-            handle_xpc_checkin(request, service_name, service_port, handle);
-            g_services[slot].receive_moved = 1;
+
+            /* For workspace/systemappservices: send COPY_SEND, keep recv right.
+             * FORCE_LISTENER in bootstrap_fix.c will get the recv right via
+             * MIG check_in later. Don't mark receive_moved. */
+            int is_ws_805 = (strstr(service_name, "frontboard.workspace") ||
+                              strstr(service_name, "frontboard.systemappservices"));
+            if (is_ws_805) {
+                broker_log("[broker] XPC 805 '%s': sending COPY_SEND (keeping recv for MIG check_in)\n",
+                           service_name);
+                handle_xpc_checkin_with_disposition(request, service_name, service_port,
+                                                     handle, MACH_MSG_TYPE_COPY_SEND);
+                /* DON'T set receive_moved — MIG check_in will move it later */
+            } else {
+                handle_xpc_checkin_with_disposition(request, service_name, service_port,
+                                                     handle, MACH_MSG_TYPE_MOVE_RECEIVE);
+                g_services[slot].receive_moved = 1;
+            }
             return;
         }
 
@@ -1553,7 +1571,7 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
         if (kr == KERN_SUCCESS) {
             mach_port_insert_right(mach_task_self(), service_port, service_port, MACH_MSG_TYPE_MAKE_SEND);
             register_service(service_name, service_port);
-            handle_xpc_checkin(request, service_name, service_port, handle);
+            handle_xpc_checkin_with_disposition(request, service_name, service_port, handle, MACH_MSG_TYPE_MOVE_RECEIVE);
             for (int i = 0; i < MAX_SERVICES; i++) {
                 if (g_services[i].active && strcmp(g_services[i].name, service_name) == 0) {
                     g_services[i].receive_moved = 1;
