@@ -4139,12 +4139,19 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
 
     gpu_copy:
         /* PHASE 3: Try UIWindow.createIOSurfaceFromScreen: to capture
-         * server-composited content. This is what the real iOS simulator uses. */
+         * server-composited content. This is what the real iOS simulator uses.
+         * Also try CARenderServerCaptureDisplay as fallback. */
         @try {
             Class uiWindowClass = objc_getClass("UIWindow");
             SEL captSel = sel_registerName("createIOSurfaceFromScreen:");
-            if (uiWindowClass && class_respondsToSelector(
-                    object_getClass((id)uiWindowClass), captSel)) {
+            int hasMethod = uiWindowClass && class_respondsToSelector(
+                    object_getClass((id)uiWindowClass), captSel);
+            static int _phase3_logged = 0;
+            if (!_phase3_logged) {
+                _phase3_logged = 1;
+                bridge_log("GPU_CAPTURE: createIOSurfaceFromScreen available=%d", hasMethod);
+            }
+            if (hasMethod) {
                 Class uiScreenClass = objc_getClass("UIScreen");
                 id mainScreen = ((id(*)(id, SEL))objc_msgSend)(
                     (id)uiScreenClass, sel_registerName("mainScreen"));
@@ -4153,6 +4160,11 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     typedef void * (*CaptFn)(id, SEL, id);
                     void *ioSurface = ((CaptFn)objc_msgSend)(
                         (id)uiWindowClass, captSel, mainScreen);
+                    static int _ios_logged = 0;
+                    if (!_ios_logged) {
+                        _ios_logged = 1;
+                        bridge_log("GPU_CAPTURE: createIOSurfaceFromScreen → ioSurface=%p", ioSurface);
+                    }
                     if (ioSurface) {
                         /* Read IOSurface properties */
                         typedef size_t (*IOSGetWidthFn)(void *);
@@ -4161,18 +4173,117 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                         typedef void * (*IOSGetBaseAddrFn)(void *);
                         typedef int (*IOSUnlockFn)(void *, uint32_t, uint32_t *);
 
-                        IOSGetWidthFn getW = (IOSGetWidthFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
-                        IOSGetHeightFn getH = (IOSGetHeightFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
-                        IOSLockFn lockFn = (IOSLockFn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
-                        IOSGetBaseAddrFn getBase = (IOSGetBaseAddrFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
-                        IOSUnlockFn unlockFn = (IOSUnlockFn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+                        /* IOSurface framework may not be loaded — try dlopen */
+                        static void *_iosurface_lib = NULL;
+                        if (!_iosurface_lib) {
+                            _iosurface_lib = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+                            if (!_iosurface_lib)
+                                _iosurface_lib = dlopen("/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
+                        }
+                        #define _IOSYM(name) (dlsym(RTLD_DEFAULT, name) ?: (_iosurface_lib ? dlsym(_iosurface_lib, name) : NULL))
+                        IOSGetWidthFn getW = (IOSGetWidthFn)_IOSYM("IOSurfaceGetWidth");
+                        IOSGetHeightFn getH = (IOSGetHeightFn)_IOSYM("IOSurfaceGetHeight");
+                        IOSLockFn lockFn = (IOSLockFn)_IOSYM("IOSurfaceLock");
+                        IOSGetBaseAddrFn getBase = (IOSGetBaseAddrFn)_IOSYM("IOSurfaceGetBaseAddress");
+                        IOSUnlockFn unlockFn = (IOSUnlockFn)_IOSYM("IOSurfaceUnlock");
 
+                        if (!getW) {
+                            /* Fallback: use ObjC methods on IOSurface */
+                            bridge_log("GPU_CAPTURE: IOSurface C funcs not found, trying ObjC...");
+                            Class iosCls = object_getClass((id)ioSurface);
+                            SEL widthSel = sel_registerName("width");
+                            SEL heightSel = sel_registerName("height");
+                            SEL bprSel = sel_registerName("bytesPerRow");
+                            SEL baseAddrSel = sel_registerName("baseAddress");
+                            SEL lockSel = sel_registerName("lockWithOptions:seed:");
+                            SEL unlockSel = sel_registerName("unlockWithOptions:seed:");
+                            if (class_respondsToSelector(iosCls, widthSel)) {
+                                size_t sw = ((size_t(*)(id, SEL))objc_msgSend)((id)ioSurface, widthSel);
+                                size_t sh = ((size_t(*)(id, SEL))objc_msgSend)((id)ioSurface, heightSel);
+                                size_t bpr = class_respondsToSelector(iosCls, bprSel) ?
+                                    ((size_t(*)(id, SEL))objc_msgSend)((id)ioSurface, bprSel) : sw * 4;
+                                /* Lock for reading */
+                                if (class_respondsToSelector(iosCls, lockSel))
+                                    ((void(*)(id, SEL, uint32_t, uint32_t *))objc_msgSend)(
+                                        (id)ioSurface, lockSel, 1, NULL);
+                                void *base = class_respondsToSelector(iosCls, baseAddrSel) ?
+                                    ((void *(*)(id, SEL))objc_msgSend)((id)ioSurface, baseAddrSel) : NULL;
+                                bridge_log("GPU_CAPTURE: IOSurface(ObjC) %zux%zu bpr=%zu base=%p",
+                                           sw, sh, bpr, base);
+                                if (base && sw > 0 && sh > 0) {
+                                    size_t dst_bpr = (size_t)dst_hdr->width * 4;
+                                    size_t copy_h = sh < dst_hdr->height ? sh : dst_hdr->height;
+                                    size_t copy_w = (sw < dst_hdr->width ? sw : dst_hdr->width) * 4;
+                                    uint8_t *sp = (uint8_t *)base;
+                                    uint8_t *dp = (uint8_t *)dst_pixels;
+                                    for (size_t row = 0; row < copy_h; row++) {
+                                        memcpy(dp, sp, copy_w);
+                                        sp += bpr;
+                                        dp += dst_bpr;
+                                    }
+                                    dst_hdr->frame_counter++;
+                                    bridge_log("GPU_CAPTURE: IOSurface(ObjC) → copied %zux%zu to framebuffer", sw, sh);
+                                    /* Check pixel content */
+                                    uint8_t *bp = (uint8_t *)base;
+                                    int nz = 0;
+                                    for (int i = 0; i < 1000; i++)
+                                        if (bp[i*4] || bp[i*4+1] || bp[i*4+2]) nz++;
+                                    bridge_log("GPU_CAPTURE: first 1000 px: %d non-zero, [0]=(%u,%u,%u,%u)",
+                                               nz, bp[0], bp[1], bp[2], bp[3]);
+                                }
+                                if (class_respondsToSelector(iosCls, unlockSel))
+                                    ((void(*)(id, SEL, uint32_t, uint32_t *))objc_msgSend)(
+                                        (id)ioSurface, unlockSel, 1, NULL);
+                            } else {
+                                bridge_log("GPU_CAPTURE: IOSurface has no width selector");
+                            }
+                        }
                         if (getW && getH && lockFn && getBase && unlockFn) {
                             size_t sw = getW(ioSurface);
                             size_t sh = getH(ioSurface);
                             lockFn(ioSurface, 1 /* kIOSurfaceLockReadOnly */, NULL);
                             void *base = getBase(ioSurface);
-                            if (base && sw == dst_hdr->width && sh == dst_hdr->height) {
+                            static int _iodim_logged = 0;
+                            if (!_iodim_logged) {
+                                _iodim_logged = 1;
+                                typedef size_t (*IOSGetBPRFn)(void *);
+                                IOSGetBPRFn getBPR = (IOSGetBPRFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+                                size_t bpr = getBPR ? getBPR(ioSurface) : 0;
+                                bridge_log("GPU_CAPTURE: IOSurface %zux%zu bpr=%zu base=%p dst=%ux%u",
+                                           sw, sh, bpr, base, dst_hdr->width, dst_hdr->height);
+                                if (base) {
+                                    uint8_t *bp = (uint8_t *)base;
+                                    int nz = 0;
+                                    for (int i = 0; i < 1000; i++)
+                                        if (bp[i*4] || bp[i*4+1] || bp[i*4+2]) nz++;
+                                    bridge_log("GPU_CAPTURE: IOSurface first 1000 pixels: %d/1000 non-zero, px[0]=(%u,%u,%u,%u)",
+                                               nz, bp[0], bp[1], bp[2], bp[3]);
+                                }
+                            }
+                            if (base && sw > 0 && sh > 0) {
+                                /* Copy with stride conversion if needed */
+                                typedef size_t (*IOSGetBPRFn)(void *);
+                                IOSGetBPRFn getBPR = (IOSGetBPRFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+                                size_t src_bpr = getBPR ? getBPR(ioSurface) : sw * 4;
+                                size_t dst_bpr = (size_t)dst_hdr->width * 4;
+                                size_t copy_h = sh < dst_hdr->height ? sh : dst_hdr->height;
+                                size_t copy_w_bytes = (sw < dst_hdr->width ? sw : dst_hdr->width) * 4;
+                                uint8_t *sp = (uint8_t *)base;
+                                uint8_t *dp = (uint8_t *)dst_pixels;
+                                for (size_t row = 0; row < copy_h; row++) {
+                                    memcpy(dp, sp, copy_w_bytes);
+                                    sp += src_bpr;
+                                    dp += dst_bpr;
+                                }
+                                dst_hdr->frame_counter++;
+                                static int _logged_cap2 = 0;
+                                if (!_logged_cap2) {
+                                    _logged_cap2 = 1;
+                                    bridge_log("GPU_CAPTURE: IOSurface %zux%zu (bpr=%zu) → copied to framebuffer",
+                                               sw, sh, src_bpr);
+                                }
+                            }
+                            if (0 && base && sw == dst_hdr->width && sh == dst_hdr->height) {
                                 size_t bytes = sw * sh * 4;
                                 memcpy(dst_pixels, base, bytes);
                                 dst_hdr->frame_counter++;
@@ -4194,6 +4305,58 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         } @catch (id ex) {
             /* Ignore — will fall through to PurpleDisplay surface copy */
         }
+
+        /* Try CARenderServerCaptureDisplay — asks server to do GPU→CPU readback */
+        @try {
+            static int _capture_init = 0;
+            static void *_capture_fn = NULL;
+            static mach_port_t _cap_port = 0;
+            if (!_capture_init) {
+                _capture_init = 1;
+                _capture_fn = dlsym(RTLD_DEFAULT, "CARenderServerCaptureDisplay");
+                /* Get server port */
+                typedef mach_port_t (*GetPortFn)(void);
+                GetPortFn gp = (GetPortFn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                if (gp) _cap_port = gp();
+                bridge_log("GPU_CAPTURE: CARenderServerCaptureDisplay=%p port=%u",
+                           _capture_fn, _cap_port);
+            }
+            if (_capture_fn && _cap_port) {
+                /* Allocate buffer for captured pixels */
+                size_t cap_size = (size_t)dst_hdr->width * dst_hdr->height * 4;
+                void *cap_buf = malloc(cap_size);
+                if (cap_buf) {
+                    memset(cap_buf, 0, cap_size);
+                    /* CARenderServerCaptureDisplay(port, display_id, buffer,
+                     *   width, height, rowBytes, flags)
+                     * Returns 0 on success. */
+                    typedef int (*CaptureFn)(mach_port_t, unsigned int,
+                        void *, int, int, unsigned long, unsigned int);
+                    int cr = ((CaptureFn)_capture_fn)(_cap_port, 1 /* displayId */,
+                        cap_buf, (int)dst_hdr->width, (int)dst_hdr->height,
+                        (unsigned long)(dst_hdr->width * 4), 0);
+                    /* Check if we got real pixels */
+                    int nz = 0;
+                    uint8_t *cb = (uint8_t *)cap_buf;
+                    for (int i = 0; i < 1000; i++) {
+                        if (cb[i*4] || cb[i*4+1] || cb[i*4+2]) nz++;
+                    }
+                    static int _cap_logged = 0;
+                    if (!_cap_logged) {
+                        _cap_logged = 1;
+                        bridge_log("GPU_CAPTURE: CaptureDisplay rc=%d nz=%d/1000 buf[0]=(%u,%u,%u,%u)",
+                                   cr, nz, cb[0], cb[1], cb[2], cb[3]);
+                    }
+                    if (cr == 0 && nz > 50) {
+                        memcpy(dst_pixels, cap_buf, cap_size);
+                        dst_hdr->frame_counter++;
+                        free(cap_buf);
+                        return; /* Success — skip fallbacks */
+                    }
+                    free(cap_buf);
+                }
+            }
+        } @catch (id ex) { /* CaptureDisplay failed */ }
 
         /* Fallback: copy from PurpleDisplay surface (backboardd framebuffer) */
         {
