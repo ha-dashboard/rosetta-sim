@@ -4454,9 +4454,19 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     _logged_remote_skip = 1;
                     bridge_log("frame_capture_tick: GPU mode — flushing CATransaction to push layer tree to server (server_port=%u)", srv);
                 }
-                /* GPU mode: skip local renderInContext but FLUSH CATransaction
-                 * so layer tree updates are sent to CARenderServer. Without this,
-                 * only the initial 3 commits are sent and the display stays static. */
+                /* GPU mode: one-time full commit marks ALL layers dirty so the
+                 * entire layer tree is pushed to CARenderServer. After that,
+                 * periodic flushes only push incremental changes. */
+                /* Mark root layer dirty and flush — simpler approach that avoids
+                 * crashes from deep layer tree traversal. */
+                if (_bridge_root_window) {
+                    id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
+                        _bridge_root_window, sel_registerName("layer"));
+                    if (rootLayer) {
+                        ((void(*)(id, SEL))objc_msgSend)(
+                            rootLayer, sel_registerName("setNeedsDisplay"));
+                    }
+                }
                 ((void(*)(id, SEL))objc_msgSend)(
                     (id)objc_getClass("CATransaction"),
                     sel_registerName("flush"));
