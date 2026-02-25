@@ -315,6 +315,10 @@ typedef union {
 static void bfix_remember_port_name(mach_port_t port, const char *name);
 static const char *bfix_lookup_port_name(mach_port_t port);
 
+/* Cached recv ports from first check_in — used by FORCE_LISTENER */
+static mach_port_t g_cached_workspace_recv = MACH_PORT_NULL;
+static mach_port_t g_cached_sysappsvcs_recv = MACH_PORT_NULL;
+
 kern_return_t replacement_bootstrap_look_up(mach_port_t bp,
                                              const name_t service_name,
                                              mach_port_t *service_port) {
@@ -439,6 +443,16 @@ kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
         *service_port = reply.port_reply.port.name;
         bfix_log("[bfix] check_in('%s'): got port 0x%x\n", service_name, *service_port);
         bfix_remember_port_name(*service_port, service_name);
+        /* Cache workspace/systemappservices recv ports for FORCE_LISTENER */
+        if (strstr(service_name, "frontboard.workspace") &&
+            !strstr(service_name, "systemappservices")) {
+            g_cached_workspace_recv = *service_port;
+            bfix_log("[bfix] CACHED workspace recv port 0x%x\n", *service_port);
+        }
+        if (strstr(service_name, "frontboard.systemappservices")) {
+            g_cached_sysappsvcs_recv = *service_port;
+            bfix_log("[bfix] CACHED systemappservices recv port 0x%x\n", *service_port);
+        }
         /* Track processinfoservice port unconditionally (any process) */
         if (strstr(service_name, "processinfoservice")) {
             g_processinfoservice_port = *service_port;
@@ -1710,6 +1724,10 @@ static void replacement_xpc_connection_check_in(void *conn) {
         strstr(conn_name, "frontboard.workspace") ||
         strstr(conn_name, "frontboard.systemappservices")));
 
+    /* Track channels that had FORCE_LISTENER applied — skip CLIENT connect for these */
+    #define MAX_FORCE_LISTENER_CHANNELS 8
+    static void *g_force_listener_channels[MAX_FORCE_LISTENER_CHANNELS];
+
     if (is_sb_listener) {
         mach_port_t fl_port1 = *(mach_port_t *)(obj + 0x34);
         mach_port_t fl_port2 = *(mach_port_t *)(obj + 0x3c);
@@ -1719,28 +1737,27 @@ static void replacement_xpc_connection_check_in(void *conn) {
         bfix_log("[bfix] FORCE_LISTENER '%s': port1=0x%x port2=0x%x send=0x%x channel=%p\n",
                  conn_name, fl_port1, fl_port2, fl_send, fl_channel);
 
-        /* Look up the recv port from the pending_listeners table (populated
-         * by _xpc_look_up_endpoint when it detected this listener service).
-         * Match by NAME, not port, since the port at +0x34 may differ. */
-        mach_port_t pending_recv = MACH_PORT_NULL;
-        for (int i = 0; i < MAX_PENDING_LISTENERS; i++) {
-            if (g_pending_listeners[i].pending && conn_name &&
-                strcmp(g_pending_listeners[i].name, conn_name) == 0) {
-                pending_recv = g_pending_listeners[i].recv_port;
-                g_pending_listeners[i].pending = 0;
-                bfix_log("[bfix] FORCE_LISTENER '%s': using PENDING recv=0x%x (replacing send=0x%x)\n",
-                         conn_name, pending_recv, fl_port1);
-                break;
-            }
+        /* Use CACHED recv port from the first check_in (via 805 handler).
+         * Do NOT call check_in again — it would create a fresh port that
+         * doesn't match what the app's look_up returns. */
+        mach_port_t cached_recv = MACH_PORT_NULL;
+        if (strstr(conn_name, "frontboard.workspace") &&
+            !strstr(conn_name, "systemappservices")) {
+            cached_recv = g_cached_workspace_recv;
+        } else if (strstr(conn_name, "frontboard.systemappservices")) {
+            cached_recv = g_cached_sysappsvcs_recv;
         }
 
-        if (pending_recv != MACH_PORT_NULL) {
-            fl_port1 = pending_recv;
-            fl_port2 = pending_recv;
+        if (cached_recv != MACH_PORT_NULL) {
+            fl_port1 = cached_recv;
+            fl_port2 = cached_recv;
             *(mach_port_t *)(obj + 0x34) = fl_port1;
             *(mach_port_t *)(obj + 0x3c) = fl_port2;
+            bfix_log("[bfix] FORCE_LISTENER '%s': using CACHED recv=0x%x\n",
+                     conn_name, cached_recv);
         } else {
-            /* No pending entry — try check_in as fallback */
+            bfix_log("[bfix] FORCE_LISTENER '%s': NO cached recv port! Trying check_in fallback\n",
+                     conn_name);
             mach_port_t recv = MACH_PORT_NULL;
             replacement_bootstrap_check_in(get_bootstrap_port(), (char *)conn_name, &recv);
             if (recv != MACH_PORT_NULL) {
@@ -1748,7 +1765,6 @@ static void replacement_xpc_connection_check_in(void *conn) {
                 fl_port2 = recv;
                 *(mach_port_t *)(obj + 0x34) = fl_port1;
                 *(mach_port_t *)(obj + 0x3c) = fl_port2;
-                bfix_log("[bfix] FORCE_LISTENER '%s': fallback check_in recv=0x%x\n", conn_name, recv);
             }
         }
 
@@ -1801,6 +1817,13 @@ static void replacement_xpc_connection_check_in(void *conn) {
         }
 
         bfix_log("[bfix] FORCE_LISTENER '%s': DONE recv=0x%x\n", conn_name, fl_port1);
+        /* Record this channel so CLIENT path skips it */
+        for (int i = 0; i < MAX_FORCE_LISTENER_CHANNELS; i++) {
+            if (!g_force_listener_channels[i]) {
+                g_force_listener_channels[i] = fl_channel;
+                break;
+            }
+        }
         return;
     }
 
@@ -1918,17 +1941,26 @@ static void replacement_xpc_connection_check_in(void *conn) {
     }
 
     if (!is_listener) {
-        /* CLIENT: same as original — no registration message.
-         * BUT skip for known SB listener services — we handle them above
-         * and don't want a double dispatch_mach_connect. */
-        if (is_sb_listener) {
-            bfix_log("[bfix] _xpc_connection_check_in: SKIP CLIENT connect for SB listener '%s'\n",
-                     conn_name ? conn_name : "?");
-            return;
+        /* Skip dispatch_mach_connect for channels that already had FORCE_LISTENER,
+         * or for known SB listener services. Prevents double-connect. */
+        int skip_connect = is_sb_listener;
+        if (!skip_connect) {
+            for (int i = 0; i < MAX_FORCE_LISTENER_CHANNELS; i++) {
+                if (g_force_listener_channels[i] == channel) {
+                    skip_connect = 1;
+                    bfix_log("[bfix] _xpc_connection_check_in: SKIP CLIENT connect (FORCE_LISTENER channel %p)\n", channel);
+                    break;
+                }
+            }
         }
-        g_dispatch_mach_connect(channel, port1, port2, NULL);
-        bfix_log("[bfix] _xpc_connection_check_in: CLIENT channel=%p port1=0x%x\n",
-                 channel, port1);
+        if (skip_connect) {
+            bfix_log("[bfix] _xpc_connection_check_in: SKIP CLIENT connect for '%s'\n",
+                     conn_name ? conn_name : "?");
+        } else {
+            g_dispatch_mach_connect(channel, port1, port2, NULL);
+            bfix_log("[bfix] _xpc_connection_check_in: CLIENT channel=%p port1=0x%x\n",
+                     channel, port1);
+        }
     } else {
         /* LISTENER: build the 52-byte registration message.
          * Format from libxpc disassembly:
@@ -2190,26 +2222,8 @@ static mach_port_t replacement_xpc_look_up_endpoint(
         bfix_remember_port_name(port, name);
     }
 
-    /* For known LISTENER services in SpringBoard: also do check_in to get
-     * the recv right. Only applies to SpringBoard process. */
-    if (port != MACH_PORT_NULL && name) {
-        const char *pn2 = getprogname();
-        int is_sb2 = (pn2 && strstr(pn2, "SpringBoard"));
-        int is_known_listener = (is_sb2 &&
-            (strstr(name, "frontboard.workspace") ||
-             strstr(name, "frontboard.systemappservices")));
-        if (is_known_listener) {
-            mach_port_t recv_port = MACH_PORT_NULL;
-            kern_return_t ci_kr = replacement_bootstrap_check_in(
-                get_bootstrap_port(), (char *)name, &recv_port);
-            if (ci_kr == KERN_SUCCESS && recv_port != MACH_PORT_NULL) {
-                register_pending_listener(name, port, recv_port);
-            } else {
-                bfix_log("[bfix] _xpc_look_up_endpoint: check_in for '%s' failed (kr=%d)\n",
-                         name, ci_kr);
-            }
-        }
-    }
+    /* No longer doing check_in in look_up_endpoint — the cached recv port
+     * from the first 805 check_in is used by FORCE_LISTENER instead. */
 
     return port;
 }

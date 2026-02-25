@@ -379,7 +379,12 @@ static void handle_check_in(mach_msg_header_t *request) {
     /* Per-process services: each process needs its own receive right.
      * MobileGestalt is the canonical example — every process hosts its own
      * in-process NSXPC listener for mobilegestalt queries. If the receive
-     * right was already moved, create a fresh port for this new caller. */
+     * right was already moved, create a fresh port for this new caller.
+     *
+     * EXCEPTION: frontboard.workspace and frontboard.systemappservices should
+     * NOT get fresh ports — the recv right from the FIRST check_in (805 path)
+     * is the one the app's look_up returns a send right to. Creating a fresh
+     * port causes a port mismatch (app sends to original, SB listens on fresh). */
     if (slot >= 0 && g_services[slot].receive_moved) {
         /* Create a fresh port for this caller */
         mach_port_t fresh_port = MACH_PORT_NULL;
@@ -1493,6 +1498,14 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
     }
     /* Routine 805 = check-in (LAUNCH_ROUTINE_CHECKIN) */
     if (routine == 805 && service_name) {
+        /* For workspace/systemappservices: send a SEND right (not MOVE_RECEIVE)
+         * in the 805 reply. This lets libxpc's check_in succeed without moving
+         * the recv right. FORCE_LISTENER in bootstrap_fix.c will then do a
+         * proper MIG check_in to get the recv right via dispatch_mach_connect. */
+        /* NOTE: The standard 805 flow handles workspace correctly at the broker
+         * level (moves recv right to SB). The issue is that libxpc in SB doesn't
+         * store the port at obj+0x34. FORCE_LISTENER in bootstrap_fix.c needs to
+         * find the recv port that was already moved to SB's port space. */
         /* Find the pre-created port for this service */
         mach_port_t service_port = MACH_PORT_NULL;
         int slot = -1;
