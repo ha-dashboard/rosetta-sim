@@ -4452,8 +4452,14 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                 static int _logged_remote_skip = 0;
                 if (!_logged_remote_skip) {
                     _logged_remote_skip = 1;
-                    bridge_log("frame_capture_tick: REMOTE context detected (server_port=%u) but GPU capture inactive — skipping renderInContext (avoid deadlock) and attempting lazy GPU mmap", srv);
+                    bridge_log("frame_capture_tick: GPU mode — flushing CATransaction to push layer tree to server (server_port=%u)", srv);
                 }
+                /* GPU mode: skip local renderInContext but FLUSH CATransaction
+                 * so layer tree updates are sent to CARenderServer. Without this,
+                 * only the initial 3 commits are sent and the display stays static. */
+                ((void(*)(id, SEL))objc_msgSend)(
+                    (id)objc_getClass("CATransaction"),
+                    sel_registerName("flush"));
                 /* Attempt to enable GPU capture for subsequent frames. */
                 if (!g_gpu_rendering_active || !_backboardd_fb_mmap) {
                     (void)try_map_gpu_framebuffer();
