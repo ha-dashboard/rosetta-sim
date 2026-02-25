@@ -2802,6 +2802,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* CPU default. GPU: add_context deadlocks on os_unfair_lock held permanently
      * by CARenderServer MIG handler. Main queue drains but lock never releases.
      * Override: ROSETTASIM_CA_MODE=gpu */
+    /* GPU: set_display_info stores displayId=1 on all contexts but
+     * context_insert (for contextIdAtPosition mapping) needs add_context
+     * which blocks on render_update virtual call. Need render_update fix. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

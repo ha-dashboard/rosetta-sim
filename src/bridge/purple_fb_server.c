@@ -2048,31 +2048,24 @@ static void pfb_init(void) {
      * with the MIG server thread. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        pfb_log("GPU_BIND: starting on main thread...");
+        pfb_log("GPU_BIND: trying force-unlock + add_context on main thread...");
 
-        /* First: try CATransaction flush on main thread — may trigger attach_contexts
-         * naturally through the server's commit processing path. */
-        {
-            Class catCls = (Class)objc_getClass("CATransaction");
-            if (catCls) {
-                ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
-                pfb_log("GPU_BIND: CATransaction flush done on main thread");
-            }
-        }
+        /* Patch vtable[8] (render_update) to no-op, then call add_context.
+         * add_context calls render_update which blocks waiting for display refresh.
+         * By no-opping render_update, add_context completes and binds contexts. */
 
-        /* Get WindowServer and display */
-        Class wsClass = (Class)objc_getClass("CAWindowServer");
-        if (!wsClass) { pfb_log("GPU_BIND: no CAWindowServer"); return; }
-        id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("server"));
+        /* Get server from display */
+        Class wsCls = (Class)objc_getClass("CAWindowServer");
+        if (!wsCls) { pfb_log("GPU_BIND: no CAWindowServer"); return; }
+        id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
         if (!ws) { pfb_log("GPU_BIND: no server"); return; }
-        id displays = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
-        unsigned long dcnt = displays ? ((unsigned long(*)(id, SEL))objc_msgSend)(
-            displays, sel_registerName("count")) : 0;
+        id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+        unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            disps, sel_registerName("count")) : 0;
         if (dcnt == 0) { pfb_log("GPU_BIND: no displays"); return; }
         id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-            displays, sel_registerName("objectAtIndex:"), 0UL);
+            disps, sel_registerName("objectAtIndex:"), 0UL);
 
-        /* Get C++ server from display */
         void *server_cpp = NULL;
         Ivar implI = class_getInstanceVariable(object_getClass(disp), "_impl");
         if (implI) {
@@ -2081,19 +2074,50 @@ static void pfb_init(void) {
         }
         if (!server_cpp) { pfb_log("GPU_BIND: no server_cpp"); return; }
 
-        /* Calculate add_context address */
+        /* Force-unlock os_unfair_lock at server+0x08 */
+        uint32_t *lock_ptr = (uint32_t *)((uint8_t *)server_cpp + 0x08);
+        uint32_t old_lock = *lock_ptr;
+        *lock_ptr = 0; /* unlock */
+        pfb_log("GPU_BIND: force-unlocked server+0x08 (was 0x%x)", old_lock);
+
+        /* Calculate set_display_info address (bypass add_context entirely).
+         * set_display_info at static 0x5e2c2: (CA::Render::Context*, uint display_id)
+         * This directly binds a context to a display via _CACSetContextDisplayInfo. */
         void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
         if (!known) { pfb_log("GPU_BIND: dlsym failed"); return; }
         ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-        typedef void (*add_ctx_fn)(void *, void *);
-        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+        typedef void (*set_di_fn)(void *, uint32_t);
+        set_di_fn set_display_info = (set_di_fn)((uint8_t *)0x5e2c2 + slide);
+        pfb_log("GPU_BIND: set_display_info at %p", (void *)set_display_info);
 
-        /* Get all contexts */
+        /* Get all contexts and add them */
         Class caCtxCls = (Class)objc_getClass("CAContext");
-        id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
+        id ctxs = ((id(*)(id, SEL))objc_msgSend)(
+            (id)caCtxCls, sel_registerName("allContexts"));
         unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
             ctxs, sel_registerName("count")) : 0;
-        pfb_log("GPU_BIND: %lu contexts, server=%p, add_ctx=%p", cnt, server_cpp, (void *)add_ctx);
+        pfb_log("GPU_BIND: %lu contexts to add", cnt);
+
+        /* Patch vtable[8] on the Display* at server+0x58.
+         * add_context calls this vtable slot (render_update) which blocks.
+         * Replace with a function that returns 1 (display_id). */
+        void *display_obj = *(void **)((uint8_t *)server_cpp + 0x58);
+        void **display_vtable = NULL;
+        void *orig_vt8 = NULL;
+        if (display_obj) {
+            display_vtable = *(void ***)display_obj;
+            if (display_vtable) {
+                orig_vt8 = display_vtable[8]; /* 0x40/8 = slot 8 */
+                pfb_log("GPU_BIND: Display vtable[8] = %p (will patch)", orig_vt8);
+                /* Replace with a simple function that returns 1 (displayId) */
+                /* We need to make the vtable page writable first */
+                extern int mprotect(void *, size_t, int);
+                uintptr_t page = (uintptr_t)&display_vtable[8] & ~0xFFF;
+                mprotect((void *)page, 0x1000, 7); /* rwx */
+                display_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np"); /* returns 0 or 1 */
+                pfb_log("GPU_BIND: patched vtable[8] → pthread_main_np");
+            }
+        }
 
         for (unsigned long i = 0; i < cnt; i++) {
             id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
@@ -2105,17 +2129,28 @@ static void pfb_init(void) {
             if (!cimpl) continue;
             unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                 ctx, sel_registerName("contextId"));
-            pfb_log("GPU_BIND: adding ctx[%lu] id=%u impl=%p", i, cid, cimpl);
-            add_ctx(server_cpp, cimpl);
-            pfb_log("GPU_BIND: ctx[%lu] added OK", i);
+            uint32_t field_a8 = *(uint32_t *)((uint8_t *)cimpl + 0xa8);
+            uint32_t field_170 = *(uint32_t *)((uint8_t *)cimpl + 0x170);
+            pfb_log("GPU_BIND: ctx[%lu] id=%u +0xa8=0x%x +0x170=%u", i, cid, field_a8, field_170);
+            set_display_info(cimpl, 1);
+            uint32_t after_170 = *(uint32_t *)((uint8_t *)cimpl + 0x170);
+            pfb_log("GPU_BIND: ctx[%lu] DONE +0x170=%u", i, after_170);
+        }
+
+        /* Restore vtable */
+        if (display_vtable && orig_vt8) {
+            display_vtable[8] = orig_vt8;
+            pfb_log("GPU_BIND: restored vtable[8]");
         }
 
         /* Check result */
-        typedef struct { double x; double y; } CGPoint_t;
-        CGPoint_t center = { 375.0, 667.0 };
-        unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
-            disp, sel_registerName("contextIdAtPosition:"), center);
-        pfb_log("GPU_BIND: contextIdAtPosition=%u (after add_context)", bound);
+        {
+            typedef struct { double x; double y; } CGPoint_t;
+            CGPoint_t center = { 375.0, 667.0 };
+            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                disp, sel_registerName("contextIdAtPosition:"), center);
+            pfb_log("GPU_BIND: contextIdAtPosition=%u AFTER add_context", bound);
+        }
     });
 }
 
