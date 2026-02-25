@@ -1127,25 +1127,24 @@ static void sb_pump_loop(const char *label) {
 
 static void replacement_uiapp_run(id self, SEL _cmd) {
     if (!__sync_bool_compare_and_swap(&g_run_entered, 0, 1)) {
-        /* Re-entrant — just return to prevent infinite loop */
+        /* Re-entrant — just return to prevent infinite loop.
+         * UIApplicationMain loops calling _run; if _run returns (because
+         * GSEventRun returns), we must not re-enter. */
         return;
     }
 
-    sb_log("RUNLOOP_FIX: [UIApplication _run] intercepted (first call)");
+    sb_log("RUNLOOP_FIX: [UIApplication _run] intercepted");
 
-    /* Call original _run — it does setup (observers, event sources,
-     * registerAsSystemApp) then calls GSEventRun which returns
-     * immediately under Rosetta 2 since CFRunLoopRunInMode doesn't block. */
+    /* Call original _run — it does setup then calls GSEventRun.
+     * NOTE: For SB, GSEventRun still returns immediately (DYLD interposition
+     * doesn't fire for intra-UIKit calls). CFRunLoop works for the APP process
+     * but SB's GSEventRun path is different. SB still needs the pump. */
     if (g_orig_uiapp_run) {
-        sb_log("RUNLOOP_FIX: calling original _run (setup + GSEventRun)");
+        sb_log("RUNLOOP_FIX: calling original _run");
         ((void(*)(id, SEL))g_orig_uiapp_run)(self, _cmd);
-        sb_log("RUNLOOP_FIX: original _run returned — GSEventRun didn't block");
+        sb_log("RUNLOOP_FIX: _run returned — entering pump (SB GSEventRun doesn't block)");
     }
 
-    /* _run returned because GSEventRun didn't block. Enter our pump.
-     * This function NEVER returns. _run stays on the stack forever.
-     * UIApplicationMain stays on the stack. main() stays on the stack.
-     * exit() is never called. All state persists. */
     sb_pump_loop("[UIApplication _run]");
     /* unreachable */
 }
