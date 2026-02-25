@@ -2661,6 +2661,40 @@ static void pfb_init(void) {
             }
         }
 
+        /* Check ALL SWContext buffers — +0x630, +0x668, +0x670 */
+        if (server_cpp) {
+            void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
+            if (swctx) {
+                struct { int off; const char *name; } bufs[] = {
+                    {0x630, "color_orig"}, {0x638, "alpha_orig"},
+                    {0x640, "color_stride_orig"}, {0x648, "alpha_stride_orig"},
+                    {0x668, "color_flipped"}, {0x670, "alpha_flipped"},
+                    {0x678, "color_stride"}, {0x680, "alpha_stride"},
+                    {0x688, "format"}, {0x690, "x"}, {0x694, "y"},
+                    {0x698, "width"}, {0x69c, "height"}, {-1, NULL}
+                };
+                for (int b = 0; bufs[b].name; b++) {
+                    int off = bufs[b].off;
+                    if (off == 0x688 || off == 0x690 || off == 0x694 || off == 0x698 || off == 0x69c) {
+                        uint32_t v = *(uint32_t *)((uint8_t *)swctx + off);
+                        pfb_log("SWCTX_FULL: +0x%x (%s) = %u", off, bufs[b].name, v);
+                    } else {
+                        uint64_t v = *(uint64_t *)((uint8_t *)swctx + off);
+                        pfb_log("SWCTX_FULL: +0x%x (%s) = 0x%llx", off, bufs[b].name, (unsigned long long)v);
+                        /* If pointer, check pixel content */
+                        if (v > 0x100000000ULL && v < 0x800000000000ULL &&
+                            (off == 0x630 || off == 0x638 || off == 0x668 || off == 0x670)) {
+                            uint8_t *pp = (uint8_t *)v;
+                            int nz = 0;
+                            for (int i = 0; i < 500; i++)
+                                if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
+                            pfb_log("  → %d/500 non-zero RGB", nz);
+                        }
+                    }
+                }
+            }
+        }
+
         pfb_log("GPU_INJECT: session 21 complete — enabling sync thread render");
         g_gpu_inject_done = 1;
     });
