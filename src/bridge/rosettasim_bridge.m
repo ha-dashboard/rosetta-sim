@@ -6478,7 +6478,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 sel_registerName("flush"));
                                             bridge_log("Display Pipeline [delayed]: Flushed after invalidation");
 
-                                            /* Post-flush: check if commits happened */
+                                            /* Post-flush: check if commits happened + fix server_port */
                                             {
                                                 Ivar li3 = class_getInstanceVariable(object_getClass(kw), "_layerContext");
                                                 id lc3 = li3 ? *(id *)((uint8_t *)kw + ivar_getOffset(li3)) : nil;
@@ -6491,6 +6491,23 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                         uint32_t sp = *(uint32_t *)((uint8_t *)impl3 + 0x98);
                                                         bridge_log("Display Pipeline [delayed]: POST-FLUSH commits=%u flags=0x%x server_port=%u",
                                                                    cc, fl, sp);
+
+                                                        /* Session 21: Fix server_port mismatch.
+                                                         * Context+0x98 may have a per-client port from RegisterClient.
+                                                         * Override with the correct CARenderServer port so commits
+                                                         * actually reach the server's MIG handler. */
+                                                        mach_port_t correct_port = g_ca_server_port;
+                                                        if (correct_port && sp != correct_port) {
+                                                            *(uint32_t *)((uint8_t *)impl3 + 0x98) = correct_port;
+                                                            bridge_log("Display Pipeline [delayed]: FIXED server_port: %u → %u",
+                                                                       sp, correct_port);
+
+                                                            /* Re-flush to send commits to the correct port */
+                                                            ((void(*)(id, SEL))objc_msgSend)(
+                                                                (id)objc_getClass("CATransaction"),
+                                                                sel_registerName("flush"));
+                                                            bridge_log("Display Pipeline [delayed]: Re-flushed after port fix");
+                                                        }
                                                     }
                                                 }
                                             }

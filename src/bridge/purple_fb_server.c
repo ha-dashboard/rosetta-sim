@@ -931,42 +931,55 @@ static void *pfb_sync_thread(void *arg) {
             }
         }
         if (g_cached_display && g_gpu_inject_done) {
-            /* Session 21: simplified sync loop — no attach_contexts (blocks on mutexes).
-             * Wait for GPU_INJECT to complete mutex reinit before entering. */
-            {
-                Class catCls = (Class)objc_getClass("CATransaction");
-                if (catCls) {
-                    ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
+            /* Session 21: call PurpleServer vtable render functions directly.
+             * CARenderServerRenderDisplay has port=0 in backboardd (IS the server).
+             * Instead, call the C++ vtable methods on the server object. */
+            static void *_server_cpp = NULL;
+            static int _render_init = 0;
+            if (!_render_init) {
+                _render_init = 1;
+                Ivar implI = class_getInstanceVariable(
+                    object_getClass(g_cached_display), "_impl");
+                if (implI) {
+                    void *impl = *(void **)((uint8_t *)g_cached_display + ivar_getOffset(implI));
+                    if (impl) _server_cpp = *(void **)((uint8_t *)impl + 0x40);
+                }
+                if (_server_cpp) {
+                    void **vtable = *(void ***)_server_cpp;
+                    pfb_log("RENDER_DIRECT: server=%p vtable=%p", _server_cpp, (void *)vtable);
+                    /* Log first 10 vtable entries */
+                    for (int vi = 0; vi < 10; vi++) {
+                        Dl_info di;
+                        if (dladdr(vtable[vi], &di) && di.dli_sname)
+                            pfb_log("  svt[%d]: %p (%s)", vi, vtable[vi], di.dli_sname);
+                        else
+                            pfb_log("  svt[%d]: %p", vi, vtable[vi]);
+                    }
                 }
             }
-            ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
 
-            /* CARenderServerRenderDisplay — sends MIG to the server (self) */
-            {
-                static int _render_init = 0;
-                static void *_render_fn = NULL;
-                static mach_port_t _srv_port = 0;
-                static id _display_name = NULL;
-                if (!_render_init) {
-                    _render_init = 1;
-                    _render_fn = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-                    typedef mach_port_t (*get_port_fn)(void);
-                    get_port_fn gp = (get_port_fn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
-                    if (gp) _srv_port = gp();
-                    _display_name = ((id(*)(id, SEL))objc_msgSend)(
-                        g_cached_display, sel_registerName("name"));
-                    pfb_log("RENDER_DISPLAY: fn=%p port=0x%x name=%p", _render_fn, _srv_port,
-                            (void *)_display_name);
+            if (_server_cpp) {
+                /* CATransaction flush + display update */
+                {
+                    Class catCls = (Class)objc_getClass("CATransaction");
+                    if (catCls) {
+                        ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
+                    }
                 }
-                if (_render_fn && _srv_port && _display_name) {
-                    typedef int (*render_fn)(mach_port_t, id, id, int, int);
-                    ((render_fn)_render_fn)(_srv_port, _display_name, NULL, 0, 0);
-                }
+                ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
+
+                /* Call PurpleServer::run_loop() would block.
+                 * Instead call immediate_render (vtable[5]) which does one frame.
+                 * If it's a no-op in base, try render_surface (vtable[9]). */
+                void **vtable = *(void ***)_server_cpp;
+                typedef void (*server_fn)(void *);
+                /* vtable[5] = immediate_render */
+                ((server_fn)vtable[5])(_server_cpp);
             }
 
             if (!g_update_logged) {
                 g_update_logged = 1;
-                pfb_log("DISPLAY_UPDATE: flush + update + CARenderServerRenderDisplay each tick");
+                pfb_log("RENDER_DIRECT: calling vtable[5] (immediate_render) each tick");
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
             {
