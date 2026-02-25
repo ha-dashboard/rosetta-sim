@@ -1134,7 +1134,86 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
         }
     }
 
+    /* Track CA MIG sends + dump RegisterClient descriptors */
+    if ((option & MACH_SEND_MSG) && msg) {
+        mach_msg_header_t *hdr = (mach_msg_header_t *)msg;
+        if (hdr->msgh_id >= 40000 && hdr->msgh_id < 41000) {
+            static int _ca_send_count = 0;
+            if (_ca_send_count < 30) {
+                _ca_send_count++;
+                int is_complex = (hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+                bfix_log("CA_SEND[%d]: id=%u size=%u port=%u complex=%d",
+                    _ca_send_count, hdr->msgh_id, hdr->msgh_size,
+                    hdr->msgh_remote_port, is_complex);
+
+                /* Dump descriptors for RegisterClient (40203) */
+                if (hdr->msgh_id == 40203 && is_complex) {
+                    mach_msg_body_t *body = (mach_msg_body_t *)(hdr + 1);
+                    bfix_log("  REGISTER: %u descriptors", body->msgh_descriptor_count);
+                    uint8_t *dp = (uint8_t *)(body + 1);
+                    for (uint32_t d = 0; d < body->msgh_descriptor_count && d < 8; d++) {
+                        uint32_t dtype = *(uint32_t *)(dp + 8) & 0xFF; /* type at offset 8 in descriptor */
+                        if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
+                            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)dp;
+                            bfix_log("  desc[%u]: PORT name=%u disp=%u type=%u",
+                                d, pd->name, pd->disposition, pd->type);
+                            dp += sizeof(mach_msg_port_descriptor_t);
+                        } else if (dtype == MACH_MSG_OOL_DESCRIPTOR) {
+                            mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
+                            bfix_log("  desc[%u]: OOL addr=%p size=%u copy=%u dealloc=%u",
+                                d, od->address, od->size, od->copy, od->deallocate);
+                            dp += sizeof(mach_msg_ool_descriptor_t);
+                        } else {
+                            bfix_log("  desc[%u]: type=%u (raw: %08x %08x %08x)",
+                                d, dtype,
+                                *(uint32_t *)dp, *(uint32_t *)(dp+4), *(uint32_t *)(dp+8));
+                            dp += 12; /* minimum descriptor size */
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     kern_return_t kr = g_orig_mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify);
+
+    /* Track CA MIG messages RECEIVED in backboardd */
+    if ((option & MACH_RCV_MSG) && kr == KERN_SUCCESS && msg) {
+        static int _recv_is_bbd = -1;
+        if (_recv_is_bbd == -1) {
+            const char *pn = getprogname();
+            _recv_is_bbd = (pn && strstr(pn, "backboardd")) ? 1 : 0;
+        }
+        if (_recv_is_bbd && msg->msgh_id > 40000) {
+            static int _ca_recv_count = 0;
+            if (_ca_recv_count < 30) {
+                _ca_recv_count++;
+                int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+                if (is_complex) {
+                    mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
+                    bfix_log("CA_RECV[%d]: id=%u size=%u port=%u COMPLEX desc=%u",
+                        _ca_recv_count, msg->msgh_id, msg->msgh_size,
+                        msg->msgh_local_port, body->msgh_descriptor_count);
+                } else {
+                    bfix_log("CA_RECV[%d]: id=%u size=%u port=%u SIMPLE",
+                        _ca_recv_count, msg->msgh_id, msg->msgh_size,
+                        msg->msgh_local_port);
+                }
+
+                /* Dump 40206 (commit notification) body */
+                if (msg->msgh_id == 40206 && msg->msgh_size >= 36) {
+                    uint32_t *body = (uint32_t *)((uint8_t *)msg + 24); /* after header */
+                    bfix_log("MSG_40206: body: %08x %08x %08x",
+                        body[0], body[1], body[2]);
+                    /* Also as uint64 + uint32 */
+                    uint64_t addr64 = *(uint64_t *)body;
+                    uint32_t len32 = body[2];
+                    bfix_log("MSG_40206: addr=0x%llx len=%u",
+                        (unsigned long long)addr64, len32);
+                }
+            }
+        }
+    }
 
     if (!is_assertiond) return kr;
 

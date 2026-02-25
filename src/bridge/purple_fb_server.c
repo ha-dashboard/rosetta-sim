@@ -52,6 +52,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/nlist.h>
 #include <mach-o/loader.h>
+#include <os/lock.h>
 
 /* Mach-O nlist symbol scanner — same technique as bootstrap_fix.c */
 static void *pfb_find_symbol(const char *func_name) {
@@ -97,6 +98,7 @@ extern kern_return_t bootstrap_register(mach_port_t, const char *, mach_port_t);
 extern kern_return_t bootstrap_check_in(mach_port_t, const char *, mach_port_t *);
 extern kern_return_t task_set_special_port(mach_port_t, int, mach_port_t);
 extern mach_port_t mach_reply_port(void);
+extern double CACurrentMediaTime(void);
 #define TASK_BOOTSTRAP_PORT 4
 extern kern_return_t mach_make_memory_entry_64(
     vm_map_t target_task,
@@ -319,6 +321,24 @@ static volatile void *g_display_pixel_buffer = NULL; /* SW renderer pixel data *
 static volatile int64_t g_display_pixel_stride = 0;  /* SW renderer stride (may differ from 750*4) */
 static volatile vm_address_t g_server_surface_map = 0; /* CARenderServer's vm_map of our surface */
 
+/* Render pump: render_for_time triggered from sync thread via CFRunLoopSource */
+static void *g_rft_srv = NULL;         /* Server C++ object */
+static uintptr_t g_rft_qc = 0;         /* QuartzCore base address */
+static CFRunLoopRef g_server_runloop = NULL; /* Server thread's CFRunLoop */
+static CFRunLoopSourceRef g_render_source = NULL; /* Signaled from sync thread */
+typedef void (*RenderForTimeFn_t)(void *, double, void *, unsigned int);
+static RenderForTimeFn_t g_renderFn = NULL;
+
+static void render_source_callback(void *info) {
+    if (!g_rft_srv || !g_renderFn) return;
+    static int _count = 0;
+    _count++;
+    if (_count <= 5 || _count % 100 == 0)
+        pfb_log("RENDER_SOURCE[%d]", _count);
+    extern double CACurrentMediaTime(void);
+    g_renderFn(g_rft_srv, CACurrentMediaTime(), NULL, 0);
+}
+
 /* CoreGraphics types and functions for CALayerHost rendering */
 typedef void *CGColorSpaceRef;
 typedef void *CGContextRef;
@@ -336,6 +356,69 @@ static volatile int g_layerhost_render_logged = 0;
 
 static void pfb_sync_to_shared(void) {
     if (g_shared_fb == MAP_FAILED) return;
+
+    /* Late check: after ~20s (sync iteration 1200), re-inspect layer tree */
+    {
+        static int _late_done = 0;
+        static int _sync_count = 0;
+        _sync_count++;
+        if (!_late_done && _sync_count >= 250) { /* ~15s after start */
+            _late_done = 1;
+            pfb_log("LATE_CHECK: triggered at sc=%d", _sync_count);
+            /* Get server_cpp fresh via CAWindowServer */
+            void *srv = NULL;
+            Class _wsCls = (Class)objc_getClass("CAWindowServer");
+            if (_wsCls) {
+                id _ws = ((id(*)(id, SEL))objc_msgSend)((id)_wsCls, sel_registerName("server"));
+                if (_ws) {
+                    id _ds = ((id(*)(id, SEL))objc_msgSend)(_ws, sel_registerName("displays"));
+                    unsigned long _dc = _ds ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                        _ds, sel_registerName("count")) : 0;
+                    if (_dc > 0) {
+                        id _d = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                            _ds, sel_registerName("objectAtIndex:"), 0UL);
+                        Ivar _iI = class_getInstanceVariable(object_getClass(_d), "_impl");
+                        if (_iI) {
+                            void *_im = *(void **)((uint8_t *)_d + ivar_getOffset(_iI));
+                            if (_im) srv = *(void **)((uint8_t *)_im + 0x40);
+                        }
+                    }
+                }
+            }
+            if (!srv) { pfb_log("LATE_CHECK: no server_cpp"); }
+            void *ctx_list = *(void **)((uint8_t *)srv + 0x68);
+            uint64_t ctx_count = *(uint64_t *)((uint8_t *)srv + 0x78);
+            pfb_log("LATE_CHECK: t~20s ctx_count=%llu", (unsigned long long)ctx_count);
+
+            for (uint64_t ci = 0; ci < ctx_count && ci < 10; ci++) {
+                void *entry = *(void **)((uint8_t *)ctx_list + ci * 0x10);
+                if (!entry) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
+                void *root = *(void **)((uint8_t *)entry + 0xB8);
+                if (!root) continue;
+                uint32_t w = *(uint32_t *)((uint8_t *)root + 0x98);
+                uint32_t h = *(uint32_t *)((uint8_t *)root + 0x9c);
+                void *contents = *(void **)((uint8_t *)root + 0x60);
+                void *sub_array = *(void **)((uint8_t *)root + 0x70);
+                int sub_cnt = (sub_array && (uint64_t)sub_array > 0x1000) ?
+                    *(int *)((uint8_t *)sub_array + 0x0C) : 0;
+                pfb_log("LATE_CHECK[%llu]: id=%u %ux%u contents=%p sublayers=%d",
+                        (unsigned long long)ci, cid, w, h, contents, sub_cnt);
+            }
+        }
+    }
+
+    /* Signal the CFRunLoopSource to trigger render_for_time on the server thread.
+     * Every 6th sync tick ≈ 10fps. */
+    if (g_render_source && g_server_runloop) {
+        static int _render_pump_tick = 0;
+        _render_pump_tick++;
+        if (_render_pump_tick >= 6) {
+            _render_pump_tick = 0;
+            CFRunLoopSourceSignal(g_render_source);
+            CFRunLoopWakeUp(g_server_runloop);
+        }
+    }
 
     uint8_t *pixel_dest = (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE;
     RosettaSimFramebufferHeader *hdr = (RosettaSimFramebufferHeader *)g_shared_fb;
@@ -2032,6 +2115,34 @@ static void *pfb_display_services_thread(void *arg) {
     return NULL;
 }
 
+/* ================================================================
+ * Render pump thread — calls render_for_time at 10fps
+ * Spawned from S22 block after render_for_time is confirmed working.
+ * ================================================================ */
+/* g_rft_srv, g_rft_qc, g_server_runloop declared near top with other globals */
+
+extern double CACurrentMediaTime(void);
+
+static void *pfb_render_pump(void *arg) {
+    pfb_log("S22_RFT: render pump thread started");
+    struct timespec interval = { 0, 100000000 }; /* 100ms = 10fps */
+    int count = 0;
+    while (g_running) {
+        nanosleep(&interval, NULL);
+        if (!g_rft_srv || !g_rft_qc) continue;
+        count++;
+
+        typedef void (*RenderForTimeFn)(void *, double, void *, unsigned int);
+        RenderForTimeFn fn = (RenderForTimeFn)(g_rft_qc + 0x1287ea);
+        fn(g_rft_srv, CACurrentMediaTime(), NULL, 0);
+
+        if (count <= 5 || count % 100 == 0)
+            pfb_log("RENDER_FOR_TIME[%d]", count);
+    }
+    pfb_log("S22_RFT: render pump thread exiting");
+    return NULL;
+}
+
 __attribute__((constructor))
 static void pfb_init(void) {
     pfb_log("Initializing PurpleFBServer shim");
@@ -2323,6 +2434,111 @@ static void pfb_init(void) {
         pfb_log("GPU_INJECT: PurpleDisplay* at server+0x58 = %p", display_cpp);
 
         if (display_cpp) {
+            /* ============================================================
+             * Session 22 FIX: Set PurpleDisplay+0x98 = 60.0 (refresh rate)
+             * TimerDisplayLink::update_timer() reads Display+0x98 as a double.
+             * If it's 0, the display timer is never created and the render
+             * loop doesn't fire. CoreSimulator normally sets this, but our
+             * PurpleFBServer shim doesn't. Write 60.0 Hz here.
+             * ============================================================ */
+            {
+                double *refresh_ptr = (double *)((uint8_t *)display_cpp + 0x98);
+                uint64_t raw_bits = *(uint64_t *)refresh_ptr;
+                pfb_log("DISPLAY_RATE: PurpleDisplay+0x98 = %.6f (raw=0x%llx)",
+                        *refresh_ptr, (unsigned long long)raw_bits);
+                /* Force write 60.0 regardless — catches NaN, denormals, zero */
+                if (!(*refresh_ptr > 1.0)) {
+                    *refresh_ptr = 60.0;
+                    pfb_log("DISPLAY_RATE: SET to 60.0 Hz (was %.6f)", *(double *)&raw_bits);
+                } else {
+                    pfb_log("DISPLAY_RATE: already %.1f Hz", *refresh_ptr);
+                }
+            }
+
+            /* ============================================================
+             * After setting rate, walk DisplayLink::_list and call
+             * update_timer() on our display's link so it creates the timer.
+             * _list at QuartzCore+0x1BF9A0, _lock at +0x1BF998
+             * ============================================================ */
+            {
+                Dl_info qc_info = {0};
+                void *qc_sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                if (qc_sym && dladdr(qc_sym, &qc_info) && qc_info.dli_fbase) {
+                    uintptr_t qc_base = (uintptr_t)qc_info.dli_fbase;
+                    pfb_log("DISPLAYLINK: QuartzCore base=%p", (void *)qc_base);
+
+                    os_unfair_lock *dl_lock = (os_unfair_lock *)(qc_base + 0x1BF998);
+                    void **dl_list_ptr = (void **)(qc_base + 0x1BF9A0);
+
+                    os_unfair_lock_lock(dl_lock);
+                    void *link = *dl_list_ptr;
+                    void *our_link = NULL;
+                    int link_count = 0;
+                    while (link) {
+                        void *link_display = *(void **)((uint8_t *)link + 0x08);
+                        pfb_log("DISPLAYLINK: [%d] link=%p display=%p %s",
+                                link_count, link, link_display,
+                                link_display == display_cpp ? "*** OURS ***" : "");
+                        if (link_display == display_cpp) {
+                            our_link = link;
+                        }
+                        link = *(void **)((uint8_t *)link + 0x28);
+                        link_count++;
+                        if (link_count > 20) break; /* safety */
+                    }
+                    os_unfair_lock_unlock(dl_lock);
+
+                    pfb_log("DISPLAYLINK: found %d links, ours=%p", link_count, our_link);
+
+                    if (our_link) {
+                        /* Dump vtable to find update_timer */
+                        void **vt = *(void ***)our_link;
+                        pfb_log("DISPLAYLINK: our link vtable=%p", (void *)vt);
+                        for (int i = 0; i < 10; i++) {
+                            Dl_info vi = {0};
+                            if (vt[i] && dladdr(vt[i], &vi) && vi.dli_sname)
+                                pfb_log("DISPLAYLINK: vt[%d] = %s", i, vi.dli_sname);
+                            else
+                                pfb_log("DISPLAYLINK: vt[%d] = %p", i, vt[i]);
+                        }
+
+                        /* Call update_timer — from disassembly it's at 0x7932.
+                         * Find which vtable slot matches by comparing to qc_base+0x7932 */
+                        void *update_timer_addr = (void *)(qc_base + 0x7932);
+                        int update_slot = -1;
+                        for (int i = 0; i < 10; i++) {
+                            if (vt[i] == update_timer_addr) {
+                                update_slot = i;
+                                break;
+                            }
+                        }
+                        pfb_log("DISPLAYLINK: update_timer expected at %p, slot=%d",
+                                update_timer_addr, update_slot);
+
+                        if (update_slot >= 0) {
+                            typedef void (*UpdateTimerFn)(void *);
+                            UpdateTimerFn update_fn = (UpdateTimerFn)vt[update_slot];
+                            pfb_log("DISPLAYLINK: calling update_timer via vtable[%d]...", update_slot);
+                            update_fn(our_link);
+                            pfb_log("DISPLAYLINK: update_timer returned!");
+                        } else {
+                            /* Fallback: call directly by address */
+                            pfb_log("DISPLAYLINK: vtable slot not found, calling update_timer directly");
+                            typedef void (*UpdateTimerFn)(void *);
+                            UpdateTimerFn update_fn = (UpdateTimerFn)update_timer_addr;
+                            update_fn(our_link);
+                            pfb_log("DISPLAYLINK: direct call returned!");
+                        }
+                    } else {
+                        pfb_log("DISPLAYLINK: no link for our display — list is empty or mismatched");
+                        pfb_log("DISPLAYLINK: _list=%p *_list=%p display_cpp=%p",
+                                dl_list_ptr, *dl_list_ptr, display_cpp);
+                    }
+                } else {
+                    pfb_log("DISPLAYLINK: could not find QuartzCore base");
+                }
+            }
+
             /* Dump Display vtable to confirm it's a real C++ object */
             uint64_t vtable_ptr = *(uint64_t *)display_cpp;
             pfb_log("GPU_INJECT: Display vtable = 0x%llx", (unsigned long long)vtable_ptr);
@@ -2375,12 +2591,145 @@ static void pfb_init(void) {
             for (uint64_t i = 0; i < count && i < 10; i++) {
                 void *entry = *(void **)((uint8_t *)list + i * 0x10);
                 uint64_t meta = *(uint64_t *)((uint8_t *)list + i * 0x10 + 8);
-                if (entry) {
+                if (!entry) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
+
+                /* root_layer: resource ID at +0xB0, cached ptr at +0xB8 */
+                uint64_t rl_resid = *(uint64_t *)((uint8_t *)entry + 0xB0);
+                void *rl_cached = *(void **)((uint8_t *)entry + 0xB8);
+
+                /* Check defer flag at context+0x08 bit 16 (0x10000) */
+                uint32_t flags = *(uint32_t *)((uint8_t *)entry + 0x08);
+                int defer = (flags >> 16) & 1;
+
+                pfb_log("  [%llu] id=%u flags=0x%x defer=%d root_resid=%llu root=%p %s",
+                        (unsigned long long)i, cid, flags, defer,
+                        (unsigned long long)rl_resid, rl_cached,
+                        rl_resid > 0 ? "HAS_ROOT" : "no_root");
+            }
+
+            /* Inspect sublayer lists for ALL contexts with root layers */
+            {
+                typedef struct { double x; double y; } CGPoint_bl;
+                CGPoint_bl ctr_bl = { 187.5, 333.5 };
+                unsigned int bound_id = ((unsigned int(*)(id, SEL, CGPoint_bl))objc_msgSend)(
+                    disp, sel_registerName("contextIdAtPosition:"), ctr_bl);
+
+                for (uint64_t i = 0; i < count && i < 10; i++) {
+                    void *entry = *(void **)((uint8_t *)list + i * 0x10);
+                    if (!entry) continue;
                     uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
-                    pfb_log("  list[%llu]: ctx=%p meta=0x%llx ctx_id=%u",
-                            (unsigned long long)i, entry, (unsigned long long)meta, cid);
+                    void *root = *(void **)((uint8_t *)entry + 0xB8);
+                    if (!root) continue;
+
+                    int is_bound = (cid == bound_id);
+                    pfb_log("LAYER_TREE[%llu]: id=%u root=%p %s",
+                            (unsigned long long)i, cid, root,
+                            is_bound ? "*** BOUND ***" : "");
+
+                    /* Bounds at root+0x98/0x9c and +0xa8/0xac */
+                    uint32_t w1 = *(uint32_t *)((uint8_t *)root + 0x98);
+                    uint32_t h1 = *(uint32_t *)((uint8_t *)root + 0x9c);
+                    uint32_t w2 = *(uint32_t *)((uint8_t *)root + 0xa8);
+                    uint32_t h2 = *(uint32_t *)((uint8_t *)root + 0xac);
+                    pfb_log("  bounds: %ux%u / %ux%u", w1, h1, w2, h2);
+
+                    /* Contents texture at +0x60 (backing store) */
+                    void *contents = *(void **)((uint8_t *)root + 0x60);
+                    pfb_log("  contents=%p", contents);
+
+                    /* For BOUND context only: inspect sublayer array at +0x70 */
+                    if (is_bound) {
+                        void *sub_array = *(void **)((uint8_t *)root + 0x70);
+                        pfb_log("  BOUND sublayer_array=%p", sub_array);
+                        if (sub_array && (uint64_t)sub_array > 0x1000) {
+                            int sub_cnt = *(int *)((uint8_t *)sub_array + 0x0C);
+                            pfb_log("  BOUND sublayer_count=%d", sub_cnt);
+                            for (int si = 0; si < sub_cnt && si < 5; si++) {
+                                void *sl = *(void **)((uint8_t *)sub_array + 0x10 + si * 8);
+                                if (!sl || (uint64_t)sl < 0x1000) {
+                                    pfb_log("  BOUND sub[%d]: NULL", si);
+                                    continue;
+                                }
+                                uint32_t sw = *(uint32_t *)((uint8_t *)sl + 0x98);
+                                uint32_t sh = *(uint32_t *)((uint8_t *)sl + 0x9c);
+                                void *sl_contents = *(void **)((uint8_t *)sl + 0x60);
+                                void *sl_subs = *(void **)((uint8_t *)sl + 0x70);
+                                int sl_sub_cnt = (sl_subs && (uint64_t)sl_subs > 0x1000) ?
+                                    *(int *)((uint8_t *)sl_subs + 0x0C) : -1;
+                                pfb_log("  BOUND sub[%d]: %ux%u contents=%p children=%d",
+                                        si, sw, sh, sl_contents, sl_sub_cnt);
+
+                                /* One level deeper for first sublayer */
+                                if (si == 0 && sl_subs && sl_sub_cnt > 0) {
+                                    for (int gi = 0; gi < sl_sub_cnt && gi < 3; gi++) {
+                                        void *gl = *(void **)((uint8_t *)sl_subs + 0x10 + gi * 8);
+                                        if (!gl || (uint64_t)gl < 0x1000) continue;
+                                        uint32_t gw = *(uint32_t *)((uint8_t *)gl + 0x98);
+                                        uint32_t gh = *(uint32_t *)((uint8_t *)gl + 0x9c);
+                                        void *gc = *(void **)((uint8_t *)gl + 0x60);
+                                        pfb_log("    sub[0].child[%d]: %ux%u contents=%p",
+                                                gi, gw, gh, gc);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        /* ============================================================
+         * render_for_time gate checks
+         * Gate 1: display_cpp+0x28 (NULL ok, or +0x30 bit5 NOT set)
+         * Gate 2: server_cpp+0xe8 bit 1 NOT set
+         * Gate 3: server_cpp+0xe8 bit 2 NOT set
+         * ============================================================ */
+        {
+            /* Gate 1: Display+0x28 */
+            void *disp_28 = *(void **)((uint8_t *)display_cpp + 0x28);
+            if (disp_28) {
+                uint8_t disp_30 = *(uint8_t *)((uint8_t *)display_cpp + 0x30);
+                int bit5 = (disp_30 >> 5) & 1;
+                pfb_log("RENDER_GATE: Display+0x28=%p +0x30=0x%02x bit5=%d %s",
+                        disp_28, disp_30, bit5,
+                        bit5 ? "*** BLOCKS RENDER ***" : "OK");
+            } else {
+                pfb_log("RENDER_GATE: Display+0x28=NULL (OK — gate passes)");
+            }
+
+            /* Gate 2: server+0xe8 bit 1 */
+            uint8_t srv_e8 = *(uint8_t *)((uint8_t *)server_cpp + 0xe8);
+            int bit1 = (srv_e8 >> 1) & 1;
+            int bit2 = (srv_e8 >> 2) & 1;
+            pfb_log("RENDER_GATE: server+0xe8=0x%02x bit1=%d bit2=%d %s",
+                    srv_e8, bit1, bit2,
+                    bit1 ? "*** BIT1 BLOCKS RENDER ***" : "OK");
+
+            /* SWContext dest check */
+            void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
+            if (swctx) {
+                void *dest = *(void **)((uint8_t *)swctx + 0x668);
+                int64_t stride = *(int64_t *)((uint8_t *)swctx + 0x678);
+                pfb_log("RENDER_GATE: SWContext dest=%p stride=%lld", dest, (long long)stride);
+            } else {
+                pfb_log("RENDER_GATE: NO SWContext!");
+            }
+
+            /* Display surface */
+            void *surf = *(void **)((uint8_t *)display_cpp + 0x138);
+            pfb_log("RENDER_GATE: Display+0x138 surface=%p", surf);
+
+            /* contextIdAtPosition */
+            typedef struct { double x; double y; } CGPoint_gate;
+            CGPoint_gate ctr = { 187.5, 333.5 };
+            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_gate))objc_msgSend)(
+                disp, sel_registerName("contextIdAtPosition:"), ctr);
+            pfb_log("RENDER_GATE: contextIdAtPosition(center)=%u", bound);
+
+            /* server+0xc8 — render_for_time reads this as a double for timing */
+            double srv_c8 = *(double *)((uint8_t *)server_cpp + 0xc8);
+            pfb_log("RENDER_GATE: server+0xc8 (timing)=%.6f", srv_c8);
         }
 
         /* ============================================================
@@ -2446,6 +2795,212 @@ static void pfb_init(void) {
 
             /* Also dump root_layer_handle area for bounds check debug */
             /* root_layer_handle is at context+some_offset, and bounds at handle+0xA0 */
+        }
+
+        /* Step 4c: Port fix DISABLED — per-client port may be correct.
+         * Log ports for diagnostics only. */
+        {
+            for (unsigned long fi = 0; fi < ctx_cnt; fi++) {
+                id fctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                    ctxs, sel_registerName("objectAtIndex:"), fi);
+                if (!fctx) continue;
+                Ivar fI = class_getInstanceVariable(object_getClass(fctx), "_impl");
+                if (!fI) continue;
+                void *fimpl = *(void **)((uint8_t *)fctx + ivar_getOffset(fI));
+                if (!fimpl) continue;
+                mach_port_t p = *(mach_port_t *)((uint8_t *)fimpl + 0x98);
+                unsigned int fcid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                    fctx, sel_registerName("contextId"));
+                pfb_log("PORT_LOG: ctx[%lu] id=%u port=%u (NOT overriding)", fi, fcid, p);
+            }
+        }
+
+        /* Step 4d: Full dump of BOUND context to find Shmem */
+        if (list && count > 0) {
+            typedef struct { double x; double y; } CGPoint_sd;
+            CGPoint_sd ctr_sd = { 187.5, 333.5 };
+            unsigned int bid = ((unsigned int(*)(id, SEL, CGPoint_sd))objc_msgSend)(
+                disp, sel_registerName("contextIdAtPosition:"), ctr_sd);
+
+            for (uint64_t si = 0; si < count && si < 10; si++) {
+                void *ctx_s = *(void **)((uint8_t *)list + si * 0x10);
+                if (!ctx_s) continue;
+                uint32_t scid = *(uint32_t *)((uint8_t *)ctx_s + 0x0C);
+                if (scid != bid) continue;
+
+                pfb_log("CTX_DUMP: bound id=%u at %p", scid, ctx_s);
+                for (int off = 0; off < 0x110; off += 8) {
+                    uint64_t val = *(uint64_t *)((uint8_t *)ctx_s + off);
+                    if (val != 0)
+                        pfb_log("  +0x%02x = 0x%016llx", off, (unsigned long long)val);
+                }
+
+                /* Scan for Mach ports in the context */
+                pfb_log("CTX_PORTS:");
+                for (int off = 0; off < 0x60; off += 4) {
+                    uint32_t val = *(uint32_t *)((uint8_t *)ctx_s + off);
+                    if (val > 100 && val < 100000) {
+                        mach_port_type_t ptype = 0;
+                        kern_return_t pkr = mach_port_type(mach_task_self(), val, &ptype);
+                        if (pkr == KERN_SUCCESS && ptype != 0) {
+                            pfb_log("  +0x%x = %u type=0x%x send=%d recv=%d",
+                                off, val, ptype,
+                                (ptype & MACH_PORT_TYPE_SEND) != 0,
+                                (ptype & MACH_PORT_TYPE_RECEIVE) != 0);
+                        }
+                    }
+                }
+
+                /* Scan connection object at +0x10 for task port */
+                void *conn = *(void **)((uint8_t *)ctx_s + 0x10);
+                if (conn && (uint64_t)conn > 0x100000) {
+                    pfb_log("CONN_SCAN: conn=%p", conn);
+                    mach_port_t found_task = 0;
+                    for (int coff = 0; coff < 0x40; coff += 4) {
+                        uint32_t cval = *(uint32_t *)((uint8_t *)conn + coff);
+                        if (cval > 0x100 && cval < 0x100000) {
+                            mach_port_type_t cpt = 0;
+                            kern_return_t ckr = mach_port_type(mach_task_self(), cval, &cpt);
+                            if (ckr == KERN_SUCCESS && cpt != 0) {
+                                pfb_log("CONN+0x%x = %u type=0x%x send=%d recv=%d",
+                                    coff, cval, cpt,
+                                    (cpt & MACH_PORT_TYPE_SEND) != 0,
+                                    (cpt & MACH_PORT_TYPE_RECEIVE) != 0);
+                                /* First SEND-only port could be the task port */
+                                if (!found_task && (cpt & MACH_PORT_TYPE_SEND) &&
+                                    !(cpt & MACH_PORT_TYPE_RECEIVE))
+                                    found_task = cval;
+                            }
+                        }
+                    }
+
+                    /* Also scan the context itself wider for task-like ports */
+                    for (int woff = 0x10; woff < 0xA0; woff += 4) {
+                        uint32_t wval = *(uint32_t *)((uint8_t *)ctx_s + woff);
+                        if (wval > 0x100 && wval < 0x100000) {
+                            mach_port_type_t wpt = 0;
+                            kern_return_t wkr = mach_port_type(mach_task_self(), wval, &wpt);
+                            if (wkr == KERN_SUCCESS && wpt != 0 &&
+                                (wpt & MACH_PORT_TYPE_SEND) && !(wpt & MACH_PORT_TYPE_RECEIVE)) {
+                                pfb_log("CTX+0x%x = %u type=0x%x (task candidate)",
+                                    woff, wval, wpt);
+                                if (!found_task) found_task = wval;
+                            }
+                        }
+                    }
+
+                    /* Try vm_read at 0x100000000 with any found task port */
+                    if (found_task) {
+                        pfb_log("VM_READ_TEST: trying task_port=%u at 0x100000000...", found_task);
+                        vm_offset_t rd_data = 0;
+                        mach_msg_type_number_t rd_cnt = 0;
+                        kern_return_t rd_kr = vm_read(found_task, 0x100000000ULL,
+                            4096, &rd_data, &rd_cnt);
+                        pfb_log("VM_READ_TEST: kr=%d (%s) got=%u bytes",
+                            rd_kr, mach_error_string(rd_kr), rd_cnt);
+                        if (rd_kr == KERN_SUCCESS && rd_cnt > 0) {
+                            uint32_t magic = *(uint32_t *)rd_data;
+                            pfb_log("VM_READ_TEST: magic=0x%x (expect 0x9C43 for commit)",
+                                magic);
+                            uint8_t *rp = (uint8_t *)rd_data;
+                            pfb_log("VM_READ_TEST: first 32 bytes: "
+                                "%02x%02x%02x%02x %02x%02x%02x%02x "
+                                "%02x%02x%02x%02x %02x%02x%02x%02x",
+                                rp[0],rp[1],rp[2],rp[3],
+                                rp[4],rp[5],rp[6],rp[7],
+                                rp[8],rp[9],rp[10],rp[11],
+                                rp[12],rp[13],rp[14],rp[15]);
+                            vm_deallocate(mach_task_self(), rd_data, rd_cnt);
+                        }
+                    } else {
+                        pfb_log("VM_READ_TEST: no task port in conn/ctx. Trying brute-force...");
+                        /* Brute-force: try vm_read with known port ranges */
+                        for (mach_port_t tp = 0x100; tp < 0x10000; tp += 4) {
+                            mach_port_type_t bpt = 0;
+                            if (mach_port_type(mach_task_self(), tp, &bpt) != KERN_SUCCESS)
+                                continue;
+                            if (!(bpt & MACH_PORT_TYPE_SEND) || (bpt & MACH_PORT_TYPE_RECEIVE))
+                                continue;
+                            /* Try vm_read at the commit address */
+                            vm_offset_t brd = 0;
+                            mach_msg_type_number_t brc = 0;
+                            kern_return_t bkr = vm_read(tp, 0x100000000ULL, 64, &brd, &brc);
+                            if (bkr == KERN_SUCCESS && brc > 0) {
+                                uint32_t mag = *(uint32_t *)brd;
+                                pfb_log("VM_READ_HIT: port=%u got %u bytes magic=0x%x",
+                                    tp, brc, mag);
+                                vm_deallocate(mach_task_self(), brd, brc);
+                                break; /* found one */
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        /* ============================================================
+         * Step 4b: Deep layer inspection on each context
+         * ============================================================ */
+        {
+            SEL respSel = sel_registerName("respondsToSelector:");
+            for (unsigned long i = 0; i < ctx_cnt && i < 5; i++) {
+                id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                    ctxs, sel_registerName("objectAtIndex:"), i);
+                if (!ctx) continue;
+                unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                    ctx, sel_registerName("contextId"));
+
+                SEL layerSel = sel_registerName("layer");
+                id layer = NULL;
+                if (class_respondsToSelector(object_getClass(ctx), layerSel))
+                    layer = ((id(*)(id, SEL))objc_msgSend)(ctx, layerSel);
+
+                if (!layer) {
+                    pfb_log("CTX_DEEP[%lu]: id=%u NO LAYER", i, cid);
+                    continue;
+                }
+
+                pfb_log("CTX_DEEP[%lu]: id=%u layer=%p class=%s",
+                        i, cid, (void *)layer, object_getClassName(layer));
+
+                /* Sublayers */
+                id sublayers = ((id(*)(id, SEL))objc_msgSend)(
+                    layer, sel_registerName("sublayers"));
+                unsigned long slc = sublayers ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                    sublayers, sel_registerName("count")) : 0;
+                pfb_log("CTX_DEEP[%lu]: sublayers=%lu", i, slc);
+
+                /* First few sublayer classes */
+                for (unsigned long s = 0; s < slc && s < 5; s++) {
+                    id sl = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                        sublayers, sel_registerName("objectAtIndex:"), s);
+                    pfb_log("CTX_DEEP[%lu]:   sub[%lu]=%p class=%s",
+                            i, s, (void *)sl, sl ? object_getClassName(sl) : "nil");
+                }
+
+                /* Opacity */
+                typedef float (*FloatMsgFn)(id, SEL);
+                float opacity = ((FloatMsgFn)objc_msgSend)(layer, sel_registerName("opacity"));
+                pfb_log("CTX_DEEP[%lu]: opacity=%.2f", i, opacity);
+
+                /* Hidden */
+                int hidden = ((int(*)(id, SEL))objc_msgSend)(layer, sel_registerName("isHidden"));
+                pfb_log("CTX_DEEP[%lu]: hidden=%d", i, hidden);
+
+                /* Background color */
+                void *bgColor = ((void *(*)(id, SEL))objc_msgSend)(
+                    layer, sel_registerName("backgroundColor"));
+                pfb_log("CTX_DEEP[%lu]: backgroundColor=%p", i, bgColor);
+
+                /* Check if context is associated with a display */
+                SEL slotSel = sel_registerName("slotId");
+                int hasSlot = ((int(*)(id, SEL, SEL))objc_msgSend)(ctx, respSel, slotSel);
+                if (hasSlot) {
+                    unsigned int slot = ((unsigned int(*)(id, SEL))objc_msgSend)(ctx, slotSel);
+                    pfb_log("CTX_DEEP[%lu]: slotId=%u", i, slot);
+                }
+            }
         }
 
         /* ============================================================
@@ -2571,217 +3126,416 @@ static void pfb_init(void) {
             }
         }
 
-        /* TEST: Add a red layer to the display to verify SW renderer can draw */
+        /* ============================================================
+         * Direct render_for_time call + POST_RENDER pixel check
+         * Calls from main thread at t=5s to check pixels immediately.
+         * ============================================================ */
         {
-            SEL rootLayerSel = sel_registerName("layer");
-            id rootLayer = NULL;
-            if (class_respondsToSelector(object_getClass(disp), rootLayerSel))
-                rootLayer = ((id(*)(id, SEL))objc_msgSend)(disp, rootLayerSel);
-            pfb_log("TEST_LAYER: display root layer = %p", (void *)rootLayer);
+            Dl_info qc_info = {0};
+            void *qc_sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+            if (qc_sym && dladdr(qc_sym, &qc_info) && qc_info.dli_fbase) {
+                uintptr_t qc_base = (uintptr_t)qc_info.dli_fbase;
+                typedef void (*RenderForTimeFn)(void *, double, void *, unsigned int);
+                RenderForTimeFn rft = (RenderForTimeFn)(qc_base + 0x1287ea);
 
-            if (rootLayer) {
-                Class layerClass = (Class)objc_getClass("CALayer");
-                id testLayer = ((id(*)(id, SEL))objc_msgSend)(
-                    ((id(*)(id, SEL))objc_msgSend)((id)layerClass, sel_registerName("alloc")),
-                    sel_registerName("init"));
+                extern double CACurrentMediaTime(void);
+                pfb_log("DIRECT_RENDER: calling render_for_time from main thread...");
+                rft(server_cpp, CACurrentMediaTime(), NULL, 0);
+                pfb_log("DIRECT_RENDER: returned OK");
 
-                typedef struct { double x, y, w, h; } CGRect_t;
-                typedef struct { double x, y; } CGPoint_t2;
-                CGRect_t bounds = {0, 0, 375.0, 667.0};
-                CGPoint_t2 pos = {187.5, 333.5};
-                ((void(*)(id, SEL, CGRect_t))objc_msgSend)(testLayer, sel_registerName("setBounds:"), bounds);
-                ((void(*)(id, SEL, CGPoint_t2))objc_msgSend)(testLayer, sel_registerName("setPosition:"), pos);
+                /* Check DISPLAY SURFACE pixels after render
+                 * Display+0x138 = MemorySurface, +0x40 = data, +0x48 = stride
+                 * This wraps our PurpleFB allocation — safe to read */
+                {
+                    void *disp_cpp_post = *(void **)((uint8_t *)server_cpp + 0x58);
+                    pfb_log("POST_RENDER: display_cpp=%p", disp_cpp_post);
 
-                /* Set opaque red background */
-                typedef void *(*CGColorCreateFn)(void *, double, double, double, double);
-                CGColorCreateFn colorCreate = (CGColorCreateFn)dlsym(RTLD_DEFAULT, "CGColorCreateGenericRGB");
-                if (colorCreate) {
-                    void *red = colorCreate(NULL, 1.0, 0.0, 0.0, 1.0);
-                    if (red) {
-                        ((void(*)(id, SEL, void *))objc_msgSend)(testLayer, sel_registerName("setBackgroundColor:"), red);
+                    if (disp_cpp_post) {
+                        void *mem_surface = *(void **)((uint8_t *)disp_cpp_post + 0x138);
+                        pfb_log("POST_RENDER: MemorySurface=%p", mem_surface);
+
+                        if (mem_surface) {
+                            void *surf_data = *(void **)((uint8_t *)mem_surface + 0x40);
+                            int64_t surf_stride = *(int64_t *)((uint8_t *)mem_surface + 0x48);
+                            pfb_log("POST_RENDER: data=%p stride=%lld g_surface=%p same=%d",
+                                    surf_data, (long long)surf_stride,
+                                    (void *)g_surface_addr,
+                                    (surf_data == (void *)g_surface_addr));
+
+                            if (surf_data && (uint64_t)surf_data > 0x100000) {
+                                uint8_t *pp = (uint8_t *)surf_data;
+                                int nz_rgb = 0, nz_alpha = 0;
+                                for (int i = 0; i < 2000; i++) {
+                                    if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz_rgb++;
+                                    if (pp[i*4+3]) nz_alpha++;
+                                }
+                                pfb_log("POST_RENDER: %d/2000 nz_rgb %d/2000 nz_alpha px[0]=(%u,%u,%u,%u)",
+                                        nz_rgb, nz_alpha, pp[0], pp[1], pp[2], pp[3]);
+                            }
+                        }
                     }
-                }
-                ((void(*)(id, SEL, float))objc_msgSend)(testLayer, sel_registerName("setOpacity:"), 1.0f);
 
-                ((void(*)(id, SEL, id))objc_msgSend)(rootLayer, sel_registerName("addSublayer:"), testLayer);
-                Class txCls = (Class)objc_getClass("CATransaction");
-                if (txCls) ((void(*)(id, SEL))objc_msgSend)((id)txCls, sel_registerName("flush"));
-                pfb_log("TEST_LAYER: added red 375x667 test layer to display root");
-            }
-        }
-
-        /* Check pixel buffer after 2s delay */
-        if (server_cpp) {
-            void *_srv = server_cpp;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2LL * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{
-                void *swctx = *(void **)((uint8_t *)_srv + 0xb8);
-                if (swctx) {
-                    void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
-                    if (pixbuf) {
-                        uint8_t *pp = (uint8_t *)pixbuf;
+                    /* Also check our PurpleFB surface directly */
+                    if (g_surface_addr) {
+                        uint8_t *pp = (uint8_t *)g_surface_addr;
                         int nz = 0;
-                        for (int i = 0; i < 1000; i++)
+                        for (int i = 0; i < 2000; i++)
                             if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
-                        pfb_log("TEST_LAYER: after 2s pixbuf nz=%d/1000 px[0]=(%u,%u,%u,%u)",
+                        pfb_log("POST_RENDER: g_surface_addr %d/2000 nz_rgb px[0]=(%u,%u,%u,%u)",
                                 nz, pp[0], pp[1], pp[2], pp[3]);
                     }
                 }
-            });
-        }
-
-        /* REMOVED: Step 6b, PIXEL_FIND, SWCTX_FULL diagnostics (crash-prone)
-         * ============================================================
-         * OLD Step 6b: Check root_layer on BOUND list entry directly
-         * allContexts may not contain the bound context — check list entries
-         * ============================================================ */
-        if (list && count > 0) {
-            pfb_log("GPU_INJECT: checking root_layer on list entries...");
-            void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-            ptrdiff_t slide = known ? (ptrdiff_t)known - (ptrdiff_t)0xb9899 : 0;
-            /* CA::Render::Context::root_layer_handle at 0x5e14e (from nm) */
-            typedef void *(*root_layer_fn)(void *);
-            root_layer_fn get_root = slide ?
-                (root_layer_fn)((uint8_t *)0x5e14e + slide) : NULL;
-
-            for (uint64_t i = 0; i < count && i < 10; i++) {
-                void *ctx_impl = *(void **)((uint8_t *)list + i * 0x10);
-                if (!ctx_impl) continue;
-                uint32_t cid = *(uint32_t *)((uint8_t *)ctx_impl + 0x0C);
-
-                /* Lock the context mutex (we initialized it earlier) */
-                pthread_mutex_t *mtx = (pthread_mutex_t *)((uint8_t *)ctx_impl + 0x28);
-                int lockrc = pthread_mutex_trylock(mtx);
-
-                void *root = NULL;
-                if (get_root && lockrc == 0) {
-                    root = get_root(ctx_impl);
-                    pthread_mutex_unlock(mtx);
-                } else if (lockrc != 0) {
-                    pfb_log("  list[%llu] id=%u MUTEX LOCKED (rc=%d), skipping root_layer",
-                            (unsigned long long)i, cid, lockrc);
-                    continue;
-                }
-
-                pfb_log("  list[%llu] id=%u root_layer_handle=%p %s",
-                        (unsigned long long)i, cid, root,
-                        cid == bound_cid ? "*** BOUND ***" : "");
-
-                if (root) {
-                    /* BoundsImpl at root+0xA0 — dump it */
-                    int32_t *bounds = (int32_t *)((uint8_t *)root + 0xA0);
-                    pfb_log("    bounds: x=%d y=%d w=%d h=%d",
-                            bounds[0], bounds[1], bounds[2], bounds[3]);
-                }
             }
         }
 
-        /* Find pixel buffer: check Display+0x138 inner object and PurpleServer */
+        pfb_log("GPU_INJECT: session 22 complete — enabling sync thread render");
+        g_gpu_inject_done = 1;
+    });
+
+    /* ================================================================
+     * Session 22: Verification block at 10s
+     * Checks if the refresh rate fix (Display+0x98=60.0) enabled the
+     * native display link, and verifies pixel buffer state.
+     * NO immediate_render() calls — those crash.
+     * ================================================================ */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        pfb_log("S22: verification — checking refresh rate fix results");
+
+        /* Get display and server fresh */
+        Class wsCls = (Class)objc_getClass("CAWindowServer");
+        if (!wsCls) { pfb_log("S22: no CAWindowServer"); return; }
+        id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
+        if (!ws) { pfb_log("S22: no server"); return; }
+        id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+        unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            disps, sel_registerName("count")) : 0;
+        if (dcnt == 0) { pfb_log("S22: no displays"); return; }
+        id disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+            disps, sel_registerName("objectAtIndex:"), 0UL);
+
+        void *server_cpp = NULL;
         {
-            /* 1. Check if inner at surf+0x08 is an IOSurface */
-            void *inner = g_display_surface ? *(void **)((uint8_t *)g_display_surface + 0x08) : NULL;
-            if (inner && (uint64_t)inner > 0x100000) {
-                uint64_t vt = *(uint64_t *)inner;
-                Dl_info di = {0};
-                if (vt > 0x100000 && vt < 0x7fffffffffffULL)
-                    dladdr((void *)vt, &di);
-                pfb_log("PIXEL_FIND: inner=%p vtable=%s", inner, di.dli_sname ?: "none");
-
-                /* Try IOSurface functions regardless of type — nlist found them */
-                {
-                    /* IOSurface! Use nlist-resolved functions */
-                    typedef size_t (*WFn)(void *); typedef void *(*BFn)(void *);
-                    typedef int (*LFn)(void *, uint32_t, uint32_t *);
-                    typedef size_t (*BPRFn)(void *);
-                    WFn ioW = (WFn)pfb_find_symbol("IOSurfaceGetWidth");
-                    WFn ioH = (WFn)pfb_find_symbol("IOSurfaceGetHeight");
-                    BPRFn ioBPR = (BPRFn)pfb_find_symbol("IOSurfaceGetBytesPerRow");
-                    BFn ioBase = (BFn)pfb_find_symbol("IOSurfaceGetBaseAddress");
-                    LFn ioLock = (LFn)pfb_find_symbol("IOSurfaceLock");
-                    LFn ioUnlock = (LFn)pfb_find_symbol("IOSurfaceUnlock");
-                    if (ioW && ioBase && ioLock) {
-                        ioLock(inner, 1, NULL);
-                        size_t w = ioW(inner), h = ioH(inner), bpr = ioBPR ? ioBPR(inner) : 0;
-                        void *base = ioBase(inner);
-                        pfb_log("PIXEL_FIND: IOSurface %zux%zu bpr=%zu base=%p", w, h, bpr, base);
-                        if (base && w > 0) {
-                            uint8_t *px = (uint8_t *)base;
-                            int nz = 0;
-                            for (int i = 0; i < 1000; i++)
-                                if (px[i*4] || px[i*4+1] || px[i*4+2]) nz++;
-                            pfb_log("PIXEL_FIND: *** %d/1000 non-zero RGB ***", nz);
-                            /* Don't cache — this is IOSurface(PurpleDisplay), not real pixels.
-                             * Real buffer comes from SWContext+0x668. */
-                        }
-                        ioUnlock(inner, 1, NULL);
-                    }
-                }
+            Ivar implI = class_getInstanceVariable(object_getClass(disp), "_impl");
+            if (implI) {
+                void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(implI));
+                if (impl) server_cpp = *(void **)((uint8_t *)impl + 0x40);
             }
+        }
+        if (!server_cpp) { pfb_log("S22: no server_cpp"); return; }
 
-            /* 2. SWContext pixel buffer at known offsets from disassembly:
-             *    set_destination stores: buf at +0x668, stride at +0x678, fmt at +0x688
-             *    NOTE: stride can be NEGATIVE (bottom-up scanlines) */
-            if (server_cpp) {
-                void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
-                if (swctx && (uint64_t)swctx > 0x100000) {
-                    void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
-                    int64_t stride = *(int64_t *)((uint8_t *)swctx + 0x678);
-                    uint32_t fmt = *(uint32_t *)((uint8_t *)swctx + 0x688);
-                    pfb_log("SWCTX: pixbuf=%p stride=%lld fmt=%u (0x%x)",
-                            pixbuf, (long long)stride, fmt, fmt);
-                    if (pixbuf && (uint64_t)pixbuf > 0x100000) {
-                        uint8_t *pp = (uint8_t *)pixbuf;
-                        int nz = 0;
-                        for (int i = 0; i < 1000; i++)
-                            if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
-                        pfb_log("SWCTX: *** %d/1000 non-zero RGB at pixbuf ***", nz);
-                        pfb_log("SWCTX: px[0]=(%u,%u,%u,%u)", pp[0], pp[1], pp[2], pp[3]);
-                        if (nz > 0) {
-                            g_display_pixel_buffer = pixbuf;
-                            g_display_pixel_stride = stride;
-                            pfb_log("SWCTX: CACHED pixel buffer at %p stride=%lld!", pixbuf, (long long)stride);
-                        }
-                    }
+        /* 1. Verify Display+0x98 was set to 60.0 */
+        void *display_cpp = *(void **)((uint8_t *)server_cpp + 0x58);
+        if (display_cpp) {
+            double rate = *(double *)((uint8_t *)display_cpp + 0x98);
+            pfb_log("S22_VERIFY: PurpleDisplay+0x98 = %.1f Hz", rate);
+        }
+
+        /* 2. Check ObjC refreshRate (reads via DisplayLink::_list) */
+        {
+            SEL respSel = sel_registerName("respondsToSelector:");
+            SEL rrSel = sel_registerName("refreshRate");
+            int hasRR = ((int(*)(id, SEL, SEL))objc_msgSend)(disp, respSel, rrSel);
+            if (hasRR) {
+                typedef double (*fpret_fn)(id, SEL);
+                fpret_fn fpr = (fpret_fn)dlsym(RTLD_DEFAULT, "objc_msgSend_fpret");
+                double rr = fpr ? fpr(disp, rrSel) : -1.0;
+                pfb_log("S22_VERIFY: [display refreshRate] = %.1f", rr);
+                if (rr > 0) {
+                    pfb_log("S22_VERIFY: *** DISPLAY LINK IS ACTIVE — render loop should be firing ***");
+                } else {
+                    pfb_log("S22_VERIFY: refreshRate still 0 — DisplayLink not registered yet");
                 }
+            } else {
+                pfb_log("S22_VERIFY: display doesn't respond to refreshRate");
             }
         }
 
-        /* Check ALL SWContext buffers — +0x630, +0x668, +0x670 */
-        if (server_cpp) {
+        /* ============================================================
+         * Direct render_for_time timer on server thread
+         * Bypasses DisplayLink entirely — calls the actual render function
+         * at qc_base+0x1287ea via a CFRunLoopTimer installed on the
+         * server's run loop thread via CFRunLoopPerformBlock.
+         * ============================================================ */
+        {
+            Dl_info qc_info = {0};
+            void *qc_sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+            if (qc_sym && dladdr(qc_sym, &qc_info) && qc_info.dli_fbase) {
+                uintptr_t qc_base = (uintptr_t)qc_info.dli_fbase;
+                CFRunLoopRef server_rl = *(CFRunLoopRef *)((uint8_t *)server_cpp + 0x168);
+
+                pfb_log("S22_RFT: qc_base=%p server_rl=%p server_cpp=%p",
+                        (void *)qc_base, (void *)server_rl, server_cpp);
+
+                if (server_rl && CFGetTypeID(server_rl) == CFRunLoopGetTypeID()) {
+                    __block void *_srv = server_cpp;
+                    __block uintptr_t _qc = qc_base;
+                    __block CFRunLoopRef _srl = (CFRunLoopRef)CFRetain(server_rl);
+
+                    typedef void (*RenderForTimeFn)(void *, double, void *, unsigned int);
+
+                    /* Set up globals for render pump */
+                    g_rft_srv = _srv;
+                    g_rft_qc = _qc;
+                    g_renderFn = (RenderForTimeFn_t)(_qc + 0x1287ea);
+                    g_server_runloop = _srl;
+
+                    /* Install CFRunLoopSource on server thread via PerformBlock.
+                     * The source persists and fires when signaled from sync thread. */
+                    CFRunLoopPerformBlock(server_rl, kCFRunLoopDefaultMode, ^{
+                        /* Log current runloop mode */
+                        CFStringRef curMode = CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
+                        if (curMode) {
+                            char buf[128];
+                            CFStringGetCString(curMode, buf, sizeof(buf), kCFStringEncodingUTF8);
+                            pfb_log("S22_RFT: server thread runloop mode = '%s'", buf);
+                            CFRelease(curMode);
+                        } else {
+                            pfb_log("S22_RFT: server thread runloop mode = NULL");
+                        }
+
+                        /* Install persistent CFRunLoopSource */
+                        CFRunLoopSourceContext srcCtx = {0};
+                        srcCtx.perform = render_source_callback;
+                        g_render_source = CFRunLoopSourceCreate(NULL, 0, &srcCtx);
+                        CFRunLoopAddSource(CFRunLoopGetCurrent(), g_render_source,
+                                           kCFRunLoopDefaultMode);
+                        /* Also add to CommonModes in case the RL runs in a different mode */
+                        CFRunLoopAddSource(CFRunLoopGetCurrent(), g_render_source,
+                                           kCFRunLoopCommonModes);
+                        pfb_log("S22_RFT: CFRunLoopSource installed on server thread");
+
+                        /* Call render_for_time once and check pixels immediately */
+                        RenderForTimeFn fn = (RenderForTimeFn)(_qc + 0x1287ea);
+                        fn(_srv, CACurrentMediaTime(), NULL, 0);
+                        pfb_log("S22_RFT: render_for_time returned OK");
+
+                        /* POST_RENDER: Check SWContext pixels IMMEDIATELY */
+                        {
+                            void *swctx = *(void **)((uint8_t *)_srv + 0xb8);
+                            if (swctx) {
+                                void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                                if (pixbuf && (uint64_t)pixbuf > 0x100000) {
+                                    uint8_t *pp = (uint8_t *)pixbuf;
+                                    int nz_rgb = 0, nz_alpha = 0;
+                                    for (int i = 0; i < 2000; i++) {
+                                        if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz_rgb++;
+                                        if (pp[i*4+3]) nz_alpha++;
+                                    }
+                                    pfb_log("POST_RENDER: nz_rgb=%d/2000 nz_alpha=%d/2000 px[0]=(%u,%u,%u,%u)",
+                                            nz_rgb, nz_alpha, pp[0], pp[1], pp[2], pp[3]);
+                                    /* Check middle of buffer */
+                                    int mid = 750 * 667 * 4;
+                                    pfb_log("POST_RENDER: mid=(%u,%u,%u,%u)",
+                                            pp[mid], pp[mid+1], pp[mid+2], pp[mid+3]);
+                                } else {
+                                    pfb_log("POST_RENDER: pixbuf=%p (invalid)", pixbuf);
+                                }
+                            } else {
+                                pfb_log("POST_RENDER: no SWContext");
+                            }
+                        }
+
+                        /* Check bound context's root layer */
+                        {
+                            /* Get bound context ID from GPU_INJECT's contextIdAtPosition */
+                            void *ctx_list_pb = *(void **)((uint8_t *)_srv + 0x68);
+                            uint64_t ctx_count_pb = *(uint64_t *)((uint8_t *)_srv + 0x78);
+
+                            for (uint64_t ci = 0; ci < ctx_count_pb && ci < 10; ci++) {
+                                void *ctx_pb = *(void **)((uint8_t *)ctx_list_pb + ci * 0x10);
+                                if (!ctx_pb) continue;
+                                uint32_t cid_pb = *(uint32_t *)((uint8_t *)ctx_pb + 0x0C);
+                                uint64_t rl_resid = *(uint64_t *)((uint8_t *)ctx_pb + 0xB0);
+                                void *rl_cached = *(void **)((uint8_t *)ctx_pb + 0xB8);
+
+                                if (rl_resid == 0) continue; /* skip contexts without root layers */
+
+                                pfb_log("BOUND_CHECK[%llu]: id=%u root=%p resid=%llu",
+                                        (unsigned long long)ci, cid_pb, rl_cached,
+                                        (unsigned long long)rl_resid);
+
+                                if (rl_cached) {
+                                    /* Dump first 8 uint32s of root layer */
+                                    uint32_t *data = (uint32_t *)rl_cached;
+                                    pfb_log("  raw: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                            data[0], data[1], data[2], data[3],
+                                            data[4], data[5], data[6], data[7]);
+                                    /* Scan for dimension-like doubles */
+                                    for (int off = 0x20; off < 0x120; off += 8) {
+                                        double val = *(double *)((uint8_t *)rl_cached + off);
+                                        if (val > 1.0 && val < 10000.0) {
+                                            pfb_log("  +0x%x = %.1f", off, val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        /* ============================================================
+                         * Inspect C++ context list — check for root layers
+                         * server+0x68 = context list ptr, +0x78 = count
+                         * ============================================================ */
+                        {
+                            void *ctx_list = *(void **)((uint8_t *)_srv + 0x68);
+                            uint64_t ctx_count = *(uint64_t *)((uint8_t *)_srv + 0x78);
+                            pfb_log("SCENE_GRAPH: C++ ctx_list=%p count=%llu",
+                                    ctx_list, (unsigned long long)ctx_count);
+
+                            for (uint64_t i = 0; i < ctx_count && i < 10; i++) {
+                                void *ctx = *(void **)((uint8_t *)ctx_list + i * 0x10);
+                                if (!ctx) { pfb_log("SCENE_GRAPH: [%llu] NULL", (unsigned long long)i); continue; }
+                                uint32_t cid = *(uint32_t *)((uint8_t *)ctx + 0x0C);
+                                pfb_log("SCENE_GRAPH: [%llu] ctx=%p id=%u",
+                                        (unsigned long long)i, ctx, cid);
+
+                                /* Scan for layer-like pointers at various offsets */
+                                for (int off = 0x10; off < 0x80; off += 8) {
+                                    void *val = *(void **)((uint8_t *)ctx + off);
+                                    if (val && (uint64_t)val > 0x100000000ULL &&
+                                        (uint64_t)val < 0x800000000000ULL) {
+                                        uint64_t vt = *(uint64_t *)val;
+                                        Dl_info info = {0};
+                                        if (vt > 0x100000 && vt < 0x7fffffffffffULL)
+                                            dladdr((void *)vt, &info);
+                                        if (info.dli_sname)
+                                            pfb_log("  +0x%x = %p vtable=%s", off, val, info.dli_sname);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    CFRunLoopWakeUp(server_rl);
+                    pfb_log("S22_RFT: CFRunLoopSource setup scheduled on server thread");
+                } else {
+                    pfb_log("S22_RFT: invalid server runloop");
+                }
+            } else {
+                pfb_log("S22_RFT: could not find QuartzCore base");
+            }
+        }
+
+        /* ObjC CAContext.allContexts REMOVED — contains garbage pointers at t=10s,
+         * crashes the S22 block and prevents subsequent dispatch_after blocks. */
+
+        /* Cache SWContext pixel buffer for sync thread (safe read, no scan) */
+        {
             void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
             if (swctx) {
-                struct { int off; const char *name; } bufs[] = {
-                    {0x630, "color_orig"}, {0x638, "alpha_orig"},
-                    {0x640, "color_stride_orig"}, {0x648, "alpha_stride_orig"},
-                    {0x668, "color_flipped"}, {0x670, "alpha_flipped"},
-                    {0x678, "color_stride"}, {0x680, "alpha_stride"},
-                    {0x688, "format"}, {0x690, "x"}, {0x694, "y"},
-                    {0x698, "width"}, {0x69c, "height"}, {-1, NULL}
-                };
-                for (int b = 0; bufs[b].name; b++) {
-                    int off = bufs[b].off;
-                    if (off == 0x688 || off == 0x690 || off == 0x694 || off == 0x698 || off == 0x69c) {
-                        uint32_t v = *(uint32_t *)((uint8_t *)swctx + off);
-                        pfb_log("SWCTX_FULL: +0x%x (%s) = %u", off, bufs[b].name, v);
-                    } else {
-                        uint64_t v = *(uint64_t *)((uint8_t *)swctx + off);
-                        pfb_log("SWCTX_FULL: +0x%x (%s) = 0x%llx", off, bufs[b].name, (unsigned long long)v);
-                        /* If pointer, check pixel content */
-                        if (v > 0x100000000ULL && v < 0x800000000000ULL &&
-                            (off == 0x630 || off == 0x638 || off == 0x668 || off == 0x670)) {
-                            uint8_t *pp = (uint8_t *)v;
-                            int nz = 0;
-                            for (int i = 0; i < 500; i++)
-                                if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
-                            pfb_log("  → %d/500 non-zero RGB", nz);
-                        }
+                void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                int64_t stride = *(int64_t *)((uint8_t *)swctx + 0x678);
+                pfb_log("S22_PIXCACHE: pixbuf=%p stride=%lld", pixbuf, (long long)stride);
+                if (pixbuf && stride > 0) {
+                    g_display_pixel_buffer = pixbuf;
+                    g_display_pixel_stride = stride;
+                    pfb_log("S22_PIXCACHE: cached for sync thread");
+                }
+            }
+        }
+
+        g_gpu_inject_done = 1;
+        pfb_log("S22: complete, g_gpu_inject_done=1");
+    });
+
+    /* ================================================================
+     * Late check at t=20s: Has the bound context's root layer gained
+     * sublayers or contents since t=5s?
+     * ================================================================ */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC),
+                   dispatch_get_global_queue(0, 0), ^{
+        pfb_log("LATE_CHECK: t=20s — re-inspecting bound context root layer");
+
+        Class wsCls = (Class)objc_getClass("CAWindowServer");
+        if (!wsCls) { pfb_log("LATE_CHECK: no CAWindowServer"); return; }
+        id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsCls, sel_registerName("server"));
+        if (!ws) return;
+        id disps = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
+        unsigned long dcnt = disps ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+            disps, sel_registerName("count")) : 0;
+        if (dcnt == 0) return;
+        id disp_late = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+            disps, sel_registerName("objectAtIndex:"), 0UL);
+
+        void *srv = NULL;
+        Ivar iI = class_getInstanceVariable(object_getClass(disp_late), "_impl");
+        if (iI) {
+            void *impl = *(void **)((uint8_t *)disp_late + ivar_getOffset(iI));
+            if (impl) srv = *(void **)((uint8_t *)impl + 0x40);
+        }
+        if (!srv) { pfb_log("LATE_CHECK: no server_cpp"); return; }
+
+        /* Get bound context ID */
+        typedef struct { double x; double y; } CGPoint_lc;
+        CGPoint_lc ctr = { 187.5, 333.5 };
+        unsigned int bound_id = ((unsigned int(*)(id, SEL, CGPoint_lc))objc_msgSend)(
+            disp_late, sel_registerName("contextIdAtPosition:"), ctr);
+        pfb_log("LATE_CHECK: bound_id=%u", bound_id);
+
+        /* Walk C++ context list */
+        void *ctx_list = *(void **)((uint8_t *)srv + 0x68);
+        uint64_t ctx_count = *(uint64_t *)((uint8_t *)srv + 0x78);
+        pfb_log("LATE_CHECK: ctx_count=%llu", (unsigned long long)ctx_count);
+
+        for (uint64_t i = 0; i < ctx_count && i < 10; i++) {
+            void *entry = *(void **)((uint8_t *)ctx_list + i * 0x10);
+            if (!entry) continue;
+            uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
+            void *root = *(void **)((uint8_t *)entry + 0xB8);
+            if (!root) continue;
+
+            uint32_t w = *(uint32_t *)((uint8_t *)root + 0x98);
+            uint32_t h = *(uint32_t *)((uint8_t *)root + 0x9c);
+            void *contents = *(void **)((uint8_t *)root + 0x60);
+            void *sub_array = *(void **)((uint8_t *)root + 0x70);
+            int sub_cnt = (sub_array && (uint64_t)sub_array > 0x1000) ?
+                *(int *)((uint8_t *)sub_array + 0x0C) : 0;
+            int is_bound = (cid == bound_id);
+
+            pfb_log("LATE_CHECK[%llu]: id=%u %ux%u contents=%p sublayers=%d %s",
+                    (unsigned long long)i, cid, w, h, contents, sub_cnt,
+                    is_bound ? "*** BOUND ***" : "");
+
+            /* For bound context: inspect sublayers one level deep */
+            if (is_bound && sub_array && sub_cnt > 0) {
+                for (int si = 0; si < sub_cnt && si < 5; si++) {
+                    void *sl = *(void **)((uint8_t *)sub_array + 0x10 + si * 8);
+                    if (!sl || (uint64_t)sl < 0x1000) continue;
+                    uint32_t sw = *(uint32_t *)((uint8_t *)sl + 0x98);
+                    uint32_t sh = *(uint32_t *)((uint8_t *)sl + 0x9c);
+                    void *sc = *(void **)((uint8_t *)sl + 0x60);
+                    pfb_log("LATE_CHECK  sub[%d]: %ux%u contents=%p", si, sw, sh, sc);
+                }
+            }
+        }
+
+        /* Also call render_for_time and check pixels */
+        {
+            Dl_info qi = {0};
+            void *qs = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+            if (qs && dladdr(qs, &qi) && qi.dli_fbase) {
+                uintptr_t qb = (uintptr_t)qi.dli_fbase;
+                typedef void (*RFTFn)(void *, double, void *, unsigned int);
+                RFTFn rft = (RFTFn)(qb + 0x1287ea);
+                extern double CACurrentMediaTime(void);
+                rft(srv, CACurrentMediaTime(), NULL, 0);
+
+                void *dc = *(void **)((uint8_t *)srv + 0x58);
+                void *ms = *(void **)((uint8_t *)dc + 0x138);
+                if (ms) {
+                    void *sd = *(void **)((uint8_t *)ms + 0x40);
+                    if (sd) {
+                        uint8_t *pp = (uint8_t *)sd;
+                        int nz = 0;
+                        for (int j = 0; j < 2000; j++)
+                            if (pp[j*4] || pp[j*4+1] || pp[j*4+2]) nz++;
+                        pfb_log("LATE_CHECK: display surface %d/2000 nz_rgb px[0]=(%u,%u,%u,%u)",
+                                nz, pp[0], pp[1], pp[2], pp[3]);
                     }
                 }
             }
         }
 
-        pfb_log("GPU_INJECT: session 21 complete — enabling sync thread render");
-        g_gpu_inject_done = 1;
+        pfb_log("LATE_CHECK: done");
     });
 }
 

@@ -4128,6 +4128,280 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         bridge_log("=== End Dump ===");
     }
 
+    /* One-time layer tree diagnostic — after ~2s of frame ticks */
+    {
+        static int _layer_check_count = 0;
+        _layer_check_count++;
+        if (_layer_check_count == 60) { /* ~2s at 30fps */
+            @autoreleasepool {
+                /* 1. Window and root VC */
+                id app = ((id(*)(id,SEL))objc_msgSend)(
+                    (id)objc_getClass("UIApplication"),
+                    sel_registerName("sharedApplication"));
+                id win = ((id(*)(id,SEL))objc_msgSend)(app,
+                    sel_registerName("keyWindow"));
+                id vc = win ? ((id(*)(id,SEL))objc_msgSend)(win,
+                    sel_registerName("rootViewController")) : nil;
+                id winLayer = win ? ((id(*)(id,SEL))objc_msgSend)(win,
+                    sel_registerName("layer")) : nil;
+                bridge_log("LAYER_CHECK: window=%p rootVC=%p", (void *)win, (void *)vc);
+                id winSubs = winLayer ? ((id(*)(id,SEL))objc_msgSend)(winLayer,
+                    sel_registerName("sublayers")) : nil;
+                unsigned long winSlc = winSubs ?
+                    ((unsigned long(*)(id,SEL))objc_msgSend)(winSubs,
+                        sel_registerName("count")) : 0;
+                id winCont = winLayer ? ((id(*)(id,SEL))objc_msgSend)(winLayer,
+                    sel_registerName("contents")) : nil;
+                bridge_log("LAYER_CHECK: winLayer=%p sublayers=%lu contents=%p",
+                    (void *)winLayer, winSlc, (void *)winCont);
+
+                /* 2. CAContext layer vs window layer */
+                {
+                    id _wl = winLayer; /* capture from outer scope */
+                    Class ctxCls = objc_getClass("CAContext");
+                    id allCtxs = ((id(*)(id,SEL))objc_msgSend)((id)ctxCls,
+                        sel_registerName("allContexts"));
+                    unsigned long ctxCount = allCtxs ?
+                        ((unsigned long(*)(id,SEL))objc_msgSend)(allCtxs,
+                            sel_registerName("count")) : 0;
+                    bridge_log("CTX_CHECK: allContexts count=%lu", ctxCount);
+                    for (unsigned long ci = 0; ci < ctxCount && ci < 5; ci++) {
+                        id ctx = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                            allCtxs, sel_registerName("objectAtIndex:"), ci);
+                        unsigned int cid = ((unsigned int(*)(id,SEL))objc_msgSend)(
+                            ctx, sel_registerName("contextId"));
+                        id ctxLayer = ((id(*)(id,SEL))objc_msgSend)(
+                            ctx, sel_registerName("layer"));
+                        bridge_log("CTX_CHECK[%lu]: id=%u layer=%p sameAsWin=%d",
+                            ci, cid, (void *)ctxLayer, ctxLayer == (id)_wl);
+                        if (ctxLayer) {
+                            id ctxSubs = ((id(*)(id,SEL))objc_msgSend)(
+                                ctxLayer, sel_registerName("sublayers"));
+                            unsigned long ctxSlc = ctxSubs ?
+                                ((unsigned long(*)(id,SEL))objc_msgSend)(
+                                    ctxSubs, sel_registerName("count")) : 0;
+                            id ctxCont = ((id(*)(id,SEL))objc_msgSend)(
+                                ctxLayer, sel_registerName("contents"));
+                            bridge_log("  sublayers=%lu contents=%p",
+                                ctxSlc, (void *)ctxCont);
+                        }
+                    }
+                }
+
+                /* 3. Count layers in the window's tree (iterative, 2 levels) */
+                if (winLayer) {
+                    int total = 1;
+                    int with_content = winCont ? 1 : 0;
+                    for (unsigned long s = 0; s < winSlc && s < 20; s++) {
+                        id sub = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                            winSubs, sel_registerName("objectAtIndex:"), s);
+                        total++;
+                        id sc = ((id(*)(id,SEL))objc_msgSend)(sub, sel_registerName("contents"));
+                        if (sc) with_content++;
+                        /* Count grandchildren */
+                        id gsubs = ((id(*)(id,SEL))objc_msgSend)(sub, sel_registerName("sublayers"));
+                        unsigned long gc = gsubs ?
+                            ((unsigned long(*)(id,SEL))objc_msgSend)(gsubs,
+                                sel_registerName("count")) : 0;
+                        total += gc;
+                    }
+                    bridge_log("TREE_CHECK: total_layers=%d with_content=%d (2 levels)",
+                        total, with_content);
+                }
+
+                /* 4. Port chain verification */
+                {
+                    /* Context[0]'s server port at impl+0x98 */
+                    id _ctxs2 = ((id(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("CAContext"),
+                        sel_registerName("allContexts"));
+                    id ctx0 = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                        _ctxs2, sel_registerName("objectAtIndex:"), 0UL);
+                    mach_port_t ctx_port = 0;
+                    Ivar implIvar = class_getInstanceVariable(object_getClass(ctx0), "_impl");
+                    if (implIvar) {
+                        void *impl = *(void **)((uint8_t *)ctx0 + ivar_getOffset(implIvar));
+                        if (impl) {
+                            ctx_port = *(mach_port_t *)((uint8_t *)impl + 0x98);
+                            bridge_log("PORT_CHECK: ctx impl=%p port@0x98=%u", impl, ctx_port);
+                        }
+                    }
+
+                    /* CARenderServer port via bootstrap */
+                    mach_port_t car_port = 0;
+                    extern mach_port_t bootstrap_port;
+                    extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+                    kern_return_t kr = bootstrap_look_up(bootstrap_port,
+                        "com.apple.CARenderServer", &car_port);
+                    bridge_log("PORT_CHECK: bootstrap CARenderServer=%u (kr=%d)", car_port, kr);
+
+                    /* CARenderServerGetServerPort */
+                    mach_port_t gs_port = 0;
+                    void *gsfn = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                    if (gsfn) {
+                        gs_port = ((mach_port_t(*)(void))gsfn)();
+                    }
+                    bridge_log("PORT_CHECK: GetServerPort()=%u", gs_port);
+
+                    /* Validate the ORIGINAL per-client port (DO NOT override) */
+                    bridge_log("PORT_CHECK: ctx=%u bootstrap=%u gsport=%u",
+                        ctx_port, car_port, gs_port);
+
+                    /* Check if the per-client port is a valid send right */
+                    if (ctx_port != 0) {
+                        mach_port_type_t ptype = 0;
+                        kern_return_t pkr = mach_port_type(mach_task_self(), ctx_port, &ptype);
+                        bridge_log("ORIG_PORT: port=%u type_kr=%d type=0x%x send=%d",
+                            ctx_port, pkr, ptype,
+                            (ptype & MACH_PORT_TYPE_SEND) != 0);
+
+                        /* Try sending a test message */
+                        mach_msg_header_t test_msg = {0};
+                        test_msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                        test_msg.msgh_size = sizeof(test_msg);
+                        test_msg.msgh_remote_port = ctx_port;
+                        test_msg.msgh_id = 99999;
+                        kern_return_t skr = mach_msg(&test_msg,
+                            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                            sizeof(test_msg), 0, 0, 100, 0);
+                        bridge_log("ORIG_PORT: test send kr=%d (%s)",
+                            skr, mach_error_string(skr));
+                    }
+
+                    /* Also check all 3 contexts' ports */
+                    {
+                        unsigned long pcc = ((unsigned long(*)(id,SEL))objc_msgSend)(
+                            _ctxs2, sel_registerName("count"));
+                        for (unsigned long pi = 0; pi < pcc && pi < 5; pi++) {
+                            id pctx = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                                _ctxs2, sel_registerName("objectAtIndex:"), pi);
+                            Ivar pIvar = class_getInstanceVariable(
+                                object_getClass(pctx), "_impl");
+                            if (!pIvar) continue;
+                            void *pimpl = *(void **)((uint8_t *)pctx + ivar_getOffset(pIvar));
+                            if (!pimpl) continue;
+                            mach_port_t pp = *(mach_port_t *)((uint8_t *)pimpl + 0x98);
+                            mach_port_type_t pt = 0;
+                            mach_port_type(mach_task_self(), pp, &pt);
+                            unsigned int pcid = ((unsigned int(*)(id,SEL))objc_msgSend)(
+                                pctx, sel_registerName("contextId"));
+                            bridge_log("PORT_ALL[%lu]: id=%u port=%u type=0x%x send=%d",
+                                pi, pcid, pp, pt, (pt & MACH_PORT_TYPE_SEND) != 0);
+                        }
+                    }
+
+                    /* Explicit dirty + commit cycle with diagnostics */
+                    bridge_log("COMMIT: forcing dirty + commit...");
+                    if (winLayer) {
+                        /* Force all layers dirty */
+                        ((void(*)(id,SEL))objc_msgSend)(winLayer,
+                            sel_registerName("setNeedsDisplay"));
+                        ((void(*)(id,SEL))objc_msgSend)(winLayer,
+                            sel_registerName("setNeedsLayout"));
+                        ((void(*)(id,SEL))objc_msgSend)(winLayer,
+                            sel_registerName("layoutIfNeeded"));
+                        ((void(*)(id,SEL))objc_msgSend)(winLayer,
+                            sel_registerName("displayIfNeeded"));
+                        bridge_log("COMMIT: layers dirtied + displayed");
+                    }
+
+                    /* Commit */
+                    ((void(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("CATransaction"),
+                        sel_registerName("begin"));
+                    ((void(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("CATransaction"),
+                        sel_registerName("commit"));
+                    bridge_log("COMMIT: begin+commit done");
+
+                    /* Also flush */
+                    ((void(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("CATransaction"),
+                        sel_registerName("flush"));
+                    bridge_log("COMMIT: flush done");
+
+                    /* Context state checks */
+                    {
+                        SEL respSel = sel_registerName("respondsToSelector:");
+
+                        /* Check connection/suspension state */
+                        const char *state_sels[] = {
+                            "_isConnected", "_commitsSuspended", "_isInvalidated",
+                            "isRemoteContext", NULL
+                        };
+                        for (int si = 0; state_sels[si]; si++) {
+                            SEL ss = sel_registerName(state_sels[si]);
+                            int has = ((int(*)(id,SEL,SEL))objc_msgSend)(ctx0, respSel, ss);
+                            if (has) {
+                                int val = ((int(*)(id,SEL))objc_msgSend)(ctx0, ss);
+                                bridge_log("CTX_STATE: %s = %d", state_sels[si], val);
+                            } else {
+                                bridge_log("CTX_STATE: %s — not found", state_sels[si]);
+                            }
+                        }
+
+                        /* Check impl+0x58 as two uint32 halves */
+                        Ivar _dI = class_getInstanceVariable(object_getClass(ctx0), "_impl");
+                        if (_dI) {
+                            void *_dimpl = *(void **)((uint8_t *)ctx0 + ivar_getOffset(_dI));
+                            if (_dimpl) {
+                                uint32_t v58_lo = *(uint32_t *)((uint8_t *)_dimpl + 0x58);
+                                uint32_t v58_hi = *(uint32_t *)((uint8_t *)_dimpl + 0x5C);
+                                bridge_log("IMPL: +0x58 lo=0x%x hi=0x%x", v58_lo, v58_hi);
+
+                                mach_port_type_t pt = 0;
+                                kern_return_t pkr = mach_port_type(mach_task_self(), v58_lo, &pt);
+                                bridge_log("IMPL: +0x58 lo as port: kr=%d type=0x%x send=%d",
+                                    pkr, pt, (pt & MACH_PORT_TYPE_SEND) != 0);
+
+                                uint32_t v60 = *(uint32_t *)((uint8_t *)_dimpl + 0x60);
+                                bridge_log("IMPL: +0x60 = 0x%x (%u)", v60, v60);
+                            }
+                        }
+                    }
+
+                    /* NUCLEAR TEST: Set a fresh red layer on the context */
+                    {
+                        Class layerCls = (Class)objc_getClass("CALayer");
+                        id redLayer = ((id(*)(id,SEL))objc_msgSend)(
+                            ((id(*)(id,SEL))objc_msgSend)((id)layerCls,
+                                sel_registerName("alloc")),
+                            sel_registerName("init"));
+
+                        typedef struct { double x,y,w,h; } CGRect_nuc;
+                        CGRect_nuc frame = {0, 0, 375.0, 667.0};
+                        ((void(*)(id,SEL,CGRect_nuc))objc_msgSend)(
+                            redLayer, sel_registerName("setFrame:"), frame);
+
+                        /* Set red background */
+                        typedef void *(*CGColorCreateFn)(double,double,double,double);
+                        CGColorCreateFn ccfn = (CGColorCreateFn)dlsym(
+                            RTLD_DEFAULT, "CGColorCreateGenericRGB");
+                        if (ccfn) {
+                            void *red = ccfn(1.0, 0.0, 0.0, 1.0);
+                            if (red) {
+                                ((void(*)(id,SEL,void*))objc_msgSend)(
+                                    redLayer, sel_registerName("setBackgroundColor:"), red);
+                            }
+                        }
+                        ((void(*)(id,SEL,float))objc_msgSend)(
+                            redLayer, sel_registerName("setOpacity:"), 1.0f);
+
+                        /* Set as context's layer */
+                        ((void(*)(id,SEL,id))objc_msgSend)(
+                            ctx0, sel_registerName("setLayer:"), redLayer);
+
+                        /* Flush */
+                        ((void(*)(id,SEL))objc_msgSend)(
+                            (id)objc_getClass("CATransaction"),
+                            sel_registerName("flush"));
+                        bridge_log("NUCLEAR: set fresh red 375x667 layer on ctx + flushed");
+                    }
+                }
+            }
+        }
+    }
+
     /* Check for and inject touch events from host.
      * Touch injection is wrapped in per-event @autoreleasepool (inside
      * check_and_inject_touch) to isolate crash recovery from the outer
@@ -6623,6 +6897,23 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 id remoteCtx = ((id(*)(id, SEL, id))objc_msgSend)(
                                                     (id)caCtxClass, remoteCtxSel, opts);
                                                 if (remoteCtx) {
+                                                    /* DISABLED: Port fix at creation — per-client port may be
+                                                     * the CORRECT destination for commits (not CARenderServer).
+                                                     * Log the port for diagnostics only. */
+                                                    {
+                                                        Ivar pI = class_getInstanceVariable(
+                                                            object_getClass(remoteCtx), "_impl");
+                                                        if (pI) {
+                                                            void *pimpl = *(void **)((uint8_t *)remoteCtx
+                                                                + ivar_getOffset(pI));
+                                                            if (pimpl) {
+                                                                mach_port_t p = *(mach_port_t *)(
+                                                                    (uint8_t *)pimpl + 0x98);
+                                                                bridge_log("PORT_AT_CREATE: impl+0x98 = %u (per-client, NOT overriding)", p);
+                                                            }
+                                                        }
+                                                    }
+
                                                     /* Set the window's layer as the context's layer */
                                                     SEL setLayerSel = sel_registerName("setLayer:");
                                                     if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
