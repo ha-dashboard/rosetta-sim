@@ -156,12 +156,20 @@ static void pfb_notify_broker(const char *name, mach_port_t port);
  * ================================================================ */
 
 static void pfb_log(const char *fmt, ...) {
+    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, PFB_LOG_PREFIX);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    int n = vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
     va_end(ap);
+    if (n > 0) {
+        /* Non-blocking write — drop message if pipe is full.
+         * Prevents sync thread death when broker stops draining stderr. */
+        static int _nb_set = 0;
+        if (!_nb_set) { _nb_set = 1; fcntl(STDERR_FILENO, F_SETFL, O_NONBLOCK); }
+        write(STDERR_FILENO, "[PurpleFBServer] ", 17);
+        write(STDERR_FILENO, buf, n);
+        write(STDERR_FILENO, "\n", 1);
+    }
 }
 
 /* ================================================================
@@ -265,6 +273,7 @@ static void pfb_setup_shared_framebuffer(void) {
 static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
 static volatile int g_layer_host_created; /* defined later, declared here for pfb_sync_to_shared */
 static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
+static volatile int g_gpu_inject_done = 0; /* set by GPU_INJECT after mutex reinit */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
 typedef void *CGColorSpaceRef;
@@ -906,8 +915,7 @@ static void *pfb_sync_thread(void *arg) {
                     g_shared_fb != MAP_FAILED ?
                     (unsigned long long)((RosettaSimFramebufferHeader *)g_shared_fb)->frame_counter : 0ULL);
         }
-        /* pfb_sync_to_shared temporarily disabled for debugging */
-        /* pfb_sync_to_shared(); */
+        pfb_sync_to_shared();
 
         /* pfb_check_context_id DISABLED — blocks sync thread via locks */
 
@@ -922,10 +930,9 @@ static void *pfb_sync_thread(void *arg) {
                         (void *)g_cached_display, g_layer_host_created);
             }
         }
-        if (g_cached_display) {
-            /* Server-side CATransaction flush — triggers commit processing
-             * which should run the render pipeline including attach_contexts.
-             * This is the server-side equivalent of a display refresh cycle. */
+        if (g_cached_display && g_gpu_inject_done) {
+            /* Session 21: simplified sync loop — no attach_contexts (blocks on mutexes).
+             * Wait for GPU_INJECT to complete mutex reinit before entering. */
             {
                 Class catCls = (Class)objc_getClass("CATransaction");
                 if (catCls) {
@@ -934,85 +941,7 @@ static void *pfb_sync_thread(void *arg) {
             }
             ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
 
-            /* Direct call to CA::WindowServer::Server::attach_contexts()
-             * via ASLR slide calculation. This is the function that binds
-             * registered contexts to the display (contextIdAtPosition). */
-            {
-                static void *g_server_cpp = NULL;
-                static int _attach_init = 0;
-                static void (*g_attach_fn)(void *) = NULL;
-                if (!_attach_init) {
-                    _attach_init = 1;
-                    /* Get server C++ object */
-                    Ivar implI = class_getInstanceVariable(
-                        object_getClass(g_cached_display), "_impl");
-                    if (implI) {
-                        void *impl = *(void **)((uint8_t *)g_cached_display + ivar_getOffset(implI));
-                        if (impl) g_server_cpp = *(void **)((uint8_t *)impl + 0x40);
-                    }
-                    /* Calculate ASLR slide from exported symbol */
-                    void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-                    if (known) {
-                        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-                        g_attach_fn = (void (*)(void *))((uint8_t *)0x1286de + slide);
-                        pfb_log("ATTACH_CONTEXTS: server=%p slide=0x%lx fn=%p",
-                                g_server_cpp, (long)slide, (void *)g_attach_fn);
-                    }
-                }
-                if (g_server_cpp && g_attach_fn) {
-                    g_attach_fn(g_server_cpp);
-                }
-
-                /* Direct add_context: get each CAContext's _impl and call add_context */
-                {
-                    static int _add_ctx_done = 0;
-                    static int _add_ctx_tick = 0;
-                    _add_ctx_tick++;
-                    /* Wait ~20s (1200 ticks at 60Hz) for contexts to register, then try once */
-                    if (!_add_ctx_done && _add_ctx_tick == 1200 && g_server_cpp) {
-                        _add_ctx_done = 1;
-                        void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-                        if (known) {
-                            ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-                            typedef void (*add_ctx_fn)(void *, void *);
-                            add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
-
-                            Class caCtxCls = (Class)objc_getClass("CAContext");
-                            id ctxs = ((id(*)(id, SEL))objc_msgSend)(
-                                (id)caCtxCls, sel_registerName("allContexts"));
-                            unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
-                                ctxs, sel_registerName("count")) : 0;
-                            pfb_log("ADD_CONTEXT: attempting for %lu contexts", cnt);
-
-                            for (unsigned long i = 0; i < cnt; i++) {
-                                id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-                                    ctxs, sel_registerName("objectAtIndex:"), i);
-                                if (!ctx) continue;
-                                Ivar implI = class_getInstanceVariable(object_getClass(ctx), "_impl");
-                                if (!implI) continue;
-                                void *impl = *(void **)((uint8_t *)ctx + ivar_getOffset(implI));
-                                if (!impl) continue;
-                                unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                                    ctx, sel_registerName("contextId"));
-                                pfb_log("ADD_CONTEXT: ctx[%lu] id=%u impl=%p", i, cid, impl);
-                                add_ctx(g_server_cpp, impl);
-                                pfb_log("ADD_CONTEXT: ctx[%lu] added (no crash)", i);
-                            }
-
-                            /* Check result */
-                            typedef struct { double x; double y; } CGPoint_t;
-                            CGPoint_t center = { 375.0, 667.0 };
-                            SEL ctxSel = sel_registerName("contextIdAtPosition:");
-                            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
-                                g_cached_display, ctxSel, center);
-                            pfb_log("ADD_CONTEXT: after add_context, contextIdAtPosition=%u", bound);
-                        }
-                    }
-                }
-            }
-
-            /* Call CARenderServerRenderDisplay to trigger the full render pipeline.
-             * This should invoke attach_contexts → add_context → set_display_info. */
+            /* CARenderServerRenderDisplay — sends MIG to the server (self) */
             {
                 static int _render_init = 0;
                 static void *_render_fn = NULL;
@@ -1037,7 +966,7 @@ static void *pfb_sync_thread(void *arg) {
 
             if (!g_update_logged) {
                 g_update_logged = 1;
-                pfb_log("DISPLAY_UPDATE: calling update + CARenderServerRenderDisplay each tick");
+                pfb_log("DISPLAY_UPDATE: flush + update + CARenderServerRenderDisplay each tick");
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
             {
@@ -1045,95 +974,17 @@ static void *pfb_sync_thread(void *arg) {
                 if (++_ctx_check >= 300) {
                     _ctx_check = 0;
                     typedef struct { double x; double y; } CGPoint_t;
-                    CGPoint_t center = { 375.0, 667.0 };
+                    CGPoint_t center = { 187.5, 333.5 };
                     SEL ctxSel = sel_registerName("contextIdAtPosition:");
                     unsigned int cid = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
                         g_cached_display, ctxSel, center);
-                    Class caCtxCls = (Class)objc_getClass("CAContext");
-                    id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
-                    unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(ctxs, sel_registerName("count")) : 0;
-                    pfb_log("PERIODIC_CHECK: contextIdAtPosition=%u allContexts=%lu", cid, cnt);
+                    pfb_log("PERIODIC_CHECK: contextIdAtPosition=%u", cid);
                 }
             }
         }
 
-        /* Standalone add_context attempt — runs independently of g_cached_display */
-        {
-            static int _add_done = 0;
-            static int _add_tick = 0;
-            _add_tick++;
-            if (!_add_done && _add_tick == 1200) { /* ~20s at 60Hz */
-                _add_done = 1;
-                pfb_log("ADD_CONTEXT_STANDALONE: starting...");
-
-                /* Get server from CAWindowServer */
-                void *server_cpp = NULL;
-                id disp = NULL;
-                Class wsClass = (Class)objc_getClass("CAWindowServer");
-                if (wsClass) {
-                    id ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("server"));
-                    if (!ws) ws = ((id(*)(id, SEL))objc_msgSend)((id)wsClass, sel_registerName("serverIfRunning"));
-                    if (ws) {
-                        id displays = ((id(*)(id, SEL))objc_msgSend)(ws, sel_registerName("displays"));
-                        unsigned long cnt = displays ? ((unsigned long(*)(id, SEL))objc_msgSend)(
-                            displays, sel_registerName("count")) : 0;
-                        if (cnt > 0) {
-                            disp = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-                                displays, sel_registerName("objectAtIndex:"), 0UL);
-                        }
-                        pfb_log("ADD_CONTEXT_STANDALONE: ws=%p displays=%lu disp=%p", (void *)ws, cnt, (void *)disp);
-                    }
-                }
-                if (disp) {
-                    Ivar implI = class_getInstanceVariable(object_getClass(disp), "_impl");
-                    if (implI) {
-                        void *impl = *(void **)((uint8_t *)disp + ivar_getOffset(implI));
-                        if (impl) server_cpp = *(void **)((uint8_t *)impl + 0x40);
-                    }
-                }
-                pfb_log("ADD_CONTEXT_STANDALONE: server_cpp=%p", server_cpp);
-
-                if (server_cpp) {
-                    void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-                    if (known) {
-                        ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-                        typedef void (*add_ctx_fn)(void *, void *);
-                        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
-
-                        Class caCtxCls = (Class)objc_getClass("CAContext");
-                        id ctxs = ((id(*)(id, SEL))objc_msgSend)(
-                            (id)caCtxCls, sel_registerName("allContexts"));
-                        unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
-                            ctxs, sel_registerName("count")) : 0;
-                        pfb_log("ADD_CONTEXT_STANDALONE: %lu contexts to add", cnt);
-
-                        for (unsigned long i = 0; i < cnt; i++) {
-                            id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-                                ctxs, sel_registerName("objectAtIndex:"), i);
-                            if (!ctx) continue;
-                            Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
-                            if (!ci) continue;
-                            void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
-                            if (!cimpl) continue;
-                            unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                                ctx, sel_registerName("contextId"));
-                            pfb_log("ADD_CONTEXT_STANDALONE: [%lu] id=%u impl=%p", i, cid, cimpl);
-                            add_ctx(server_cpp, cimpl);
-                            pfb_log("ADD_CONTEXT_STANDALONE: [%lu] done", i);
-                        }
-
-                        /* Check */
-                        if (disp) {
-                            typedef struct { double x; double y; } CGPoint_t;
-                            CGPoint_t center = { 375.0, 667.0 };
-                            unsigned int bound = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
-                                disp, sel_registerName("contextIdAtPosition:"), center);
-                            pfb_log("ADD_CONTEXT_STANDALONE: contextIdAtPosition=%u", bound);
-                        }
-                    }
-                }
-            }
-        }
+        /* DISABLED: Standalone add_context blocks on context mutex and kills sync thread.
+         * GPU_INJECT dispatch_after handles context binding on main thread instead. */
 
         usleep(16667);  /* ~60 Hz */
     }
@@ -2044,11 +1895,16 @@ static void pfb_init(void) {
     pfb_log("PurpleFBServer ready — all interpositions active");
 
     /* Main queue IS draining — use dispatch_after for GPU context binding.
-     * add_context must run on the main thread to avoid lock contention
-     * with the MIG server thread. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC),
+     * Session 21: server+0x58 is PurpleDisplay*, NOT Shmem.
+     * hit_test calls Display::transform() (vtable[14]) which returns Display+0x148.
+     * Transform::get_scale() reads double at Transform+0x80.
+     * If scale is 0 (uninitialized), point becomes (0,0) and bounds check may fail.
+     * Also: context+0x28 mutex must be properly initialized for hit_test to iterate. */
+    /* Reduced from 20s to 5s — sync thread needs g_cached_display early.
+     * App contexts should be registered by 5s (RegisterClient fires at ~3s). */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        pfb_log("GPU_INJECT: direct context list injection on main thread...");
+        pfb_log("GPU_INJECT: session 21 — Display transform + mutex fix...");
 
         /* Get server C++ object */
         Class wsCls = (Class)objc_getClass("CAWindowServer");
@@ -2070,67 +1926,116 @@ static void pfb_init(void) {
         }
         if (!server_cpp) { pfb_log("GPU_INJECT: no server_cpp"); return; }
 
-        /* Check if server+0x58 (Shmem/Display) is our surface */
-        void *shmem_ptr = *(void **)((uint8_t *)server_cpp + 0x58);
-        pfb_log("GPU_INJECT: server+0x58=%p g_surface_addr=%p SAME=%d",
-                shmem_ptr, (void *)g_surface_addr,
-                shmem_ptr == (void *)g_surface_addr);
-        /* If it IS our surface, we can write function pointers into it.
-         * The render_update virtual call does *(*(server+0x58) + 0x40).
-         * If we write a valid callback at surface+0x40, the render cycle works. */
-        if (shmem_ptr) {
-            /* add_context does: rdi=*(server+0x58), rax=*rdi, callq *(rax+0x40)
-             * So it's a double dereference: vtable = *(shmem_ptr), fn = vtable[8]
-             * We need to create a fake vtable and point shmem_ptr's first word to it. */
-            uint64_t old_vtable_ptr = *(uint64_t *)shmem_ptr;
-            pfb_log("GPU_INJECT: *shmem = 0x%llx (vtable pointer)", (unsigned long long)old_vtable_ptr);
-            if (old_vtable_ptr > 0x100000 && old_vtable_ptr < 0x7fffffffffffULL) {
-                uint64_t old_fn = *(uint64_t *)(old_vtable_ptr + 0x40);
-                pfb_log("GPU_INJECT: vtable+0x40 = 0x%llx (render_update target)",
-                        (unsigned long long)old_fn);
+        /* Set g_cached_display for the sync thread to use */
+        g_cached_display = disp;
+        pfb_log("GPU_INJECT: set g_cached_display=%p", (void *)disp);
+
+        /* ============================================================
+         * Step 1: Fix Display Transform
+         * server+0x58 = PurpleDisplay* (C++ object with vtable)
+         * PurpleDisplay::transform() returns this+0x148 (CA::Transform)
+         * CA::Transform::get_scale() reads double at +0x80
+         * For hit_test: point *= scale, then bounds check
+         * ============================================================ */
+        void *display_cpp = *(void **)((uint8_t *)server_cpp + 0x58);
+        pfb_log("GPU_INJECT: PurpleDisplay* at server+0x58 = %p", display_cpp);
+
+        if (display_cpp) {
+            /* Dump Display vtable to confirm it's a real C++ object */
+            uint64_t vtable_ptr = *(uint64_t *)display_cpp;
+            pfb_log("GPU_INJECT: Display vtable = 0x%llx", (unsigned long long)vtable_ptr);
+            if (vtable_ptr > 0x100000 && vtable_ptr < 0x7fffffffffffULL) {
+                Dl_info vinfo;
+                if (dladdr((void *)vtable_ptr, &vinfo) && vinfo.dli_sname)
+                    pfb_log("GPU_INJECT: Display vtable → %s", vinfo.dli_sname);
             }
 
-            /* Create a fake vtable where slot 8 (offset 0x40) is our no-op */
-            static void *pfb_fake_shmem_vtable[20];
-            /* Copy existing vtable entries if the pointer is valid */
-            if (old_vtable_ptr > 0x100000 && old_vtable_ptr < 0x7fffffffffffULL) {
-                for (int vi = 0; vi < 20; vi++)
-                    pfb_fake_shmem_vtable[vi] = ((void **)old_vtable_ptr)[vi];
+            /* Transform is at Display+0x148 */
+            uint8_t *transform = (uint8_t *)display_cpp + 0x148;
+            /* Scale is at Transform+0x80 */
+            double *scale_ptr = (double *)(transform + 0x80);
+            uint8_t *flags_ptr = transform + 0x90;
+
+            pfb_log("GPU_INJECT: Transform at %p, scale=%.4f, flags=0x%02x",
+                    transform, *scale_ptr, *flags_ptr);
+
+            /* Dump Transform raw (first 0x98 bytes) */
+            pfb_log("GPU_INJECT: Transform RAW:");
+            for (int off = 0; off < 0x98; off += 32) {
+                pfb_log("  +%02x: %016llx %016llx %016llx %016llx",
+                        off,
+                        (unsigned long long)*(uint64_t *)(transform + off),
+                        (unsigned long long)*(uint64_t *)(transform + off + 8),
+                        (unsigned long long)*(uint64_t *)(transform + off + 16),
+                        (unsigned long long)*(uint64_t *)(transform + off + 24));
             }
-            /* Replace slot 8 (offset 0x40 / 8 = slot 8) with pthread_main_np */
-            pfb_fake_shmem_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np");
-            /* Point shmem's first word to our fake vtable */
-            *(void **)shmem_ptr = pfb_fake_shmem_vtable;
-            pfb_log("GPU_INJECT: PATCHED *shmem → fake vtable, slot[8]=%p",
-                    pfb_fake_shmem_vtable[8]);
+
+            /* If scale is 0 or uninitialized, write identity scale = 1.0 */
+            if (*scale_ptr == 0.0 || *scale_ptr != *scale_ptr /* NaN */) {
+                double identity_scale = 1.0;
+                *scale_ptr = identity_scale;
+                /* Clear complex-transform flag (bit 4 at +0x90) */
+                *flags_ptr &= ~0x10;
+                pfb_log("GPU_INJECT: WROTE scale=1.0 at Display+0x1C8, cleared flag");
+            } else {
+                pfb_log("GPU_INJECT: scale already set to %.4f, leaving as-is", *scale_ptr);
+            }
         }
 
-        /* Read existing context list */
+        /* ============================================================
+         * Step 2: Dump context list (already populated by RegisterClient)
+         * ============================================================ */
         void *list = *(void **)((uint8_t *)server_cpp + 0x68);
         uint64_t count = *(uint64_t *)((uint8_t *)server_cpp + 0x78);
-        pfb_log("GPU_INJECT: server+0x68=%p count=%llu", list, (unsigned long long)count);
+        pfb_log("GPU_INJECT: context list at server+0x68=%p count=%llu", list, (unsigned long long)count);
 
-        /* Dump existing entries to understand the structure */
         if (list && count > 0) {
-            for (uint64_t i = 0; i < count && i < 5; i++) {
+            for (uint64_t i = 0; i < count && i < 10; i++) {
                 void *entry = *(void **)((uint8_t *)list + i * 0x10);
                 uint64_t meta = *(uint64_t *)((uint8_t *)list + i * 0x10 + 8);
                 if (entry) {
                     uint32_t cid = *(uint32_t *)((uint8_t *)entry + 0x0C);
-                    pfb_log("  list[%llu]: ptr=%p meta=0x%llx ctx_id=%u",
+                    pfb_log("  list[%llu]: ctx=%p meta=0x%llx ctx_id=%u",
                             (unsigned long long)i, entry, (unsigned long long)meta, cid);
                 }
             }
         }
 
-        /* Get app's Render::Context* from allContexts */
+        /* ============================================================
+         * Step 3: Properly initialize context+0x28 mutexes
+         * hit_test calls pthread_mutex_lock(ctx+0x28) for each context.
+         * If mutex has __sig=0 (uninitialized) and is held by the
+         * RegisterClient MIG handler, pthread_mutex_lock blocks forever.
+         * Fix: pthread_mutex_init to reset to unlocked state.
+         * ============================================================ */
+        if (list && count > 0) {
+            pfb_log("GPU_INJECT: initializing context mutexes...");
+            for (uint64_t i = 0; i < count && i < 20; i++) {
+                void *ctx_impl = *(void **)((uint8_t *)list + i * 0x10);
+                if (!ctx_impl) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)ctx_impl + 0x0C);
+                pthread_mutex_t *mtx = (pthread_mutex_t *)((uint8_t *)ctx_impl + 0x28);
+                /* Dump current mutex state */
+                uint32_t sig = *(uint32_t *)mtx;
+                pfb_log("  ctx[%llu] id=%u mutex __sig=0x%x", (unsigned long long)i, cid, sig);
+                /* Force reinitialize: zero the memory then init */
+                memset(mtx, 0, sizeof(pthread_mutex_t));
+                int rc = pthread_mutex_init(mtx, NULL);
+                pfb_log("  ctx[%llu] mutex_init rc=%d, new __sig=0x%x",
+                        (unsigned long long)i, rc, *(uint32_t *)mtx);
+            }
+        }
+
+        /* ============================================================
+         * Step 4: Also init mutexes on CAContext allContexts impls
+         * (may differ from direct list entries)
+         * ============================================================ */
         Class caCtxCls = (Class)objc_getClass("CAContext");
         id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
         unsigned long ctx_cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(
             ctxs, sel_registerName("count")) : 0;
-        pfb_log("GPU_INJECT: %lu server-side contexts available", ctx_cnt);
+        pfb_log("GPU_INJECT: CAContext.allContexts count=%lu", ctx_cnt);
 
-        /* Try inserting the first context with a valid context_id */
         for (unsigned long i = 0; i < ctx_cnt; i++) {
             id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
                 ctxs, sel_registerName("objectAtIndex:"), i);
@@ -2141,47 +2046,177 @@ static void pfb_init(void) {
             if (!cimpl) continue;
             unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                 ctx, sel_registerName("contextId"));
-            pfb_log("GPU_INJECT: ctx[%lu] id=%u impl=%p +0x0C=%u",
-                    i, cid, cimpl, *(uint32_t *)((uint8_t *)cimpl + 0x0C));
+
+            pthread_mutex_t *mtx = (pthread_mutex_t *)((uint8_t *)cimpl + 0x28);
+            uint32_t sig = *(uint32_t *)mtx;
+            if (sig != 0x32AAABA7) { /* _PTHREAD_MUTEX_SIG */
+                memset(mtx, 0, sizeof(pthread_mutex_t));
+                pthread_mutex_init(mtx, NULL);
+                pfb_log("GPU_INJECT: allCtx[%lu] id=%u impl=%p mutex reinit (was sig=0x%x)",
+                        i, cid, cimpl, sig);
+            } else {
+                /* Mutex is properly initialized — try unlock in case it's held */
+                pthread_mutex_trylock(mtx);
+                pthread_mutex_unlock(mtx);
+                pfb_log("GPU_INJECT: allCtx[%lu] id=%u impl=%p mutex force-unlocked",
+                        i, cid, cimpl);
+            }
+
+            /* Also dump root_layer_handle area for bounds check debug */
+            /* root_layer_handle is at context+some_offset, and bounds at handle+0xA0 */
         }
 
-        /* Now try add_context — with shmem+0x40 patched, it should complete */
-        {
-            void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
-            if (known) {
-                ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-                typedef void (*add_ctx_fn)(void *, void *);
-                add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
-                pfb_log("GPU_INJECT: add_context=%p, calling for each context...", (void *)add_ctx);
+        /* ============================================================
+         * Step 5: Check contextIdAtPosition
+         * ============================================================ */
+        typedef struct { double x; double y; } CGPoint_t;
 
-                for (unsigned long i = 0; i < ctx_cnt; i++) {
-                    id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
-                        ctxs, sel_registerName("objectAtIndex:"), i);
-                    if (!ctx) continue;
-                    Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
-                    if (!ci) continue;
-                    void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
-                    if (!cimpl) continue;
-                    unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                        ctx, sel_registerName("contextId"));
-                    /* Force-unlock context+0x28 mutex (held by RegisterClient handler).
-                     * invalidate_context inside add_context tries to lock it → deadlock. */
-                    uint32_t old_ctx_lock = *(uint32_t *)((uint8_t *)cimpl + 0x28);
-                    *(uint32_t *)((uint8_t *)cimpl + 0x28) = 0;
-                    pfb_log("GPU_INJECT: add_context ctx[%lu] id=%u (unlocked +0x28 was 0x%x)",
-                            i, cid, old_ctx_lock);
-                    add_ctx(server_cpp, cimpl);
-                    pfb_log("GPU_INJECT: ctx[%lu] DONE!", i);
+        /* Try multiple positions */
+        CGPoint_t positions[] = {
+            { 0.0, 0.0 },       /* origin */
+            { 187.5, 333.5 },   /* center of points */
+            { 375.0, 667.0 },   /* bottom-right of points */
+            { 1.0, 1.0 },       /* near origin */
+        };
+
+        for (int pi = 0; pi < 4; pi++) {
+            unsigned int cid = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                disp, sel_registerName("contextIdAtPosition:"), positions[pi]);
+            pfb_log("GPU_INJECT: contextIdAtPosition(%.1f, %.1f) = %u",
+                    positions[pi].x, positions[pi].y, cid);
+        }
+
+        /* If still 0, try triggering a render cycle first */
+        {
+            /* CARenderServerRenderDisplay to trigger full render pipeline */
+            void *render_fn = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+            if (render_fn) {
+                typedef mach_port_t (*get_port_fn)(void);
+                get_port_fn gp = (get_port_fn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                mach_port_t srv_port = gp ? gp() : 0;
+                id display_name = ((id(*)(id, SEL))objc_msgSend)(disp, sel_registerName("name"));
+                if (srv_port && display_name) {
+                    pfb_log("GPU_INJECT: triggering CARenderServerRenderDisplay...");
+                    typedef int (*render_fn_t)(mach_port_t, id, id, int, int);
+                    ((render_fn_t)render_fn)(srv_port, display_name, NULL, 0, 0);
+
+                    /* Re-check after render */
+                    CGPoint_t center = { 187.5, 333.5 };
+                    unsigned int after = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                        disp, sel_registerName("contextIdAtPosition:"), center);
+                    pfb_log("GPU_INJECT: AFTER RENDER contextIdAtPosition(187.5, 333.5) = %u", after);
                 }
             }
         }
 
-        /* Check contextIdAtPosition AFTER */
-        typedef struct { double x; double y; } CGPoint_t;
-        CGPoint_t center = { 375.0, 667.0 };
-        unsigned int after = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
-            disp, sel_registerName("contextIdAtPosition:"), center);
-        pfb_log("GPU_INJECT: contextIdAtPosition AFTER = %u", after);
+        /* ============================================================
+         * Step 6: Diagnose bound context — check root layer
+         * The bound context needs a committed layer tree for rendering.
+         * ============================================================ */
+        unsigned int bound_cid;
+        {
+            /* Find which context is bound */
+            CGPoint_t center2 = { 187.5, 333.5 };
+            bound_cid = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                disp, sel_registerName("contextIdAtPosition:"), center2);
+            pfb_log("GPU_INJECT: bound context at center = %u", bound_cid);
+
+            for (unsigned long i = 0; i < ctx_cnt; i++) {
+                id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                    ctxs, sel_registerName("objectAtIndex:"), i);
+                if (!ctx) continue;
+                unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                    ctx, sel_registerName("contextId"));
+
+                /* Check layer property */
+                SEL layerSel = sel_registerName("layer");
+                id layer = NULL;
+                if (class_respondsToSelector(object_getClass(ctx), layerSel))
+                    layer = ((id(*)(id, SEL))objc_msgSend)(ctx, layerSel);
+                pfb_log("GPU_INJECT: ctx[%lu] id=%u layer=%p %s",
+                        i, cid, (void *)layer,
+                        cid == bound_cid ? "*** BOUND ***" : "");
+
+                if (layer) {
+                    /* Check sublayers */
+                    id sublayers = ((id(*)(id, SEL))objc_msgSend)(
+                        layer, sel_registerName("sublayers"));
+                    unsigned long slc = sublayers ? ((unsigned long(*)(id, SEL))objc_msgSend)(
+                        sublayers, sel_registerName("count")) : 0;
+                    pfb_log("  sublayer count=%lu", slc);
+                }
+
+                /* Check C++ impl root_layer area */
+                Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                if (ci) {
+                    void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
+                    if (cimpl) {
+                        /* Scan for plausible root layer pointers */
+                        for (int off = 0x58; off <= 0x78; off += 8) {
+                            void *ptr = *(void **)((uint8_t *)cimpl + off);
+                            if (ptr && (uint64_t)ptr > 0x100000 && (uint64_t)ptr < 0x7fffffffffffULL) {
+                                /* Check if it has a vtable pointing into QuartzCore */
+                                uint64_t vt = *(uint64_t *)ptr;
+                                Dl_info di;
+                                if (vt > 0x100000 && vt < 0x7fffffffffffULL &&
+                                    dladdr((void *)vt, &di) && di.dli_sname)
+                                    pfb_log("  impl+0x%x → %p (vtable: %s)", off, ptr, di.dli_sname);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ============================================================
+         * Step 6b: Check root_layer on BOUND list entry directly
+         * allContexts may not contain the bound context — check list entries
+         * ============================================================ */
+        if (list && count > 0) {
+            pfb_log("GPU_INJECT: checking root_layer on list entries...");
+            void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+            ptrdiff_t slide = known ? (ptrdiff_t)known - (ptrdiff_t)0xb9899 : 0;
+            /* CA::Render::Context::root_layer_handle at 0x5e14e (from nm) */
+            typedef void *(*root_layer_fn)(void *);
+            root_layer_fn get_root = slide ?
+                (root_layer_fn)((uint8_t *)0x5e14e + slide) : NULL;
+
+            for (uint64_t i = 0; i < count && i < 10; i++) {
+                void *ctx_impl = *(void **)((uint8_t *)list + i * 0x10);
+                if (!ctx_impl) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)ctx_impl + 0x0C);
+
+                /* Lock the context mutex (we initialized it earlier) */
+                pthread_mutex_t *mtx = (pthread_mutex_t *)((uint8_t *)ctx_impl + 0x28);
+                int lockrc = pthread_mutex_trylock(mtx);
+
+                void *root = NULL;
+                if (get_root && lockrc == 0) {
+                    root = get_root(ctx_impl);
+                    pthread_mutex_unlock(mtx);
+                } else if (lockrc != 0) {
+                    pfb_log("  list[%llu] id=%u MUTEX LOCKED (rc=%d), skipping root_layer",
+                            (unsigned long long)i, cid, lockrc);
+                    continue;
+                }
+
+                pfb_log("  list[%llu] id=%u root_layer_handle=%p %s",
+                        (unsigned long long)i, cid, root,
+                        cid == bound_cid ? "*** BOUND ***" : "");
+
+                if (root) {
+                    /* BoundsImpl at root+0xA0 — dump it */
+                    int32_t *bounds = (int32_t *)((uint8_t *)root + 0xA0);
+                    pfb_log("    bounds: x=%d y=%d w=%d h=%d",
+                            bounds[0], bounds[1], bounds[2], bounds[3]);
+                }
+            }
+        }
+
+        /* Display surface scan removed — double-dereference causes SIGBUS */
+
+        pfb_log("GPU_INJECT: session 21 complete — enabling sync thread render");
+        g_gpu_inject_done = 1;
     });
 }
 
