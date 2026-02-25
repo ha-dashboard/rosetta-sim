@@ -275,6 +275,7 @@ static volatile int g_layer_host_created; /* defined later, declared here for pf
 static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
 static volatile int g_gpu_inject_done = 0; /* set by GPU_INJECT after mutex reinit */
 static volatile void *g_display_surface = NULL; /* Display+0x138: actual rendered surface */
+static volatile vm_address_t g_server_surface_map = 0; /* CARenderServer's vm_map of our surface */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
 typedef void *CGColorSpaceRef;
@@ -342,8 +343,12 @@ static void pfb_sync_to_shared(void) {
     }
 
 fallback:
-    /* Copy from Display's actual rendered surface (Display+0x138) if available,
-     * otherwise fall back to g_surface_addr (our memory entry, usually empty). */
+    /* Copy from Display's actual rendered surface.
+     * Re-read Display+0x138 each frame (surface pointer may change).
+     * The surface object has a pixel data pointer at +0x08. */
+    /* Use cached g_display_surface (set once by GPU_INJECT, stable pointer).
+     * This is the surface OBJECT at Display+0x138. It contains a small header
+     * followed by pixel data. Header bytes appear as noise in first few pixels. */
     if (g_display_surface != NULL) {
         memcpy(pixel_dest, (void *)g_display_surface, PFB_SURFACE_SIZE);
     } else if (g_surface_addr != 0) {
@@ -441,10 +446,65 @@ static void pfb_handle_message(PurpleFBRequest *req) {
         }
     } else if (req->header.msgh_id == 3 && reply_port != MACH_PORT_NULL) {
         /* msg_id=3: flush_shmem — framebuffer dirty region notification.
-         * The body contains dirty bounds at offset 0x28 (16 bytes: x, y, w, h).
-         * We sync our shared framebuffer and send a 72-byte reply. */
+         * CARenderServer has just finished rendering. Read pixel data NOW
+         * from the Display's surface object while the pointer is valid. */
+        if (g_shared_fb != MAP_FAILED && g_display_surface) {
+            uint8_t *pixel_dest = (uint8_t *)g_shared_fb + ROSETTASIM_FB_META_SIZE;
+            RosettaSimFramebufferHeader *fhdr = (RosettaSimFramebufferHeader *)g_shared_fb;
+            void *surf_obj = (void *)g_display_surface;
+
+            /* Read surface metadata */
+            uint32_t s_width  = *(uint32_t *)((uint8_t *)surf_obj + 24);
+            uint32_t s_height = *(uint32_t *)((uint8_t *)surf_obj + 28);
+            /* Try to find stride at various offsets */
+            uint32_t s_stride = *(uint32_t *)((uint8_t *)surf_obj + 32);
+            static int _flush_logged = 0;
+            if (!_flush_logged) {
+                _flush_logged = 1;
+                pfb_log("flush_shmem: surface %ux%u stride_candidate=%u",
+                        s_width, s_height, s_stride);
+                /* Also dump bytes 32-63 for stride detection */
+                uint32_t *hdr32 = (uint32_t *)((uint8_t *)surf_obj + 32);
+                pfb_log("flush_shmem: surf+32 as uint32: %u %u %u %u %u %u %u %u",
+                        hdr32[0], hdr32[1], hdr32[2], hdr32[3],
+                        hdr32[4], hdr32[5], hdr32[6], hdr32[7]);
+            }
+
+            /* Get pixel data pointer (at surf_obj+0x08) */
+            void *pixel_buf = *(void **)((uint8_t *)surf_obj + 0x08);
+            if (pixel_buf && (uint64_t)pixel_buf > 0x100000000ULL) {
+                /* Determine source stride */
+                int src_stride = PFB_BYTES_PER_ROW; /* 3000 default */
+                if (s_stride > 0 && s_stride <= 8192 && s_stride >= PFB_BYTES_PER_ROW) {
+                    src_stride = (int)s_stride;
+                }
+
+                if (src_stride == PFB_BYTES_PER_ROW) {
+                    memcpy(pixel_dest, pixel_buf, PFB_SURFACE_SIZE);
+                } else {
+                    /* Row-by-row copy with stride conversion */
+                    uint8_t *src = (uint8_t *)pixel_buf;
+                    uint8_t *dst = pixel_dest;
+                    for (int row = 0; row < PFB_PIXEL_HEIGHT; row++) {
+                        memcpy(dst, src, PFB_BYTES_PER_ROW);
+                        src += src_stride;
+                        dst += PFB_BYTES_PER_ROW;
+                    }
+                }
+                fhdr->frame_counter++;
+                fhdr->flags |= ROSETTASIM_FB_FLAG_FRAME_READY;
+
+                if (!_flush_logged) {
+                    pfb_log("flush_shmem: copied from pixel_buf=%p stride=%d",
+                            pixel_buf, src_stride);
+                }
+            } else {
+                pfb_sync_to_shared();
+            }
+        } else {
+            pfb_sync_to_shared();
+        }
         pfb_log("flush_shmem: syncing to shared framebuffer");
-        pfb_sync_to_shared();
 
         /* Send a simple 72-byte non-complex reply */
         uint8_t reply_buf[72];
@@ -985,36 +1045,101 @@ static void *pfb_sync_thread(void *arg) {
                 g_update_logged = 1;
                 pfb_log("RENDER_DIRECT: calling vtable[5] (immediate_render) each tick");
 
-                /* Surface check: scan g_surface_addr for RGB content */
-                if (g_surface_addr != 0) {
-                    uint8_t *pixels = (uint8_t *)g_surface_addr;
-                    int rgb_nz = 0;
-                    for (int i = 0; i < 7500; i++) {
-                        int off = i * 4;
-                        if (pixels[off] != 0 || pixels[off+1] != 0 || pixels[off+2] != 0)
-                            rgb_nz++;
+                /* Surface stride/format diagnostic */
+                if (g_display_surface) {
+                    uint8_t *surf = (uint8_t *)g_display_surface;
+
+                    /* Check for header at start of surface */
+                    uint32_t *hdr32 = (uint32_t *)surf;
+                    pfb_log("STRIDE_DIAG: surface=%p first 32B as uint32: %u %u %u %u %u %u %u %u",
+                            surf, hdr32[0], hdr32[1], hdr32[2], hdr32[3],
+                            hdr32[4], hdr32[5], hdr32[6], hdr32[7]);
+                    pfb_log("STRIDE_DIAG: first 16B hex: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                            surf[0],surf[1],surf[2],surf[3],
+                            surf[4],surf[5],surf[6],surf[7],
+                            surf[8],surf[9],surf[10],surf[11],
+                            surf[12],surf[13],surf[14],surf[15]);
+
+                    /* Scan for correct stride at row 710 (known content row) */
+                    for (int stride = 2048; stride <= 4096; stride += 64) {
+                        int off = 710 * stride;
+                        if (off + 400 > 6000000) continue;
+                        int nz = 0;
+                        for (int x = 0; x < 100; x++) {
+                            int p = off + x * 4;
+                            if (surf[p] || surf[p+1] || surf[p+2]) nz++;
+                        }
+                        if (nz > 30)
+                            pfb_log("STRIDE_DIAG: stride=%d → %d/100 non-zero at row 710", stride, nz);
                     }
-                    pfb_log("SURFACE_CHECK: g_surface_addr=%p RGB non-zero=%d/7500",
-                            (void *)g_surface_addr, rgb_nz);
-                    /* Also check the vm_map'd address (Display surface) */
-                    /* Display+0x138 stores the mapped surface address */
-                    if (_server_cpp) {
-                        void *display_cpp = *(void **)((uint8_t *)_server_cpp + 0x58);
-                        if (display_cpp) {
-                            void *mapped = *(void **)((uint8_t *)display_cpp + 0x138);
-                            pfb_log("SURFACE_CHECK: Display+0x138 (mapped surface)=%p", mapped);
-                            if (mapped && mapped != (void *)g_surface_addr) {
-                                uint8_t *mp = (uint8_t *)mapped;
-                                int mnz = 0;
-                                for (int i = 0; i < 7500; i++) {
-                                    int off = i * 4;
-                                    if (mp[off] != 0 || mp[off+1] != 0 || mp[off+2] != 0)
-                                        mnz++;
+
+                    /* Find header size: scan for first row of pixel data.
+                     * Header has metadata (width=750, height=1334 at bytes 24-31).
+                     * Pixel data starts at some offset. Try offsets 32, 64, 128. */
+                    for (int hdr_off = 32; hdr_off <= 256; hdr_off += 32) {
+                        /* At this offset, check if stride=3072 produces content */
+                        int nz = 0;
+                        /* Check "row 0" at hdr_off with stride 3072 */
+                        for (int x = 0; x < 100; x++) {
+                            int p = hdr_off + x * 4;
+                            if (surf[p] || surf[p+1] || surf[p+2]) nz++;
+                        }
+                        /* Check "row 400" */
+                        int nz400 = 0;
+                        for (int x = 0; x < 100; x++) {
+                            int p = hdr_off + 400 * 3072 + x * 4;
+                            if (surf[p] || surf[p+1] || surf[p+2]) nz400++;
+                        }
+                        if (nz > 10 || nz400 > 10)
+                            pfb_log("STRIDE_DIAG: hdr_off=%d stride=3072: row0_nz=%d row400_nz=%d",
+                                    hdr_off, nz, nz400);
+                    }
+
+                    /* Display+0x138 is a surface object. Dump raw pointers to find
+                     * the actual pixel data buffer inside. */
+                    pfb_log("STRIDE_DIAG: surface object raw dump (0x100 bytes):");
+                    for (int off = 0; off < 0x100; off += 32) {
+                        pfb_log("  +%02x: %016llx %016llx %016llx %016llx",
+                                off,
+                                (unsigned long long)*(uint64_t *)(surf + off),
+                                (unsigned long long)*(uint64_t *)(surf + off + 8),
+                                (unsigned long long)*(uint64_t *)(surf + off + 16),
+                                (unsigned long long)*(uint64_t *)(surf + off + 24));
+                    }
+                    /* The header at +0x08 looks like a pointer (0x7fb0XXXXXXXX).
+                     * This could be the actual pixel data buffer. Check it. */
+                    uint64_t pixel_ptr = *(uint64_t *)(surf + 0x08);
+                    pfb_log("STRIDE_DIAG: surf+0x08 (possible pixel ptr) = 0x%llx",
+                            (unsigned long long)pixel_ptr);
+                    if (pixel_ptr > 0x100000000ULL && pixel_ptr < 0x800000000000ULL) {
+                        uint8_t *pp = (uint8_t *)pixel_ptr;
+                        /* Try strides 3000 and 3072 on this pointer */
+                        for (int ts = 3000; ts <= 3072; ts += 72) {
+                            int nz = 0;
+                            for (int row = 0; row < 1334; row++) {
+                                for (int x = 0; x < 750; x++) {
+                                    int p = row * ts + x * 4;
+                                    if (p + 3 < 5500000 && (pp[p] || pp[p+1] || pp[p+2]))
+                                        nz++;
                                 }
-                                pfb_log("SURFACE_CHECK: mapped surface RGB non-zero=%d/7500", mnz);
                             }
+                            pfb_log("STRIDE_DIAG: pixel_ptr stride=%d: %d/%d non-zero",
+                                    ts, nz, 750*1334);
+                        }
+                        /* Sample some rows */
+                        for (int row = 0; row < 1334; row += 100) {
+                            int nz = 0;
+                            for (int x = 0; x < 750; x++) {
+                                int p = row * 3000 + x * 4;
+                                if (pp[p] || pp[p+1] || pp[p+2]) nz++;
+                            }
+                            if (nz > 0)
+                                pfb_log("STRIDE_DIAG: pixel_ptr row %d: %d/750 non-zero (stride 3000)", row, nz);
                         }
                     }
+                    /* Also try surf+0x10 as pixel ptr */
+                    uint64_t pixel_ptr2 = *(uint64_t *)(surf + 0x10);
+                    pfb_log("STRIDE_DIAG: surf+0x10 = 0x%llx", (unsigned long long)pixel_ptr2);
                 }
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
@@ -1260,6 +1385,13 @@ kern_return_t pfb_vm_map(vm_map_t target, vm_address_t *addr, vm_size_t size,
                 (unsigned long)size, object, cur_prot, max_prot,
                 kr == KERN_SUCCESS ? "OK" : mach_error_string(kr), kr,
                 addr ? (void *)*addr : NULL);
+        /* If this maps our memory entry (same object port), save the address.
+         * CARenderServer renders to THIS mapping, not our g_surface_addr. */
+        if (kr == KERN_SUCCESS && addr && *addr != g_surface_addr &&
+            object == g_memory_entry) {
+            g_server_surface_map = *addr;
+            pfb_log("vm_map: CAPTURED server's mapping of our surface at %p", (void *)*addr);
+        }
     }
     return kr;
 }
