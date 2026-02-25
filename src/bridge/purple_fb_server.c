@@ -2080,15 +2080,14 @@ static void pfb_init(void) {
         *lock_ptr = 0; /* unlock */
         pfb_log("GPU_BIND: force-unlocked server+0x08 (was 0x%x)", old_lock);
 
-        /* Calculate set_display_info address (bypass add_context entirely).
-         * set_display_info at static 0x5e2c2: (CA::Render::Context*, uint display_id)
-         * This directly binds a context to a display via _CACSetContextDisplayInfo. */
+        /* Calculate add_context address. With fake vtable, render_update is
+         * a no-op so add_context should complete without blocking. */
         void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
         if (!known) { pfb_log("GPU_BIND: dlsym failed"); return; }
         ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
-        typedef void (*set_di_fn)(void *, uint32_t);
-        set_di_fn set_display_info = (set_di_fn)((uint8_t *)0x5e2c2 + slide);
-        pfb_log("GPU_BIND: set_display_info at %p", (void *)set_display_info);
+        typedef void (*add_ctx_fn)(void *, void *);
+        add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+        pfb_log("GPU_BIND: add_context at %p (slide=0x%lx)", (void *)add_ctx, (long)slide);
 
         /* Get all contexts and add them */
         Class caCtxCls = (Class)objc_getClass("CAContext");
@@ -2098,24 +2097,27 @@ static void pfb_init(void) {
             ctxs, sel_registerName("count")) : 0;
         pfb_log("GPU_BIND: %lu contexts to add", cnt);
 
-        /* Patch vtable[8] on the Display* at server+0x58.
-         * add_context calls this vtable slot (render_update) which blocks.
-         * Replace with a function that returns 1 (display_id). */
+        /* Replace Display vtable pointer with a FAKE vtable where slot 8
+         * (render_update at offset 0x40) is a no-op. The real vtable is in
+         * read-only memory; we can't patch it. Instead, create a copy on the
+         * heap and swap the vtable pointer on the Display object. */
         void *display_obj = *(void **)((uint8_t *)server_cpp + 0x58);
-        void **display_vtable = NULL;
-        void *orig_vt8 = NULL;
+        pfb_log("GPU_BIND: server+0x58 = %p (this is what add_context uses)", display_obj);
+        void **orig_vtable = NULL;
+        static void *fake_vtable[40];
         if (display_obj) {
-            display_vtable = *(void ***)display_obj;
-            if (display_vtable) {
-                orig_vt8 = display_vtable[8]; /* 0x40/8 = slot 8 */
-                pfb_log("GPU_BIND: Display vtable[8] = %p (will patch)", orig_vt8);
-                /* Replace with a simple function that returns 1 (displayId) */
-                /* We need to make the vtable page writable first */
-                extern int mprotect(void *, size_t, int);
-                uintptr_t page = (uintptr_t)&display_vtable[8] & ~0xFFF;
-                mprotect((void *)page, 0x1000, 7); /* rwx */
-                display_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np"); /* returns 0 or 1 */
-                pfb_log("GPU_BIND: patched vtable[8] → pthread_main_np");
+            orig_vtable = *(void ***)display_obj;
+            if (orig_vtable) {
+                /* Copy vtable entries */
+                for (int vi = 0; vi < 40; vi++) fake_vtable[vi] = orig_vtable[vi];
+                /* Replace slot 8 (render_update) with a no-op that returns 1 */
+                fake_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np");
+                pfb_log("GPU_BIND: orig_vtable=%p fake_vtable=%p slot8: %p → %p",
+                        (void *)orig_vtable, (void *)fake_vtable,
+                        orig_vtable[8], fake_vtable[8]);
+                /* Swap vtable pointer on heap-allocated Display object */
+                *(void ***)display_obj = fake_vtable;
+                pfb_log("GPU_BIND: swapped Display vtable pointer");
             }
         }
 
@@ -2129,18 +2131,15 @@ static void pfb_init(void) {
             if (!cimpl) continue;
             unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                 ctx, sel_registerName("contextId"));
-            uint32_t field_a8 = *(uint32_t *)((uint8_t *)cimpl + 0xa8);
-            uint32_t field_170 = *(uint32_t *)((uint8_t *)cimpl + 0x170);
-            pfb_log("GPU_BIND: ctx[%lu] id=%u +0xa8=0x%x +0x170=%u", i, cid, field_a8, field_170);
-            set_display_info(cimpl, 1);
-            uint32_t after_170 = *(uint32_t *)((uint8_t *)cimpl + 0x170);
-            pfb_log("GPU_BIND: ctx[%lu] DONE +0x170=%u", i, after_170);
+            pfb_log("GPU_BIND: add_context ctx[%lu] id=%u impl=%p", i, cid, cimpl);
+            add_ctx(server_cpp, cimpl);
+            pfb_log("GPU_BIND: ctx[%lu] DONE", i);
         }
 
-        /* Restore vtable */
-        if (display_vtable && orig_vt8) {
-            display_vtable[8] = orig_vt8;
-            pfb_log("GPU_BIND: restored vtable[8]");
+        /* Restore original vtable pointer */
+        if (display_obj && orig_vtable) {
+            *(void ***)display_obj = orig_vtable;
+            pfb_log("GPU_BIND: restored original vtable pointer");
         }
 
         /* Check result */

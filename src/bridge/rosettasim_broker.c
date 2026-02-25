@@ -2805,6 +2805,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* GPU: set_display_info stores displayId=1 on all contexts but
      * context_insert (for contextIdAtPosition mapping) needs add_context
      * which blocks on render_update virtual call. Need render_update fix. */
+    /* CPU default. GPU: context list at server+0x68 (pointer array, stride 0x10),
+     * count at server+0x78. contextItem+0x0C = context_id. Next: write directly. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
