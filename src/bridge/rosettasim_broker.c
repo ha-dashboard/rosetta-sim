@@ -2784,11 +2784,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* ROSETTASIM_RUNLOOP_PUMP disabled — CFRunLoopRun works under Rosetta 2.
      * Timers fire naturally. GCD main queue drains automatically. */
     /* env[ei++] = "ROSETTASIM_RUNLOOP_PUMP=1"; */
-    /* CPU rendering mode default — CARenderServer display binding doesn't work
-     * even with display=1 injected via remoteContextWithOptions swizzle
-     * (contextIdAtPosition returns 0). Display binding likely requires full
-     * BKSDisplayServices scene assignment from workspace. CPU renderInContext
-     * produces visible frames directly. Override: ROSETTASIM_CA_MODE=gpu */
+    /* CPU rendering default. GPU path: MIG 40400 sends OK but contextIdAtPosition
+     * still returns 0. The per-client port routing needs further investigation.
+     * Override: ROSETTASIM_CA_MODE=gpu to test GPU path. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

@@ -7738,10 +7738,78 @@ static void swizzle_bks_methods(void) {
                                [newOpts[@"display"] unsignedIntValue],
                                [newOpts[@"displayable"] boolValue],
                                (unsigned long)(opts ? [opts count] : 0));
-                    return ((id(*)(id, SEL, id))g_orig_remoteCtxOpts)(_self, remoteCtxSel, newOpts);
+                    id ctx = ((id(*)(id, SEL, id))g_orig_remoteCtxOpts)(_self, remoteCtxSel, newOpts);
+
+                    /* After context creation, send MIG 40400 (SetContextDisplayInfo)
+                     * to bind this context to display 1. connect_remote() does NOT
+                     * do this — display binding is a separate Mach message.
+                     * Reverse-engineered from CA::Render::Context::set_display_info(). */
+                    if (ctx) {
+                        @try {
+                            Ivar implIvar = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                            if (implIvar) {
+                                void *impl = *(void **)((uint8_t *)ctx + ivar_getOffset(implIvar));
+                                if (impl) {
+                                    mach_port_t srvPort = *(mach_port_t *)((uint8_t *)impl + 0x98);
+                                    uint32_t connPort = *(uint32_t *)((uint8_t *)impl + 0xa8);
+                                    uint32_t clientId = *(uint32_t *)((uint8_t *)impl + 0x58);
+                                    uint32_t localId = *(uint32_t *)((uint8_t *)impl + 0x60);
+                                    bridge_log("MIG 40400 DIAG: impl=%p srv=0x%x conn=0x%x cid=0x%x lid=0x%x",
+                                               impl, srvPort, connPort, clientId, localId);
+                                    /* Scan impl object for valid Mach ports (0x100..0xFFFF range) */
+                                    {
+                                        extern kern_return_t mach_port_type(mach_port_t task,
+                                            mach_port_t name, mach_port_type_t *type);
+                                        for (int off = 0x90; off < 0xC0; off += 4) {
+                                            uint32_t val = *(uint32_t *)((uint8_t *)impl + off);
+                                            if (val > 0x100 && val < 0x100000) {
+                                                mach_port_type_t ptype = 0;
+                                                kern_return_t pkr = mach_port_type(
+                                                    mach_task_self(), val, &ptype);
+                                                if (pkr == 0) {
+                                                    bridge_log("MIG 40400 PORT_SCAN: +0x%x = 0x%x type=0x%x",
+                                                               off, val, ptype);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    /* The per-client connection port is at +0xB0 (not +0xA8).
+                                     * Found via PORT_SCAN: +0xB0 has send+receive rights. */
+                                    mach_port_t clientConnPort = *(mach_port_t *)((uint8_t *)impl + 0xB0);
+                                    bridge_log("MIG 40400: clientConnPort(+0xB0)=0x%x", clientConnPort);
+                                    mach_port_t destPort = (clientConnPort > 0x100 && clientConnPort < 0x100000)
+                                                           ? clientConnPort : srvPort;
+                                    if (destPort != 0 && destPort != MACH_PORT_NULL) {
+                                        struct {
+                                            mach_msg_header_t hdr;
+                                            NDR_record_t ndr;
+                                            uint32_t display_id;
+                                        } __attribute__((packed)) req;
+                                        memset(&req, 0, sizeof(req));
+                                        req.hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                                        req.hdr.msgh_size = sizeof(req);
+                                        req.hdr.msgh_remote_port = destPort;
+                                        req.hdr.msgh_local_port = MACH_PORT_NULL;
+                                        req.hdr.msgh_id = 40400;
+                                        req.ndr = NDR_record;
+                                        req.display_id = 1;
+                                        kern_return_t kr = mach_msg(&req.hdr, MACH_SEND_MSG,
+                                            sizeof(req), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+                                        bridge_log("MIG 40400 SetContextDisplayInfo: dest=0x%x display=1 kr=%d (%s)",
+                                                   destPort, kr, kr == 0 ? "OK" : mach_error_string(kr));
+                                    } else {
+                                        bridge_log("MIG 40400: skipped — server_port=0");
+                                    }
+                                }
+                            }
+                        } @catch (id ex) {
+                            bridge_log("MIG 40400: exception");
+                        }
+                    }
+                    return ctx;
                 };
                 method_setImplementation(m, imp_implementationWithBlock(swizzleBlock));
-                bridge_log("  +[CAContext remoteContextWithOptions:] → injects display=1, displayable=YES");
+                bridge_log("  +[CAContext remoteContextWithOptions:] → injects display=1 + MIG 40400");
             }
         }
     }
