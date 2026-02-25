@@ -1145,6 +1145,64 @@ static void *pfb_sync_thread(void *arg) {
                     uint64_t pixel_ptr2 = *(uint64_t *)(surf + 0x10);
                     pfb_log("STRIDE_DIAG: surf+0x10 = 0x%llx", (unsigned long long)pixel_ptr2);
                 }
+
+                /* Pixel format diagnostic — sample non-zero pixels from cached buffer */
+                if (g_display_pixel_buffer) {
+                    uint8_t *px = (uint8_t *)g_display_pixel_buffer;
+                    int logged = 0;
+                    for (int i = 0; i < 750 * 1334 && logged < 10; i++) {
+                        int off = i * 4;
+                        if (px[off] || px[off+1] || px[off+2]) {
+                            pfb_log("PIXEL_FMT: [%d] = (%u,%u,%u,%u) row=%d col=%d",
+                                    i, px[off], px[off+1], px[off+2], px[off+3],
+                                    i / 750, i % 750);
+                            logged++;
+                        }
+                    }
+                    if (logged == 0)
+                        pfb_log("PIXEL_FMT: no non-zero RGB pixels found in buffer!");
+                    /* Also count total non-zero and check alpha distribution */
+                    int total_nz = 0, alpha_only = 0, has_alpha = 0;
+                    for (int i = 0; i < 30000; i++) {
+                        int off = i * 4;
+                        int rgb = px[off] || px[off+1] || px[off+2];
+                        int a = px[off+3];
+                        if (rgb) total_nz++;
+                        if (!rgb && a) alpha_only++;
+                        if (a) has_alpha++;
+                    }
+                    pfb_log("PIXEL_FMT: first 30K: rgb_nz=%d alpha_only=%d has_alpha=%d",
+                            total_nz, alpha_only, has_alpha);
+                }
+
+                /* OpenGL readback diagnostic — check if we can read the GPU framebuffer */
+                {
+                    void *gl_read = dlsym(RTLD_DEFAULT, "glReadPixels");
+                    void *cgl_ctx = dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
+                    pfb_log("GL_READBACK: glReadPixels=%p CGLGetCurrentContext=%p", gl_read, cgl_ctx);
+                    if (cgl_ctx) {
+                        typedef void *(*CGLGetCtxFn)(void);
+                        void *ctx = ((CGLGetCtxFn)cgl_ctx)();
+                        pfb_log("GL_READBACK: current CGL context = %p", ctx);
+                    }
+                    if (gl_read) {
+                        /* Try reading 1 pixel to test */
+                        uint8_t test_pixel[4] = {0};
+                        typedef void (*glReadPixelsFn)(int, int, int, int, unsigned int, unsigned int, void *);
+                        /* GL_BGRA = 0x80E1, GL_UNSIGNED_BYTE = 0x1401 */
+                        ((glReadPixelsFn)gl_read)(0, 0, 1, 1, 0x80E1, 0x1401, test_pixel);
+                        pfb_log("GL_READBACK: test pixel (0,0) = (%u,%u,%u,%u)",
+                                test_pixel[0], test_pixel[1], test_pixel[2], test_pixel[3]);
+                        /* Check GL error */
+                        typedef unsigned int (*glGetErrorFn)(void);
+                        glGetErrorFn getErr = (glGetErrorFn)dlsym(RTLD_DEFAULT, "glGetError");
+                        if (getErr) {
+                            unsigned int err = getErr();
+                            pfb_log("GL_READBACK: glGetError = 0x%x (%s)",
+                                    err, err == 0 ? "GL_NO_ERROR" : "ERROR");
+                        }
+                    }
+                }
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
             {
