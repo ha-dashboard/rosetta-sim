@@ -5073,6 +5073,19 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
                     if (implIvar) {
                         void *impl = *(void **)((uint8_t *)layerCtx + ivar_getOffset(implIvar));
                         if (impl) {
+                            /* Full CA::Context C++ object dump 0x00-0xC0 */
+                            {
+                                uint8_t *p = (uint8_t *)impl;
+                                bridge_log("CA_CTX FULL DUMP (impl=%p):", impl);
+                                for (int off = 0; off < 0xC0; off += 0x20) {
+                                    bridge_log("  +%02x: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                               off,
+                                               *(uint32_t*)(p+off+0x00), *(uint32_t*)(p+off+0x04),
+                                               *(uint32_t*)(p+off+0x08), *(uint32_t*)(p+off+0x0c),
+                                               *(uint32_t*)(p+off+0x10), *(uint32_t*)(p+off+0x14),
+                                               *(uint32_t*)(p+off+0x18), *(uint32_t*)(p+off+0x1c));
+                                }
+                            }
                             uint32_t client_id = *(uint32_t *)((uint8_t *)impl + 0x58);
                             uint32_t field_60 = *(uint32_t *)((uint8_t *)impl + 0x60);
                             void *render_ctx = *(void **)((uint8_t *)impl + 0x70);
