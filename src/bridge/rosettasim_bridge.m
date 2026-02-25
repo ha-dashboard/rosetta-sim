@@ -4094,6 +4094,14 @@ static void _mark_display_dirty(void) {
      * (tint colors, selection states) which causes visual regressions. */
 }
 
+/* Test timer callback for CFRunLoop diagnostic */
+static int _test_timer_count = 0;
+static void rsim_test_timer_callback(CFRunLoopTimerRef timer, void *info) {
+    _test_timer_count++;
+    if (_test_timer_count <= 5 || _test_timer_count % 100 == 0)
+        bridge_log("TEST_TIMER: fired #%d", _test_timer_count);
+}
+
 static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
     if (!_bridge_root_window || !_fb_mmap) return;
     if (!_cg_CreateColorSpace || !_cg_CreateBitmap) return;
@@ -7201,6 +7209,23 @@ rowBytes, void *transform);
 
         bridge_log("CFRL_DIAG: main_thread=%d tsd4=%p main_rl=%p curr_rl=%p same=%d dispatch_port=0x%x getPort=%p",
                    is_main_thread, tsd4, (void *)main_rl, (void *)curr_rl, is_main_rl, dispatch_port, (void *)getPort);
+
+        /* Check all modes and test actual run loop blocking */
+        CFArrayRef modes = CFRunLoopCopyAllModes(main_rl);
+        CFIndex mcount = modes ? CFArrayGetCount(modes) : 0;
+        bridge_log("CFRL_DIAG2: all_modes count=%ld", (long)mcount);
+        for (CFIndex mi = 0; mi < mcount && mi < 10; mi++) {
+            CFStringRef m = CFArrayGetValueAtIndex(modes, mi);
+            char buf[128];
+            CFStringGetCString(m, buf, sizeof(buf), kCFStringEncodingUTF8);
+            bridge_log("  mode[%ld]: %s", (long)mi, buf);
+        }
+        if (modes) CFRelease(modes);
+
+        /* Test: does CFRunLoopRunInMode actually block with a 0.5s timeout? */
+        bridge_log("CFRL_DIAG2: calling CFRunLoopRunInMode(default, 0.5, false)...");
+        SInt32 rl_result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+        bridge_log("CFRL_DIAG2: result=%d (1=finished 2=stopped 3=timedOut 4=handled)", rl_result);
     }
 
     if (getenv("ROSETTASIM_RUNLOOP_PUMP") && atoi(getenv("ROSETTASIM_RUNLOOP_PUMP"))) {
@@ -7250,6 +7275,15 @@ rowBytes, void *transform);
             }
         }
     } else {
+        /* Add a test timer to verify CFRunLoopTimer fires */
+        {
+            CFRunLoopTimerRef testTimer = CFRunLoopTimerCreate(
+                NULL, CFAbsoluteTimeGetCurrent() + 1.0, 2.0, 0, 0,
+                rsim_test_timer_callback, NULL);
+            CFRunLoopAddTimer(CFRunLoopGetCurrent(), testTimer, kCFRunLoopDefaultMode);
+            bridge_log("  Test timer added (fires in 1s, repeats 2s)");
+        }
+
         bridge_log("  Starting CFRunLoopRun...");
         CFRunLoopRun();
         bridge_log("  CFRunLoopRun returned");
