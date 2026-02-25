@@ -2070,6 +2070,41 @@ static void pfb_init(void) {
         }
         if (!server_cpp) { pfb_log("GPU_INJECT: no server_cpp"); return; }
 
+        /* Check if server+0x58 (Shmem/Display) is our surface */
+        void *shmem_ptr = *(void **)((uint8_t *)server_cpp + 0x58);
+        pfb_log("GPU_INJECT: server+0x58=%p g_surface_addr=%p SAME=%d",
+                shmem_ptr, (void *)g_surface_addr,
+                shmem_ptr == (void *)g_surface_addr);
+        /* If it IS our surface, we can write function pointers into it.
+         * The render_update virtual call does *(*(server+0x58) + 0x40).
+         * If we write a valid callback at surface+0x40, the render cycle works. */
+        if (shmem_ptr) {
+            /* add_context does: rdi=*(server+0x58), rax=*rdi, callq *(rax+0x40)
+             * So it's a double dereference: vtable = *(shmem_ptr), fn = vtable[8]
+             * We need to create a fake vtable and point shmem_ptr's first word to it. */
+            uint64_t old_vtable_ptr = *(uint64_t *)shmem_ptr;
+            pfb_log("GPU_INJECT: *shmem = 0x%llx (vtable pointer)", (unsigned long long)old_vtable_ptr);
+            if (old_vtable_ptr > 0x100000 && old_vtable_ptr < 0x7fffffffffffULL) {
+                uint64_t old_fn = *(uint64_t *)(old_vtable_ptr + 0x40);
+                pfb_log("GPU_INJECT: vtable+0x40 = 0x%llx (render_update target)",
+                        (unsigned long long)old_fn);
+            }
+
+            /* Create a fake vtable where slot 8 (offset 0x40) is our no-op */
+            static void *pfb_fake_shmem_vtable[20];
+            /* Copy existing vtable entries if the pointer is valid */
+            if (old_vtable_ptr > 0x100000 && old_vtable_ptr < 0x7fffffffffffULL) {
+                for (int vi = 0; vi < 20; vi++)
+                    pfb_fake_shmem_vtable[vi] = ((void **)old_vtable_ptr)[vi];
+            }
+            /* Replace slot 8 (offset 0x40 / 8 = slot 8) with pthread_main_np */
+            pfb_fake_shmem_vtable[8] = dlsym(RTLD_DEFAULT, "pthread_main_np");
+            /* Point shmem's first word to our fake vtable */
+            *(void **)shmem_ptr = pfb_fake_shmem_vtable;
+            pfb_log("GPU_INJECT: PATCHED *shmem → fake vtable, slot[8]=%p",
+                    pfb_fake_shmem_vtable[8]);
+        }
+
         /* Read existing context list */
         void *list = *(void **)((uint8_t *)server_cpp + 0x68);
         uint64_t count = *(uint64_t *)((uint8_t *)server_cpp + 0x78);
@@ -2110,39 +2145,43 @@ static void pfb_init(void) {
                     i, cid, cimpl, *(uint32_t *)((uint8_t *)cimpl + 0x0C));
         }
 
-        /* Scan list entries for bounds values — the hit_test uses bounds from
-         * the Render::Context objects pointed to by the list entries. */
-        if (list && count > 0) {
-            for (uint64_t i = 0; i < count && i < 3; i++) {
-                void *ctx_ptr = *(void **)((uint8_t *)list + i * 0x10);
-                if (!ctx_ptr) continue;
-                uint32_t cid = *(uint32_t *)((uint8_t *)list + i * 0x10 + 0x0C);
-                pfb_log("GPU_INJECT: scanning ctx %u at %p for bounds...", cid, ctx_ptr);
-                uint8_t *p = (uint8_t *)ctx_ptr;
-                /* Look for float values matching display dimensions */
-                for (int off = 0; off < 0x200; off += 4) {
-                    float f = *(float *)(p + off);
-                    if ((f > 374.0f && f < 376.0f) || (f > 666.0f && f < 668.0f) ||
-                        (f > 749.0f && f < 751.0f) || (f > 1333.0f && f < 1335.0f)) {
-                        pfb_log("  ctx %u +0x%x = %.1f", cid, off, f);
-                    }
+        /* Now try add_context — with shmem+0x40 patched, it should complete */
+        {
+            void *known = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+            if (known) {
+                ptrdiff_t slide = (ptrdiff_t)known - (ptrdiff_t)0xb9899;
+                typedef void (*add_ctx_fn)(void *, void *);
+                add_ctx_fn add_ctx = (add_ctx_fn)((uint8_t *)0x12a006 + slide);
+                pfb_log("GPU_INJECT: add_context=%p, calling for each context...", (void *)add_ctx);
+
+                for (unsigned long i = 0; i < ctx_cnt; i++) {
+                    id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                        ctxs, sel_registerName("objectAtIndex:"), i);
+                    if (!ctx) continue;
+                    Ivar ci = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                    if (!ci) continue;
+                    void *cimpl = *(void **)((uint8_t *)ctx + ivar_getOffset(ci));
+                    if (!cimpl) continue;
+                    unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                        ctx, sel_registerName("contextId"));
+                    /* Force-unlock context+0x28 mutex (held by RegisterClient handler).
+                     * invalidate_context inside add_context tries to lock it → deadlock. */
+                    uint32_t old_ctx_lock = *(uint32_t *)((uint8_t *)cimpl + 0x28);
+                    *(uint32_t *)((uint8_t *)cimpl + 0x28) = 0;
+                    pfb_log("GPU_INJECT: add_context ctx[%lu] id=%u (unlocked +0x28 was 0x%x)",
+                            i, cid, old_ctx_lock);
+                    add_ctx(server_cpp, cimpl);
+                    pfb_log("GPU_INJECT: ctx[%lu] DONE!", i);
                 }
-                /* Also dump the first 0x20 bytes as raw to see structure */
-                pfb_log("  ctx %u raw +0x00: %016llx %016llx %016llx %016llx",
-                        cid,
-                        (unsigned long long)*(uint64_t *)(p),
-                        (unsigned long long)*(uint64_t *)(p+8),
-                        (unsigned long long)*(uint64_t *)(p+16),
-                        (unsigned long long)*(uint64_t *)(p+24));
             }
         }
 
-        /* Check contextIdAtPosition */
+        /* Check contextIdAtPosition AFTER */
         typedef struct { double x; double y; } CGPoint_t;
         CGPoint_t center = { 375.0, 667.0 };
-        unsigned int before = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+        unsigned int after = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
             disp, sel_registerName("contextIdAtPosition:"), center);
-        pfb_log("GPU_INJECT: contextIdAtPosition = %u", before);
+        pfb_log("GPU_INJECT: contextIdAtPosition AFTER = %u", after);
     });
 }
 

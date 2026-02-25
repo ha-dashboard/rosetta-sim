@@ -2812,6 +2812,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
      * Next: fix context bounds or set display bounds on contexts. */
     /* CPU default. GPU: contexts in list but no bounds (computed from committed
      * layer tree during render cycle which requires Shmem display callback). */
+    /* CPU default. GPU: add_context blocks on pthread_mutex_lock(context+0x28).
+     * Contexts already in list (count=8). Need manual bounds, not add_context. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
