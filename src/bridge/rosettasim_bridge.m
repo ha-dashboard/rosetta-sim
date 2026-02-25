@@ -7200,6 +7200,25 @@ rowBytes, void *transform);
                  * (camera images, network callbacks) dispatch here. */
                 if (drain_main_q) drain_main_q();
 
+                /* Force a CA commit by marking the root layer dirty.
+                 * Without CADisplayLink (broken under Rosetta 2), there's
+                 * no vsync-driven commit cycle. This ensures the GPU
+                 * framebuffer advances even when no explicit UI changes occur. */
+                if (_bridge_root_window && pump_iter % 2 == 0) {
+                    id rootLayer = ((id(*)(id, SEL))objc_msgSend)(
+                        _bridge_root_window, sel_registerName("layer"));
+                    if (rootLayer) {
+                        ((void(*)(id, SEL))objc_msgSend)(
+                            rootLayer, sel_registerName("setNeedsDisplay"));
+                    }
+                    /* Flush CA transaction to push to server */
+                    Class catClass = objc_getClass("CATransaction");
+                    if (catClass) {
+                        ((void(*)(id, SEL))objc_msgSend)(
+                            (id)catClass, sel_registerName("flush"));
+                    }
+                }
+
                 if (pump_iter % 300 == 0) {
                     bridge_log("pump: iter=%d alive", pump_iter);
                 }
