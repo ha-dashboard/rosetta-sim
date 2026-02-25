@@ -1191,10 +1191,15 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
     const int is_assertiond = bfix_is_assertiond_process();
 
     /* Fire post-commit render if a commit was received on the previous call.
-     * This runs AFTER MIG processed the commit, so the scene graph is updated. */
-    if (g_commit_render_pending && (option & MACH_RCV_MSG)) {
+     * This runs AFTER MIG processed the commit, so the scene graph is updated.
+     * Guard against re-entrancy: render_for_time may trigger mach_msg internally
+     * (e.g. flush_shmem notification), which would re-enter this function. */
+    static __thread int _pcr_in_render = 0;
+    if (g_commit_render_pending && (option & MACH_RCV_MSG) && !_pcr_in_render) {
         g_commit_render_pending = 0;
+        _pcr_in_render = 1;
         _pcr_do_render();
+        _pcr_in_render = 0;
     }
 
     /* Pre-send trace: capture routine=805 name/handle mapping for assertiond. */
