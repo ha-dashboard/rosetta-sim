@@ -274,7 +274,8 @@ static id g_layer_host_ref = NULL; /* stored when CALayerHost is created */
 static volatile int g_layer_host_created; /* defined later, declared here for pfb_sync_to_shared */
 static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
 static volatile int g_gpu_inject_done = 0; /* set by GPU_INJECT after mutex reinit */
-static volatile void *g_display_surface = NULL; /* Display+0x138: actual rendered surface */
+static volatile void *g_display_surface = NULL; /* Display+0x138: surface object */
+static volatile void *g_display_pixel_buffer = NULL; /* surf_obj+0x08: actual pixel data */
 static volatile vm_address_t g_server_surface_map = 0; /* CARenderServer's vm_map of our surface */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
@@ -346,10 +347,13 @@ fallback:
     /* Copy from Display's actual rendered surface.
      * Re-read Display+0x138 each frame (surface pointer may change).
      * The surface object has a pixel data pointer at +0x08. */
-    /* Use cached g_display_surface (set once by GPU_INJECT, stable pointer).
-     * This is the surface OBJECT at Display+0x138. It contains a small header
-     * followed by pixel data. Header bytes appear as noise in first few pixels. */
-    if (g_display_surface != NULL) {
+    /* Use cached pixel buffer (set once by GPU_INJECT from surf_obj+0x08).
+     * This is CARenderServer's actual render target — a persistent vm_allocate'd
+     * region that doesn't change between frames. */
+    if (g_display_pixel_buffer != NULL) {
+        memcpy(pixel_dest, (void *)g_display_pixel_buffer, PFB_SURFACE_SIZE);
+    } else if (g_display_surface != NULL) {
+        /* Fallback: copy surface object raw (includes 32-byte header as noise) */
         memcpy(pixel_dest, (void *)g_display_surface, PFB_SURFACE_SIZE);
     } else if (g_surface_addr != 0) {
         memcpy(pixel_dest, (void *)g_surface_addr, PFB_SURFACE_SIZE);
@@ -2128,6 +2132,13 @@ static void pfb_init(void) {
                 if (mapped) {
                     g_display_surface = mapped;
                     pfb_log("GPU_INJECT: set g_display_surface=%p (Display+0x138)", mapped);
+                    /* Cache the pixel data pointer at surf_obj+0x08.
+                     * This is a persistent vm_allocate'd buffer. */
+                    void *pixel_buf = *(void **)((uint8_t *)mapped + 0x08);
+                    if (pixel_buf && (uint64_t)pixel_buf > 0x100000000ULL) {
+                        g_display_pixel_buffer = pixel_buf;
+                        pfb_log("GPU_INJECT: CACHED pixel buffer=%p (surf+0x08)", pixel_buf);
+                    }
                 }
             }
         }
