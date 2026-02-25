@@ -5089,6 +5089,21 @@ static void replacement_makeKeyAndVisible(id self, SEL _cmd) {
          * In CPU mode, we still call _createContextAttached: — but rendersLocally
          * is swizzled to YES, so UIKit will create a LOCAL context instead. */
         {
+            /* Check rendersLocally and _shouldUseRemoteContext before creating */
+            {
+                id sharedApp = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                Class appCls = sharedApp ? object_getClass(sharedApp) : objc_getClass("UIApplication");
+                SEL rlSel = sel_registerName("rendersLocally");
+                BOOL rl = ((BOOL(*)(id, SEL))objc_msgSend)((id)appCls, rlSel);
+                bridge_log("REMOTE_DIAG: +[%s rendersLocally]=%d (0=REMOTE, 1=LOCAL)",
+                           class_getName(appCls), rl);
+                SEL srSel = sel_registerName("_shouldUseRemoteContext");
+                if ([(id)self respondsToSelector:srSel]) {
+                    BOOL sr = ((BOOL(*)(id, SEL))objc_msgSend)(self, srSel);
+                    bridge_log("REMOTE_DIAG: [UIWindow _shouldUseRemoteContext]=%d", sr);
+                }
+            }
             bridge_log("  Calling UIKit's _createContextAttached:YES (%s path)",
                        _force_cpu_mode() ? "LOCAL/cpu" : "natural");
             SEL createCtxSel = sel_registerName("_createContextAttached:");
