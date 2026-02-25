@@ -535,49 +535,9 @@ static mach_port_t bridge_broker_lookup(const char *name) {
 static mach_port_t replacement_CARenderServerGetServerPort(void) {
     /* If already connected to real CARenderServer, return cached port.
      * Also ensure client port is set on first access. */
+    /* Simply return cached port. No early context, no setClientPort.
+     * Let UIKit's connect_remote handle all registration. */
     if (g_ca_server_connected) {
-        /* DISABLED — let CoreAnimation handle context creation naturally.
-         * With BKSDisplayServicesStart succeeding and CARenderServerGetServerPort
-         * returning a real port, CA should set up the server connection.
-         * Creating extra contexts might interfere with the default pipeline. */
-        static int _early_ctx = 0;
-        if (!_early_ctx) { /* re-enabled for CALayerHost */
-            _early_ctx = 1;
-            mach_port_t cp = MACH_PORT_NULL;
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
-            mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
-            Class caCtxCls = objc_getClass("CAContext");
-            if (caCtxCls) {
-                ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                    (id)caCtxCls, sel_registerName("setClientPort:"), cp);
-                bridge_log("CARenderServerGetServerPort: setClientPort:%u", cp);
-                @try {
-                    NSDictionary *opts = @{@"displayable": @YES, @"display": @(1), @"clientPortNumber": @(cp)};
-                    id ctx = ((id(*)(id, SEL, id))objc_msgSend)(
-                        (id)caCtxCls, sel_registerName("remoteContextWithOptions:"), opts);
-                    if (ctx) {
-                        unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
-                            ctx, sel_registerName("contextId"));
-                        bridge_log("CARenderServerGetServerPort: EARLY ctx ID=%u", cid);
-                        /* Check if client port is now registered */
-                        typedef mach_port_t (*GetCPFn)(unsigned int);
-                        GetCPFn gcp = (GetCPFn)dlsym(RTLD_DEFAULT, "CARenderServerGetClientPort");
-                        if (gcp) {
-                            mach_port_t rcp = gcp(g_ca_server_port);
-                            bridge_log("CARenderServerGetServerPort: GetClientPort(%u)=%u (after early ctx)", g_ca_server_port, rcp);
-                        }
-                        ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("retain"));
-                        /* Store globally for UIWindow to use later.
-                         * DON'T write context_id file here — UIKit will create
-                         * the real window context later with a different ID. */
-                        _bridge_pre_created_context = ctx;
-                    }
-                } @catch (id ex) {
-                    bridge_log("CARenderServerGetServerPort: early ctx threw: %s",
-                               [[ex description] UTF8String] ?: "?");
-                }
-            }
-        }
         return g_ca_server_port;
     }
 
@@ -606,25 +566,7 @@ static mach_port_t replacement_CARenderServerGetServerPort(void) {
             bridge_log("CARenderServerGetServerPort() → port %u "
                        "(real CARenderServer via broker)", port);
 
-            /* Set client port IMMEDIATELY so CoreAnimation knows to use
-             * IOSurface-backed backing stores for server compositing.
-             * This MUST happen before ANY views/layers are created. */
-            static int _client_port_set = 0;
-            if (!_client_port_set) {
-                _client_port_set = 1;
-                mach_port_t cp = MACH_PORT_NULL;
-                mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &cp);
-                mach_port_insert_right(mach_task_self(), cp, cp, MACH_MSG_TYPE_MAKE_SEND);
-                Class caCtxCls = objc_getClass("CAContext");
-                if (caCtxCls) {
-                    SEL scpSel = sel_registerName("setClientPort:");
-                    if (class_respondsToSelector(object_getClass((id)caCtxCls), scpSel)) {
-                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                            (id)caCtxCls, scpSel, cp);
-                        bridge_log("CARenderServerGetServerPort: setClientPort:%u (early init)", cp);
-                    }
-                }
-            }
+            /* REMOVED: Early setClientPort — let connect_remote handle it */
 
             return port;
         }
@@ -6099,29 +6041,12 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                     object_setIvar(mainScreen, displayIvar, mainDisplay);
                                     bridge_log("Display Pipeline: set _display=%p", (void *)mainDisplay);
 
-                                    /* Set the client port so UIKit's default CA pipeline
-                                     * routes render commits to CARenderServer */
-                                    Class caCtxClass = objc_getClass("CAContext");
-                                    SEL setClientPortSel = sel_registerName("setClientPort:");
-                                    if (caCtxClass && class_respondsToSelector(
-                                            object_getClass((id)caCtxClass), setClientPortSel)) {
-                                        /* Create a receive port for the client.
-                                         * setClientPort sets the port that the SERVER sends callbacks to.
-                                         * It must NOT be the server port — it must be a port the client OWNS. */
-                                        mach_port_t clientPort = MACH_PORT_NULL;
-                                        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &clientPort);
-                                        mach_port_insert_right(mach_task_self(), clientPort, clientPort,
-                                                               MACH_MSG_TYPE_MAKE_SEND);
-                                        ((void(*)(id, SEL, mach_port_t))objc_msgSend)(
-                                            (id)caCtxClass, setClientPortSel, clientPort);
-                                        bridge_log("Display Pipeline: [CAContext setClientPort:%u] (client receive port)",
-                                                   clientPort);
-                                    }
+                                    /* REMOVED: setClientPort and RegisterClient — let UIKit's
+                                     * connect_remote handle all registration naturally.
+                                     * Multiple calls with different ports caused renderCtx=0. */
 
-                                    /* Send RegisterClient MIG message to CARenderServer.
-                                     * This registers the app as a display client so the server
-                                     * composites its content onto the display surface. */
-                                    if (g_ca_server_port != MACH_PORT_NULL) {
+                                    /* DISABLED: Manual RegisterClient — handled by connect_remote */
+                                    if (0) { /* was: g_ca_server_port != MACH_PORT_NULL */
                                         /* Try calling the MIG client stub directly via dlsym */
                                         typedef kern_return_t (*CASRegFn)(
                                             mach_port_t, mach_port_t, mach_port_t,
@@ -6140,7 +6065,7 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                             bridge_log("Display Pipeline: __CASRegisterClient not found");
                                         }
                                     }
-                                    if (g_ca_server_port != MACH_PORT_NULL) { /* manual RegisterClient */
+                                    if (0) { /* DISABLED: manual RegisterClient MIG */
                                         #pragma pack(4)
                                         struct {
                                             mach_msg_header_t header;     /* 24 bytes */
