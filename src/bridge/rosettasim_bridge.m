@@ -52,6 +52,75 @@
 
 #include "../shared/rosettasim_framebuffer.h"
 
+/* ================================================================
+ * Mach-O nlist symbol scanner — finds symbols in the shared cache
+ * that dlsym can't locate. Same technique as bootstrap_fix.c.
+ * ================================================================ */
+static void *bridge_find_symbol_in_macho(const struct mach_header_64 *header,
+                                          intptr_t slide, const char *symbol_name) {
+    const uint8_t *ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+    const struct symtab_command *symtab_cmd = NULL;
+    const struct segment_command_64 *linkedit_seg = NULL;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *cmd = (const struct load_command *)ptr;
+        if (cmd->cmd == LC_SYMTAB)
+            symtab_cmd = (const struct symtab_command *)cmd;
+        else if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0)
+                linkedit_seg = seg;
+        }
+        ptr += cmd->cmdsize;
+    }
+    if (!symtab_cmd || !linkedit_seg) return NULL;
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
+    const struct nlist_64 *symtab = (const struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab_cmd->stroff);
+    for (uint32_t j = 0; j < symtab_cmd->nsyms; j++) {
+        if ((symtab[j].n_type & N_TYPE) != N_SECT) continue;
+        uint32_t strx = symtab[j].n_un.n_strx;
+        if (strx == 0) continue;
+        if (strcmp(strtab + strx, symbol_name) == 0)
+            return (void *)(symtab[j].n_value + slide);
+    }
+    return NULL;
+}
+
+static void *bridge_find_function(const char *func_name) {
+    char mangled[256];
+    snprintf(mangled, sizeof(mangled), "_%s", func_name);
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        void *sym = bridge_find_symbol_in_macho(
+            (const struct mach_header_64 *)mh, slide, mangled);
+        if (sym) return sym;
+    }
+    return NULL;
+}
+
+/* Cached IOSurface function pointers (resolved via nlist scan) */
+static void *_iosym_getWidth = NULL;
+static void *_iosym_getHeight = NULL;
+static void *_iosym_getBytesPerRow = NULL;
+static void *_iosym_getBaseAddress = NULL;
+static void *_iosym_lock = NULL;
+static void *_iosym_unlock = NULL;
+static int _iosym_resolved = 0;
+
+static void resolve_iosurface_symbols(void) {
+    if (_iosym_resolved) return;
+    _iosym_resolved = 1;
+    _iosym_getWidth = bridge_find_function("IOSurfaceGetWidth");
+    _iosym_getHeight = bridge_find_function("IOSurfaceGetHeight");
+    _iosym_getBytesPerRow = bridge_find_function("IOSurfaceGetBytesPerRow");
+    _iosym_getBaseAddress = bridge_find_function("IOSurfaceGetBaseAddress");
+    _iosym_lock = bridge_find_function("IOSurfaceLock");
+    _iosym_unlock = bridge_find_function("IOSurfaceUnlock");
+}
+
 /* Forward declarations for frame capture system */
 static id _bridge_delegate = nil;
 static id _bridge_root_window = nil;
@@ -4193,78 +4262,41 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                             if (!_iosurface_lib)
                                 _iosurface_lib = dlopen("/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface", RTLD_LAZY);
                         }
-                        /* Find IOSurface symbols — try QuartzCore's handle (it links IOSurface)
-                         * then RTLD_DEFAULT, then explicit dlopen paths, then image walk */
-                        static void *_ios_getW = NULL, *_ios_getH = NULL, *_ios_lock = NULL,
-                                    *_ios_getBase = NULL, *_ios_unlock = NULL, *_ios_getBPR = NULL;
-                        static int _ios_searched = 0;
-                        if (!_ios_searched) {
-                            _ios_searched = 1;
-                            /* Try QuartzCore handle — IOSurface resolves through its deps */
-                            const char *try_libs[] = {
-                                "/System/Library/Frameworks/QuartzCore.framework/QuartzCore",
-                                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
-                                "/System/Library/Frameworks/IOSurface.framework/IOSurface",
-                                "/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface",
-                                "/usr/lib/libIOSurface.dylib",
-                                NULL
-                            };
-                            for (int pi = 0; try_libs[pi] && !_ios_getW; pi++) {
-                                void *h = dlopen(try_libs[pi], RTLD_NOLOAD | RTLD_LAZY);
-                                if (!h) h = dlopen(try_libs[pi], RTLD_LAZY);
-                                if (!h) continue;
-                                _ios_getW = dlsym(h, "IOSurfaceGetWidth");
-                                if (_ios_getW) {
-                                    _ios_getH = dlsym(h, "IOSurfaceGetHeight");
-                                    _ios_lock = dlsym(h, "IOSurfaceLock");
-                                    _ios_getBase = dlsym(h, "IOSurfaceGetBaseAddress");
-                                    _ios_unlock = dlsym(h, "IOSurfaceUnlock");
-                                    _ios_getBPR = dlsym(h, "IOSurfaceGetBytesPerRow");
-                                    bridge_log("GPU_CAPTURE: FOUND IOSurface via %s", try_libs[pi]);
+                        /* Resolve IOSurface symbols via Mach-O nlist scan */
+                        resolve_iosurface_symbols();
+                        IOSGetWidthFn getW = (IOSGetWidthFn)_iosym_getWidth;
+                        IOSGetHeightFn getH = (IOSGetHeightFn)_iosym_getHeight;
+                        IOSLockFn lockFn = (IOSLockFn)_iosym_lock;
+                        IOSGetBaseAddrFn getBase = (IOSGetBaseAddrFn)_iosym_getBaseAddress;
+                        IOSUnlockFn unlockFn = (IOSUnlockFn)_iosym_unlock;
+                        static int _ios_log_done = 0;
+                        if (!_ios_log_done) {
+                            _ios_log_done = 1;
+                            bridge_log("GPU_CAPTURE: IOSurface nlist scan: w=%p h=%p lock=%p base=%p bpr=%p",
+                                       getW, getH, lockFn, getBase, _iosym_getBytesPerRow);
+                            /* Verify function addresses via Dl_info */
+                            if (getW) {
+                                Dl_info di;
+                                if (dladdr((void *)getW, &di) && di.dli_fname)
+                                    bridge_log("GPU_CAPTURE: getW at %p → %s (%s)", (void *)getW, di.dli_sname ?: "?", di.dli_fname);
+                            }
+                            /* Test call with CFTypeID check */
+                            if (getW && ioSurface) {
+                                CFTypeID tid = CFGetTypeID((CFTypeRef)ioSurface);
+                                bridge_log("GPU_CAPTURE: ioSurface=%p CFTypeID=%lu class=%s",
+                                           ioSurface, (unsigned long)tid,
+                                           class_getName(object_getClass((id)ioSurface)));
+                                /* Try locking first, then read */
+                                if (lockFn) {
+                                    int lr = lockFn(ioSurface, 1, NULL);
+                                    bridge_log("GPU_CAPTURE: lock(%p, READ) = %d", ioSurface, lr);
                                 }
-                            }
-                            /* Fallback: RTLD_DEFAULT */
-                            if (!_ios_getW) _ios_getW = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
-                            if (_ios_getW && !_ios_getH) {
-                                _ios_getH = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
-                                _ios_lock = dlsym(RTLD_DEFAULT, "IOSurfaceLock");
-                                _ios_getBase = dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
-                                _ios_unlock = dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
-                                _ios_getBPR = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
-                                bridge_log("GPU_CAPTURE: FOUND IOSurface via RTLD_DEFAULT");
-                            }
-                            if (!_ios_getW) {
-                                /* Walk loaded images */
-                                #include <mach-o/dyld.h>
-                                uint32_t img_count = _dyld_image_count();
-                                for (uint32_t ii = 0; ii < img_count && !_ios_getW; ii++) {
-                                    const char *name = _dyld_get_image_name(ii);
-                                    if (!name) continue;
-                                    void *h = dlopen(name, RTLD_NOLOAD | RTLD_LAZY);
-                                    if (!h) continue;
-                                    _ios_getW = dlsym(h, "IOSurfaceGetWidth");
-                                    if (_ios_getW) {
-                                        _ios_getH = dlsym(h, "IOSurfaceGetHeight");
-                                        _ios_lock = dlsym(h, "IOSurfaceLock");
-                                        _ios_getBase = dlsym(h, "IOSurfaceGetBaseAddress");
-                                        _ios_unlock = dlsym(h, "IOSurfaceUnlock");
-                                        _ios_getBPR = dlsym(h, "IOSurfaceGetBytesPerRow");
-                                        bridge_log("GPU_CAPTURE: FOUND IOSurface in image %s", name);
-                                    }
-                                }
-                            }
-                            if (_ios_getW) {
-                                bridge_log("GPU_CAPTURE: IOSurface symbols: w=%p h=%p lock=%p base=%p bpr=%p",
-                                           _ios_getW, _ios_getH, _ios_lock, _ios_getBase, _ios_getBPR);
-                            } else {
-                                bridge_log("GPU_CAPTURE: IOSurface symbols NOT found anywhere");
+                                size_t tw = getW(ioSurface);
+                                void *tb = getBase ? getBase(ioSurface) : NULL;
+                                bridge_log("GPU_CAPTURE: after lock: getW=%zu getBase=%p", tw, tb);
+                                if (unlockFn) unlockFn(ioSurface, 1, NULL);
                             }
                         }
-                        IOSGetWidthFn getW = (IOSGetWidthFn)_ios_getW;
-                        IOSGetHeightFn getH = (IOSGetHeightFn)_ios_getH;
-                        IOSLockFn lockFn = (IOSLockFn)_ios_lock;
-                        IOSGetBaseAddrFn getBase = (IOSGetBaseAddrFn)_ios_getBase;
-                        IOSUnlockFn unlockFn = (IOSUnlockFn)_ios_unlock;
 
                         if (!getW) {
                             /* Fallback: use ObjC methods on IOSurface */
