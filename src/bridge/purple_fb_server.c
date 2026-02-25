@@ -315,7 +315,8 @@ static volatile int g_layer_host_created; /* defined later, declared here for pf
 static id g_cached_display = NULL; /* set by pfb_create_layer_host, used by sync thread */
 static volatile int g_gpu_inject_done = 0; /* set by GPU_INJECT after mutex reinit */
 static volatile void *g_display_surface = NULL; /* Display+0x138: surface object */
-static volatile void *g_display_pixel_buffer = NULL; /* surf_obj+0x08: actual pixel data */
+static volatile void *g_display_pixel_buffer = NULL; /* SW renderer pixel data */
+static volatile int64_t g_display_pixel_stride = 0;  /* SW renderer stride (may differ from 750*4) */
 static volatile vm_address_t g_server_surface_map = 0; /* CARenderServer's vm_map of our surface */
 
 /* CoreGraphics types and functions for CALayerHost rendering */
@@ -387,11 +388,30 @@ fallback:
     /* Copy from Display's actual rendered surface.
      * Re-read Display+0x138 each frame (surface pointer may change).
      * The surface object has a pixel data pointer at +0x08. */
-    /* Use cached pixel buffer (set once by GPU_INJECT from surf_obj+0x08).
-     * This is CARenderServer's actual render target — a persistent vm_allocate'd
-     * region that doesn't change between frames. */
+    /* Copy from SWContext pixel buffer with stride conversion.
+     * Source stride may differ from 750*4=3000 (e.g. 3008 for 16-byte alignment). */
     if (g_display_pixel_buffer != NULL) {
-        memcpy(pixel_dest, (void *)g_display_pixel_buffer, PFB_SURFACE_SIZE);
+        int64_t src_stride = g_display_pixel_stride;
+        int64_t dst_stride = PFB_BYTES_PER_ROW; /* 3000 */
+        if (src_stride == dst_stride || src_stride == 0) {
+            memcpy(pixel_dest, (void *)g_display_pixel_buffer, PFB_SURFACE_SIZE);
+        } else {
+            /* Row-by-row copy — handle positive or negative stride */
+            int64_t abs_src = src_stride < 0 ? -src_stride : src_stride;
+            uint8_t *src = (uint8_t *)g_display_pixel_buffer;
+            uint8_t *dst = pixel_dest;
+            for (int row = 0; row < PFB_PIXEL_HEIGHT; row++) {
+                uint8_t *src_row;
+                if (src_stride < 0) {
+                    /* Negative stride: buffer starts at last row, goes up */
+                    src_row = src + (int64_t)(PFB_PIXEL_HEIGHT - 1 - row) * abs_src;
+                } else {
+                    src_row = src + (int64_t)row * src_stride;
+                }
+                memcpy(dst, src_row, PFB_BYTES_PER_ROW);
+                dst += dst_stride;
+            }
+        }
     } else if (g_display_surface != NULL) {
         /* Fallback: copy surface object raw (includes 32-byte header as noise) */
         memcpy(pixel_dest, (void *)g_display_surface, PFB_SURFACE_SIZE);
@@ -2613,17 +2633,28 @@ static void pfb_init(void) {
                 }
             }
 
-            /* 2. Scan PurpleServer for Renderer (look for OGL/Renderer vtable) */
+            /* 2. SWContext pixel buffer at known offsets from disassembly:
+             *    set_destination stores: buf at +0x668, stride at +0x678, fmt at +0x688
+             *    NOTE: stride can be NEGATIVE (bottom-up scanlines) */
             if (server_cpp) {
-                for (int off = 0x80; off < 0x200; off += 8) {
-                    uint64_t val = *(uint64_t *)((uint8_t *)server_cpp + off);
-                    if (val > 0x100000 && val < 0x7fffffffffffULL) {
-                        uint64_t vt = *(uint64_t *)val;
-                        if (vt > 0x100000 && vt < 0x7fffffffffffULL) {
-                            Dl_info di2;
-                            if (dladdr((void *)vt, &di2) && di2.dli_sname &&
-                                (strstr(di2.dli_sname, "OGL") || strstr(di2.dli_sname, "Render")))
-                                pfb_log("PIXEL_FIND: srv+0x%x → %p (%s)", off, (void *)val, di2.dli_sname);
+                void *swctx = *(void **)((uint8_t *)server_cpp + 0xb8);
+                if (swctx && (uint64_t)swctx > 0x100000) {
+                    void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+                    int64_t stride = *(int64_t *)((uint8_t *)swctx + 0x678);
+                    uint32_t fmt = *(uint32_t *)((uint8_t *)swctx + 0x688);
+                    pfb_log("SWCTX: pixbuf=%p stride=%lld fmt=%u (0x%x)",
+                            pixbuf, (long long)stride, fmt, fmt);
+                    if (pixbuf && (uint64_t)pixbuf > 0x100000) {
+                        uint8_t *pp = (uint8_t *)pixbuf;
+                        int nz = 0;
+                        for (int i = 0; i < 1000; i++)
+                            if (pp[i*4] || pp[i*4+1] || pp[i*4+2]) nz++;
+                        pfb_log("SWCTX: *** %d/1000 non-zero RGB at pixbuf ***", nz);
+                        pfb_log("SWCTX: px[0]=(%u,%u,%u,%u)", pp[0], pp[1], pp[2], pp[3]);
+                        if (nz > 0) {
+                            g_display_pixel_buffer = pixbuf;
+                            g_display_pixel_stride = stride;
+                            pfb_log("SWCTX: CACHED pixel buffer at %p stride=%lld!", pixbuf, (long long)stride);
                         }
                     }
                 }
