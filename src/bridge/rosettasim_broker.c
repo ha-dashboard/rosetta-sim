@@ -2790,6 +2790,8 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* CPU default. GPU needs server-side display render cycle (attach_contexts).
      * [CAWindowServerDisplay update] doesn't trigger it. Need to investigate
      * _CASRenderDisplay or CA::Display::callback. ROSETTASIM_CA_MODE=gpu to test. */
+    /* CPU default. GPU: need server-side render trigger (not client-side
+     * CARenderServerRenderDisplay which needs remote port). Server IS backboardd. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;

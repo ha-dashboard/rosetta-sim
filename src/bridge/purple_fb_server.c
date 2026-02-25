@@ -872,9 +872,34 @@ static void *pfb_sync_thread(void *arg) {
         }
         if (g_cached_display) {
             ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
+
+            /* Call CARenderServerRenderDisplay to trigger the full render pipeline.
+             * This should invoke attach_contexts → add_context → set_display_info. */
+            {
+                static int _render_init = 0;
+                static void *_render_fn = NULL;
+                static mach_port_t _srv_port = 0;
+                static id _display_name = NULL;
+                if (!_render_init) {
+                    _render_init = 1;
+                    _render_fn = dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+                    typedef mach_port_t (*get_port_fn)(void);
+                    get_port_fn gp = (get_port_fn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                    if (gp) _srv_port = gp();
+                    _display_name = ((id(*)(id, SEL))objc_msgSend)(
+                        g_cached_display, sel_registerName("name"));
+                    pfb_log("RENDER_DISPLAY: fn=%p port=0x%x name=%p", _render_fn, _srv_port,
+                            (void *)_display_name);
+                }
+                if (_render_fn && _srv_port && _display_name) {
+                    typedef int (*render_fn)(mach_port_t, id, id, int, int);
+                    ((render_fn)_render_fn)(_srv_port, _display_name, NULL, 0, 0);
+                }
+            }
+
             if (!g_update_logged) {
                 g_update_logged = 1;
-                pfb_log("DISPLAY_UPDATE: calling [CAWindowServerDisplay update] each tick");
+                pfb_log("DISPLAY_UPDATE: calling update + CARenderServerRenderDisplay each tick");
             }
             /* Periodic contextIdAtPosition check (every ~5s) */
             {
