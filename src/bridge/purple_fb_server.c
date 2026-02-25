@@ -871,6 +871,15 @@ static void *pfb_sync_thread(void *arg) {
             }
         }
         if (g_cached_display) {
+            /* Server-side CATransaction flush — triggers commit processing
+             * which should run the render pipeline including attach_contexts.
+             * This is the server-side equivalent of a display refresh cycle. */
+            {
+                Class catCls = (Class)objc_getClass("CATransaction");
+                if (catCls) {
+                    ((void(*)(id, SEL))objc_msgSend)((id)catCls, sel_registerName("flush"));
+                }
+            }
             ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
 
             /* Call CARenderServerRenderDisplay to trigger the full render pipeline.
