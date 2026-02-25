@@ -2110,12 +2110,39 @@ static void pfb_init(void) {
                     i, cid, cimpl, *(uint32_t *)((uint8_t *)cimpl + 0x0C));
         }
 
-        /* Check contextIdAtPosition before and after */
+        /* Scan list entries for bounds values — the hit_test uses bounds from
+         * the Render::Context objects pointed to by the list entries. */
+        if (list && count > 0) {
+            for (uint64_t i = 0; i < count && i < 3; i++) {
+                void *ctx_ptr = *(void **)((uint8_t *)list + i * 0x10);
+                if (!ctx_ptr) continue;
+                uint32_t cid = *(uint32_t *)((uint8_t *)list + i * 0x10 + 0x0C);
+                pfb_log("GPU_INJECT: scanning ctx %u at %p for bounds...", cid, ctx_ptr);
+                uint8_t *p = (uint8_t *)ctx_ptr;
+                /* Look for float values matching display dimensions */
+                for (int off = 0; off < 0x200; off += 4) {
+                    float f = *(float *)(p + off);
+                    if ((f > 374.0f && f < 376.0f) || (f > 666.0f && f < 668.0f) ||
+                        (f > 749.0f && f < 751.0f) || (f > 1333.0f && f < 1335.0f)) {
+                        pfb_log("  ctx %u +0x%x = %.1f", cid, off, f);
+                    }
+                }
+                /* Also dump the first 0x20 bytes as raw to see structure */
+                pfb_log("  ctx %u raw +0x00: %016llx %016llx %016llx %016llx",
+                        cid,
+                        (unsigned long long)*(uint64_t *)(p),
+                        (unsigned long long)*(uint64_t *)(p+8),
+                        (unsigned long long)*(uint64_t *)(p+16),
+                        (unsigned long long)*(uint64_t *)(p+24));
+            }
+        }
+
+        /* Check contextIdAtPosition */
         typedef struct { double x; double y; } CGPoint_t;
         CGPoint_t center = { 375.0, 667.0 };
         unsigned int before = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
             disp, sel_registerName("contextIdAtPosition:"), center);
-        pfb_log("GPU_INJECT: contextIdAtPosition BEFORE = %u", before);
+        pfb_log("GPU_INJECT: contextIdAtPosition = %u", before);
     });
 }
 
