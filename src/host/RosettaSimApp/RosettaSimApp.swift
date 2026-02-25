@@ -439,6 +439,8 @@ class SimulatorDisplayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        fputs("[Host] mouseDown at view (\(loc.x), \(loc.y)) bounds=\(bounds)\n", stderr)
         // Ensure we have keyboard focus when clicked
         window?.makeFirstResponder(self)
         sendTouch(event, phase: kTouchPhaseBegan)
@@ -584,10 +586,12 @@ struct DeviceChromeView: View {
             let chromeH = screenH + bezelV * 2
 
             ZStack {
-                // Device bezel
+                // Device bezel — allowsHitTesting(false) ensures mouse events
+                // pass through to the SimulatorDisplayView underneath
                 RoundedRectangle(cornerRadius: cornerR)
                     .fill(Color(NSColor.darkGray))
                     .shadow(radius: 10)
+                    .allowsHitTesting(false)
 
                 // Screen area
                 VStack(spacing: 0) {
@@ -597,6 +601,7 @@ struct DeviceChromeView: View {
                     SimulatorDisplayRepresentable(frameLoader: frameLoader)
                         .frame(width: screenW, height: screenH)
                         .cornerRadius(8)
+                        .contentShape(Rectangle())  // ensure full frame is hit-testable
 
                     Spacer().frame(height: bezelV)
                 }
