@@ -62,6 +62,7 @@ extern void xpc_connection_cancel(xpc_connection_t connection);
 
 static mach_port_t g_broker_port = MACH_PORT_NULL;
 static int g_init_done = 0;
+static mach_port_t g_ws_cached_recv = MACH_PORT_NULL;
 
 /* Original function pointer for xpc_connection_create_mach_service.
  * Must use dlsym(RTLD_NEXT) because DYLD interposition redirects ALL
@@ -160,6 +161,16 @@ static void replacement_xpc_connection_resume(xpc_connection_t connection) {
                    *(mach_port_t *)(obj + 0x3c),
                    *(mach_port_t *)(obj + 0x38),
                    *(void **)(obj + 0x58));
+
+            /* Re-inject cached recv port AFTER resume overwrote it */
+            if (strstr(name, "frontboard.workspace") && g_ws_cached_recv != MACH_PORT_NULL) {
+                mach_port_t cur = *(mach_port_t *)(obj + 0x34);
+                if (cur != g_ws_cached_recv) {
+                    *(mach_port_t *)(obj + 0x34) = g_ws_cached_recv;
+                    *(mach_port_t *)(obj + 0x3c) = g_ws_cached_recv;
+                    sb_log("WORKSPACE_RE_INJECT: recv=0x%x (was 0x%x)", g_ws_cached_recv, cur);
+                }
+            }
         }
     }
 }
@@ -433,10 +444,47 @@ static xpc_connection_t replacement_xpc_connection_create_mach_service(
     if (flags & XPC_CONNECTION_MACH_SERVICE_LISTENER) {
         /* === LISTENER MODE === */
 
-        /* Call real function — bootstrap_fix trampolines handle routing */
-        /* Call real function — bootstrap_fix trampolines handle routing.
-         * The dispatch_mach_connect trampoline in bootstrap_fix.c swaps
-         * send→recv for known listener services. */
+        /* For workspace/systemappservices: get recv port BEFORE calling
+         * the real function. The real function's internal 805 will move
+         * the recv right away (broker sends MOVE_RECEIVE). By doing
+         * check_in first, we get the recv right. The real function's
+         * 805 then gets a fresh/dead port (doesn't matter). After
+         * it returns, we inject our cached recv port. */
+        /* For workspace: pre-check_in to get recv port, then create
+         * as CLIENT (flag=0) to avoid the LISTENER's dispatch_mach_connect
+         * with a dead port. Then inject recv port. The CLIENT path uses
+         * _xpc_connection_check_in which goes through our trampoline in
+         * bootstrap_fix.c — FORCE_LISTENER will handle it correctly. */
+        int is_ws_listener = (strstr(name, "frontboard.workspace") != NULL);
+        if (is_ws_listener) {
+            mach_port_t cached_recv = MACH_PORT_NULL;
+            kern_return_t kr = bootstrap_check_in(g_broker_port, name, &cached_recv);
+            sb_log("LISTENER_PRECHECK: '%s' check_in → recv=0x%x (kr=%d)",
+                   name, cached_recv, kr);
+            if (kr == KERN_SUCCESS && cached_recv != MACH_PORT_NULL) {
+                g_ws_cached_recv = cached_recv;
+            }
+
+            /* Create as CLIENT — this uses _xpc_connection_check_in
+             * (our trampoline) instead of the LISTENER internal path.
+             * FORCE_LISTENER in bootstrap_fix.c will detect the workspace
+             * name and handle it with the recv port. */
+            sb_log("xpc_create_mach_service CLIENT-FOR-LISTENER '%s'", name);
+            xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, 0);
+            sb_log("  CLIENT-FOR-LISTENER '%s' → %p", name, conn);
+
+            if (conn && cached_recv != MACH_PORT_NULL) {
+                uint8_t *obj = (uint8_t *)conn;
+                *(mach_port_t *)(obj + 0x34) = cached_recv;
+                *(mach_port_t *)(obj + 0x3c) = cached_recv;
+                sb_log("LISTENER_INJECT: '%s' recv=0x%x at +0x34", name, cached_recv);
+            }
+
+            sb_track_assertiond_conn(name, conn);
+            return conn;
+        }
+
+        /* Non-workspace LISTENER: pass through normally */
         sb_log("xpc_create_mach_service LISTENER '%s' — calling real function", name);
         if (g_real_xpc_create_mach_service) {
             xpc_connection_t conn = g_real_xpc_create_mach_service(name, targetq, flags);
@@ -866,6 +914,21 @@ static void replacement_exit_sb(int status) {
     _exit(status);
 }
 
+/* abort() interposition — catches bg thread XPC disconnect crashes.
+ * BKSEventFocusManager and other XPC handlers call abort() via
+ * std::terminate when their Mach channels are cancelled. */
+extern void abort(void);
+
+static void replacement_abort_sb(void) {
+    if (!pthread_main_np()) {
+        sb_log("RUNLOOP_FIX: abort() caught on bg thread — sleeping forever");
+        while (1) sleep(3600);
+    }
+    /* Main thread abort — let it through */
+    sb_log("RUNLOOP_FIX: abort() on main thread — passing through");
+    _exit(134); /* SIGABRT exit code */
+}
+
 __attribute__((used))
 static const interpose_t uiam_interposer[]
 __attribute__((section("__DATA,__interpose"))) = {
@@ -873,6 +936,8 @@ __attribute__((section("__DATA,__interpose"))) = {
       (const void *)UIApplicationMain },
     { (const void *)replacement_exit_sb,
       (const void *)exit },
+    { (const void *)replacement_abort_sb,
+      (const void *)abort },
 };
 
 /* ================================================================

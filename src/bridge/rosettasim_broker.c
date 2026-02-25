@@ -1547,22 +1547,9 @@ static void handle_xpc_launch_msg(mach_msg_header_t *request) {
             mach_port_insert_right(mach_task_self(), service_port, service_port,
                                     MACH_MSG_TYPE_MAKE_SEND);
 
-            /* For workspace/systemappservices: send COPY_SEND, keep recv right.
-             * FORCE_LISTENER in bootstrap_fix.c will get the recv right via
-             * MIG check_in later. Don't mark receive_moved. */
-            int is_ws_805 = (strstr(service_name, "frontboard.workspace") ||
-                              strstr(service_name, "frontboard.systemappservices"));
-            if (is_ws_805) {
-                broker_log("[broker] XPC 805 '%s': sending COPY_SEND (keeping recv for MIG check_in)\n",
-                           service_name);
-                handle_xpc_checkin_with_disposition(request, service_name, service_port,
-                                                     handle, MACH_MSG_TYPE_COPY_SEND);
-                /* DON'T set receive_moved — MIG check_in will move it later */
-            } else {
-                handle_xpc_checkin_with_disposition(request, service_name, service_port,
-                                                     handle, MACH_MSG_TYPE_MOVE_RECEIVE);
-                g_services[slot].receive_moved = 1;
-            }
+            handle_xpc_checkin_with_disposition(request, service_name, service_port,
+                                                 handle, MACH_MSG_TYPE_MOVE_RECEIVE);
+            g_services[slot].receive_moved = 1;
             return;
         }
 
