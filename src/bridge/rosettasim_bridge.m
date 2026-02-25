@@ -7181,6 +7181,28 @@ rowBytes, void *transform);
      * ROSETTASIM_RUNLOOP_PUMP=1: Manual pump that calls frame_capture_tick
      *   directly + drains run loop events. Use this if CFRunLoopTimer
      *   callbacks don't fire (observed with iOS 10.3 SDK under Rosetta 2). */
+    /* === CFRunLoop dispatch integration diagnostic ===
+     * Check the 5 conditions that __CFRunLoopRun needs for GCD integration.
+     * If any fails, the dispatch port is 0 and CFRunLoopRunInMode returns immediately. */
+    {
+        int is_main_thread = pthread_main_np();
+
+        typedef void *(*get_tsd_fn)(int);
+        get_tsd_fn getTSD = (get_tsd_fn)dlsym(RTLD_DEFAULT, "__CFGetTSD");
+        void *tsd4 = getTSD ? getTSD(4) : (void *)(uintptr_t)-1;
+
+        CFRunLoopRef main_rl = CFRunLoopGetMain();
+        CFRunLoopRef curr_rl = CFRunLoopGetCurrent();
+        int is_main_rl = (main_rl == curr_rl);
+
+        typedef mach_port_t (*get_port_fn)(void);
+        get_port_fn getPort = (get_port_fn)dlsym(RTLD_DEFAULT, "_dispatch_get_main_queue_port_4CF");
+        mach_port_t dispatch_port = getPort ? getPort() : 0;
+
+        bridge_log("CFRL_DIAG: main_thread=%d tsd4=%p main_rl=%p curr_rl=%p same=%d dispatch_port=0x%x getPort=%p",
+                   is_main_thread, tsd4, (void *)main_rl, (void *)curr_rl, is_main_rl, dispatch_port, (void *)getPort);
+    }
+
     if (getenv("ROSETTASIM_RUNLOOP_PUMP") && atoi(getenv("ROSETTASIM_RUNLOOP_PUMP"))) {
         bridge_log("  Starting manual run loop pump (~30 FPS, ROSETTASIM_RUNLOOP_PUMP=1)...");
         /* Resolve GCD main queue drain function once */
