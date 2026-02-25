@@ -838,11 +838,61 @@ static void *pfb_sync_thread(void *arg) {
     (void)arg;
     pfb_log("Sync thread started (60 Hz)");
 
+    /* Cache the display object for update calls */
+    static id g_cached_display = NULL;
+    static int g_update_logged = 0;
+
     while (g_running) {
         pfb_sync_to_shared();
 
         /* Check for app's context ID to create CALayerHost */
         pfb_check_context_id();
+
+        /* Trigger CAWindowServer display update cycle.
+         * This calls attach_contexts → add_context → set_display_info,
+         * binding registered contexts to the display for GPU compositing. */
+        if (!g_cached_display) {
+            Class wsClass = (Class)objc_getClass("CAWindowServer");
+            if (wsClass) {
+                id server = ((id(*)(id, SEL))objc_msgSend)(
+                    (id)wsClass, sel_registerName("server"));
+                if (server) {
+                    id displays = ((id(*)(id, SEL))objc_msgSend)(
+                        server, sel_registerName("displays"));
+                    if (displays) {
+                        unsigned long cnt = ((unsigned long(*)(id, SEL))objc_msgSend)(
+                            displays, sel_registerName("count"));
+                        if (cnt > 0) {
+                            g_cached_display = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                displays, sel_registerName("objectAtIndex:"), 0UL);
+                        }
+                    }
+                }
+            }
+        }
+        if (g_cached_display) {
+            ((void(*)(id, SEL))objc_msgSend)(g_cached_display, sel_registerName("update"));
+            if (!g_update_logged) {
+                g_update_logged = 1;
+                pfb_log("DISPLAY_UPDATE: calling [CAWindowServerDisplay update] each tick");
+            }
+            /* Periodic contextIdAtPosition check (every ~5s) */
+            {
+                static int _ctx_check = 0;
+                if (++_ctx_check >= 300) {
+                    _ctx_check = 0;
+                    typedef struct { double x; double y; } CGPoint_t;
+                    CGPoint_t center = { 375.0, 667.0 };
+                    SEL ctxSel = sel_registerName("contextIdAtPosition:");
+                    unsigned int cid = ((unsigned int(*)(id, SEL, CGPoint_t))objc_msgSend)(
+                        g_cached_display, ctxSel, center);
+                    Class caCtxCls = (Class)objc_getClass("CAContext");
+                    id ctxs = ((id(*)(id, SEL))objc_msgSend)((id)caCtxCls, sel_registerName("allContexts"));
+                    unsigned long cnt = ctxs ? ((unsigned long(*)(id, SEL))objc_msgSend)(ctxs, sel_registerName("count")) : 0;
+                    pfb_log("PERIODIC_CHECK: contextIdAtPosition=%u allContexts=%lu", cid, cnt);
+                }
+            }
+        }
 
         usleep(16667);  /* ~60 Hz */
     }

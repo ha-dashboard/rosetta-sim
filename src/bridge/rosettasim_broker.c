@@ -2787,10 +2787,9 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     /* CPU rendering default. GPU path: MIG 40400 sends OK but contextIdAtPosition
      * still returns 0. The per-client port routing needs further investigation.
      * Override: ROSETTASIM_CA_MODE=gpu to test GPU path. */
-    /* CPU default. GPU investigation: 4 contexts registered server-side but
-     * add_context never called (display binding missing). Need to trigger
-     * CA::WindowServer::Server::attach_contexts via display update cycle.
-     * Override: ROSETTASIM_CA_MODE=gpu to test GPU path. */
+    /* CPU default. GPU needs server-side display render cycle (attach_contexts).
+     * [CAWindowServerDisplay update] doesn't trigger it. Need to investigate
+     * _CASRenderDisplay or CA::Display::callback. ROSETTASIM_CA_MODE=gpu to test. */
     if (!ca_mode) env[ei++] = "ROSETTASIM_CA_MODE=cpu";
     if (env_bundle_exec[0]) env[ei++] = env_bundle_exec;
     if (env_bundle_path[0]) env[ei++] = env_bundle_path;
