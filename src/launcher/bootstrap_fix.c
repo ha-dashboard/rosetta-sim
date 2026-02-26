@@ -2010,7 +2010,7 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
 
                 /* Dump command opcodes from commit data */
                 static int _cmd_log = 0;
-                if (_cmd_log < 20) {
+                if (_cmd_log < 200) {
                     _cmd_log++;
                     uint8_t *cmd_data = NULL;
                     uint32_t cmd_size = 0;
@@ -2048,31 +2048,67 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         }
                     }
 
-                    if (cmd_data && cmd_size >= 32) {
-                        /* Dump first 64 bytes of command data */
-                        bfix_log("CMD_BYTES[%d]: size=%u first64:", _cmd_log, cmd_size);
-                        bfix_log("  %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
-                                 " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-                            cmd_data[0], cmd_data[1], cmd_data[2], cmd_data[3],
-                            cmd_data[4], cmd_data[5], cmd_data[6], cmd_data[7],
-                            cmd_data[8], cmd_data[9], cmd_data[10], cmd_data[11],
-                            cmd_data[12], cmd_data[13], cmd_data[14], cmd_data[15],
-                            cmd_data[16], cmd_data[17], cmd_data[18], cmd_data[19],
-                            cmd_data[20], cmd_data[21], cmd_data[22], cmd_data[23],
-                            cmd_data[24], cmd_data[25], cmd_data[26], cmd_data[27],
-                            cmd_data[28], cmd_data[29], cmd_data[30], cmd_data[31]);
-                        if (cmd_size >= 64) {
-                            bfix_log("  %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
-                                     " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-                                cmd_data[32], cmd_data[33], cmd_data[34], cmd_data[35],
-                                cmd_data[36], cmd_data[37], cmd_data[38], cmd_data[39],
-                                cmd_data[40], cmd_data[41], cmd_data[42], cmd_data[43],
-                                cmd_data[44], cmd_data[45], cmd_data[46], cmd_data[47],
-                                cmd_data[48], cmd_data[49], cmd_data[50], cmd_data[51],
-                                cmd_data[52], cmd_data[53], cmd_data[54], cmd_data[55],
-                                cmd_data[56], cmd_data[57], cmd_data[58], cmd_data[59],
-                                cmd_data[60], cmd_data[61], cmd_data[62], cmd_data[63]);
+                    if (cmd_data && cmd_size >= 16) {
+                        /* FULL SCAN: scan entire buffer for visual opcodes 0x02 and 0x03 */
+                        uint32_t count_02 = 0, count_03 = 0;
+                        /* Track first 5 offsets of each */
+                        uint32_t off_02[5] = {0}, off_03[5] = {0};
+                        /* Also build opcode histogram for all byte values seen at 4-byte boundaries
+                           (CA command stream uses 4-byte aligned opcodes) */
+                        uint32_t opcode_hist[256] = {0};
+                        for (uint32_t i = 0; i < cmd_size; i++) {
+                            if (cmd_data[i] == 0x02) {
+                                if (count_02 < 5) off_02[count_02] = i;
+                                count_02++;
+                            }
+                            if (cmd_data[i] == 0x03) {
+                                if (count_03 < 5) off_03[count_03] = i;
+                                count_03++;
+                            }
                         }
+                        /* Histogram at 4-byte aligned positions (likely opcode positions) */
+                        for (uint32_t i = 0; i + 3 < cmd_size; i += 4) {
+                            uint8_t op = cmd_data[i];
+                            opcode_hist[op]++;
+                        }
+                        bfix_log("FULL_SCAN[%d]: size=%u count_02=%u count_03=%u",
+                            _cmd_log, cmd_size, count_02, count_03);
+                        /* Log first 5 occurrences with context */
+                        for (uint32_t k = 0; k < 5 && k < count_02; k++) {
+                            uint32_t o = off_02[k];
+                            uint32_t cs = (o >= 4) ? o - 4 : 0;
+                            uint32_t ce = (o + 5 < cmd_size) ? o + 5 : cmd_size;
+                            bfix_log("  0x02[%u] @%u ctx:", k, o);
+                            char hex[128]; int hp = 0;
+                            for (uint32_t j = cs; j < ce && hp < 100; j++)
+                                hp += snprintf(hex + hp, sizeof(hex) - hp, "%02x ", cmd_data[j]);
+                            bfix_log("    %s", hex);
+                        }
+                        for (uint32_t k = 0; k < 5 && k < count_03; k++) {
+                            uint32_t o = off_03[k];
+                            uint32_t cs = (o >= 4) ? o - 4 : 0;
+                            uint32_t ce = (o + 5 < cmd_size) ? o + 5 : cmd_size;
+                            bfix_log("  0x03[%u] @%u ctx:", k, o);
+                            char hex[128]; int hp = 0;
+                            for (uint32_t j = cs; j < ce && hp < 100; j++)
+                                hp += snprintf(hex + hp, sizeof(hex) - hp, "%02x ", cmd_data[j]);
+                            bfix_log("    %s", hex);
+                        }
+                        /* Log non-zero aligned opcode histogram entries */
+                        bfix_log("  ALIGNED_HIST (4-byte):");
+                        for (int h = 0; h < 256; h++) {
+                            if (opcode_hist[h] > 0)
+                                bfix_log("    op=0x%02x count=%u", h, opcode_hist[h]);
+                        }
+                        /* Also log running totals across all commits */
+                        static uint64_t total_bytes = 0, total_02 = 0, total_03 = 0;
+                        static int total_commits = 0;
+                        total_bytes += cmd_size;
+                        total_02 += count_02;
+                        total_03 += count_03;
+                        total_commits++;
+                        bfix_log("  CUMULATIVE: commits=%d bytes=%llu total_02=%llu total_03=%llu",
+                            total_commits, total_bytes, total_02, total_03);
                     }
                 }
             }
