@@ -344,10 +344,6 @@ static BOOL refresh_device(DeviceDisplay *dd) {
 
     /* --- IOSurface path: zero-copy CGImage wrapping shared surface memory --- */
     if (dd->iosurface) {
-        /* Skip if surface hasn't changed (seed increments on lock/unlock cycles) */
-        uint32_t seed = IOSurfaceGetSeed(dd->iosurface);
-        if (seed == dd->last_seed) return NO;
-        dd->last_seed = seed;
 
         void *base = IOSurfaceGetBaseAddress(dd->iosurface);
         size_t bpr = IOSurfaceGetBytesPerRow(dd->iosurface);
