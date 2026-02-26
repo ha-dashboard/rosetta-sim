@@ -141,8 +141,12 @@ static void attempt_injection(void) {
                 continue;
             }
 
-            NSLog(@"[inject] surfaceLayer: %@ bounds=%@",
-                  g_surface_layer, NSStringFromRect(g_surface_layer.bounds));
+            /* Set contentsScale for @2x Retina display */
+            g_surface_layer.contentsScale = 2.0;
+            g_surface_layer.contentsGravity = kCAGravityResize;
+            NSLog(@"[inject] surfaceLayer: %@ bounds=%@ contentsScale=%.1f",
+                  g_surface_layer, NSStringFromRect(g_surface_layer.bounds),
+                  g_surface_layer.contentsScale);
 
             /* Do first refresh immediately */
             refresh_surface(nil);
