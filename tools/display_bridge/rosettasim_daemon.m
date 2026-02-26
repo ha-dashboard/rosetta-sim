@@ -408,8 +408,11 @@ static BOOL is_legacy_runtime(id device) {
         NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
                            sel_registerName("runtimeIdentifier"));
         if (!rtId) return NO;
-        /* Legacy = iOS 9.x or 10.x (uses PurpleFBServer) */
-        return [rtId containsString:@"iOS-9"] || [rtId containsString:@"iOS-10"];
+        if (![rtId containsString:@"iOS-9"] && ![rtId containsString:@"iOS-10"]) return NO;
+        /* Verify device has a valid device type profile */
+        id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
+        if (!deviceType) return NO;
+        return YES;
     } @catch (id e) {
         return NO;
     }
