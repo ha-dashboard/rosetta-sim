@@ -341,21 +341,27 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         if (!dd->layer_ref) return NO;
     }
 
-    /* --- IOSurface path (zero-copy): set surface directly on layer --- */
+    /* --- IOSurface path: CGImage from shared IOSurface (no file I/O) --- */
     if (dd->iosurface) {
-        CALayer *layer = DEVICE_LAYER(dd);
-        /* Set IOSurface as layer contents — backboardd updates it in-place */
-        if (layer.contents != (__bridge id)dd->iosurface) {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            layer.contents = (__bridge id)dd->iosurface;
-            [CATransaction commit];
-            static int s_log_count = 0;
-            if (s_log_count++ < 3)
-                NSLog(@"[inject] '%s': set IOSurface id=%u as layer.contents", dd->name, dd->surface_id);
+        IOSurfaceLock(dd->iosurface, kIOSurfaceLockReadOnly, NULL);
+        void *base = IOSurfaceGetBaseAddress(dd->iosurface);
+        size_t bpr = IOSurfaceGetBytesPerRow(dd->iosurface);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(base, dd->width, dd->height,
+            8, bpr, cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        if (ctx) {
+            CGImageRef img = CGBitmapContextCreateImage(ctx);
+            if (img) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                DEVICE_LAYER(dd).contents = (__bridge id)img;
+                [CATransaction commit];
+                CGImageRelease(img);
+            }
+            CGContextRelease(ctx);
         }
-        /* Force layer to re-read surface contents */
-        [layer setNeedsDisplay];
+        CGColorSpaceRelease(cs);
+        IOSurfaceUnlock(dd->iosurface, kIOSurfaceLockReadOnly, NULL);
         return YES;
     }
 
