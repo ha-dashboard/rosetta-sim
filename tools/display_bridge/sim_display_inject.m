@@ -419,13 +419,11 @@ static void retry_injection(void) {
 static IMP g_orig_setHardwareKeyboard = NULL;
 
 static BOOL swizzled_setHardwareKeyboardEnabled(id self, SEL _cmd, BOOL enabled, id keyboardType, NSError **error) {
-    @try {
-        typedef BOOL (*OrigFn)(id, SEL, BOOL, id, NSError **);
-        return ((OrigFn)g_orig_setHardwareKeyboard)(self, _cmd, enabled, keyboardType, error);
-    } @catch (id e) {
-        NSLog(@"[inject] Caught exception in setHardwareKeyboardEnabled: %@ (ignored)", e);
-        return YES;
-    }
+    /* Never call original — legacy device bridge returns garbage that causes
+     * SIGSEGV in objc_storeStrong (ARC retains corrupt pointer before any
+     * ObjC exception). Safe to skip: keyboard config is non-critical. */
+    (void)self; (void)_cmd; (void)enabled; (void)keyboardType; (void)error;
+    return YES;
 }
 
 static void install_keyboard_swizzle(void) {
