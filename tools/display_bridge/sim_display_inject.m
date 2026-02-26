@@ -181,8 +181,43 @@ static void load_single_device(void) {
 
 /* --- Refresh a single device display --- */
 
+/* Check if a window still has a valid renderable view + surfaceLayer */
+static CALayer *rescan_window_layer(NSWindow *win) {
+    NSView *renderable = find_renderable_view(win.contentView);
+    if (!renderable) return nil;
+    return get_surface_layer(renderable);
+}
+
 static void refresh_device(DeviceDisplay *dd) {
     if (!dd->layer_ref || !dd->read_buf || !dd->fb_path[0]) return;
+
+    /* Check layer is still in the view hierarchy — Simulator.app may have replaced it */
+    CALayer *layer = DEVICE_LAYER(dd);
+    if (!layer.superlayer) {
+        NSLog(@"[inject] Layer for '%s' lost superlayer — re-scanning", dd->name);
+        /* Find the window matching this device and re-scan */
+        for (NSWindow *win in [NSApp windows]) {
+            BOOL match = dd->name[0]
+                ? [win.title containsString:[NSString stringWithUTF8String:dd->name]]
+                : (find_renderable_view(win.contentView) != nil);
+            if (match) {
+                CALayer *newLayer = rescan_window_layer(win);
+                if (newLayer && newLayer != layer) {
+                    device_set_layer(dd, newLayer);
+                    newLayer.contentsScale = dd->scale;
+                    newLayer.contentsGravity = kCAGravityResize;
+                    NSLog(@"[inject] Re-attached to new layer for '%s'", dd->name);
+                } else if (!newLayer) {
+                    device_set_layer(dd, nil);
+                    dd->active = NO;
+                    NSLog(@"[inject] No renderable view found for '%s'", dd->name);
+                    return;
+                }
+                break;
+            }
+        }
+        if (!dd->layer_ref) return;
+    }
 
     int fd = open(dd->fb_path, O_RDONLY);
     if (fd < 0) return;
@@ -396,12 +431,11 @@ static void inject_init(void) {
     NSLog(@"[inject] sim_display_inject loaded into %s (pid=%d)",
           getprogname(), getpid());
 
-    /* Install keyboard crash fix immediately (before any SimDevice calls) */
-    install_keyboard_swizzle();
-
-    /* Wait for Simulator.app to finish launching and create windows */
+    /* Wait for Simulator.app to finish launching, then install fixes and scan windows */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
+        /* Install keyboard crash fix (must be after Simulator init completes) */
+        install_keyboard_swizzle();
         retry_injection();
     });
 }

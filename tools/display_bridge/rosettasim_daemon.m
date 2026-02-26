@@ -173,12 +173,21 @@ static void cleanup_device_files(DeviceContext *ctx) {
  * PurpleFB message handler (per-device)
  * ================================================================ */
 
+static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg);
+
 static void handle_msg_for_device(DeviceContext *ctx) {
+    /* Drain ALL pending messages — dispatch_source coalesces events */
     uint8_t buf[4096];
     mach_msg_header_t *msg = (mach_msg_header_t *)buf;
-    kern_return_t kr = mach_msg(msg, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                 0, sizeof(buf), ctx->service_port, 0, MACH_PORT_NULL);
-    if (kr) return;
+    for (;;) {
+        kern_return_t kr = mach_msg(msg, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                     0, sizeof(buf), ctx->service_port, 0, MACH_PORT_NULL);
+        if (kr) break;  /* no more messages */
+        handle_one_msg(ctx, msg);
+    }
+}
+
+static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
 
     if (msg->msgh_id == 4 && msg->msgh_remote_port) {
         /* map_surface — reply with framebuffer info */
@@ -197,13 +206,14 @@ static void handle_msg_for_device(DeviceContext *ctx) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        r.pt_width = (uint32_t)(ctx->pixel_width / ctx->scale);
-        r.pt_height = (uint32_t)(ctx->pixel_height / ctx->scale);
+        /* TEST STEP 1: revert pt_width to pixel dims (was pixel/scale) */
+        r.pt_width = ctx->pixel_width;
+        r.pt_height = ctx->pixel_height;
 
-        kr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
+        kern_return_t skr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
                       0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u)",
-              ctx->name, kr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row);
+              ctx->name, skr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row);
 
     } else if (msg->msgh_id == 3) {
         /* flush_shmem — reply and dump pixels */
