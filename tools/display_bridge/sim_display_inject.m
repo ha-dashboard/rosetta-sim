@@ -42,9 +42,9 @@ typedef struct {
     BOOL     active;
 } DeviceDisplay;
 
-#define MAX_DEVICES 8
-static DeviceDisplay g_devices[MAX_DEVICES];
+static DeviceDisplay *g_devices = NULL;
 static int g_device_count = 0;
+static int g_device_capacity = 0;
 static NSTimer *g_refresh_timer = nil;
 static int g_frame_count = 0;
 static BOOL g_multi_device_mode = NO;
@@ -101,9 +101,15 @@ static BOOL load_multi_device_list(void) {
     }
     if (!devices || ![devices isKindOfClass:[NSArray class]]) return NO;
 
+    int count = (int)[devices count];
+    if (count > g_device_capacity) {
+        g_devices = realloc(g_devices, count * sizeof(DeviceDisplay));
+        memset(g_devices + g_device_capacity, 0, (count - g_device_capacity) * sizeof(DeviceDisplay));
+        g_device_capacity = count;
+    }
+
     g_device_count = 0;
     for (NSDictionary *dev in devices) {
-        if (g_device_count >= MAX_DEVICES) break;
         NSString *udid = dev[@"udid"];
         NSString *name = dev[@"name"];
         NSNumber *w = dev[@"width"];
