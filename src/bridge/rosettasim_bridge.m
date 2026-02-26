@@ -9155,17 +9155,52 @@ static void replacement_copyRenderLayer(id self, SEL _cmd, void *renderLayer,
     /* Check CALayer.backgroundColor BEFORE encoding */
     void *preBg = ((void*(*)(id,SEL))objc_msgSend)(self, sel_registerName("backgroundColor"));
 
+    /* Check renderLayer content BEFORE original */
+    int pre_nz = 0;
+    if (renderLayer && g_crl_log_count <= 5) {
+        uint8_t *rl = (uint8_t *)renderLayer;
+        for (int i = 0; i < 256; i++) if (rl[i]) pre_nz++;
+    }
+
     /* Call original */
     ((void(*)(id, SEL, void*, unsigned char, void*))g_orig_copyRenderLayer)(
         self, _cmd, renderLayer, layerFlags, commitFlags);
 
-    /* AFTER encoding: read Render::Layer+0x10 for backgroundColor */
-    if (g_crl_log_count <= 30 && renderLayer) {
-        float *bg = (float *)((uint8_t *)renderLayer + 0x10);
-        uint8_t opacity = *(uint8_t *)((uint8_t *)renderLayer + 0x20);
-        bridge_log("CRL_ENCODED[%d]: class=%s cgBg=%p RL_bg=[%.3f,%.3f,%.3f,%.3f] opacity=%u",
+    /* Check renderLayer content AFTER original */
+    int post_nz = 0;
+    if (renderLayer && g_crl_log_count <= 5) {
+        uint8_t *rl = (uint8_t *)renderLayer;
+        for (int i = 0; i < 256; i++) if (rl[i]) post_nz++;
+        bridge_log("CRL_DELTA[%d]: pre_nz=%d post_nz=%d (changed=%d bytes in first 256)",
+            g_crl_log_count, pre_nz, post_nz, post_nz - pre_nz);
+    }
+
+    /* AFTER encoding: dump Render::Layer to find backgroundColor */
+    if (g_crl_log_count <= 5 && renderLayer) {
+        float *bg10 = (float *)((uint8_t *)renderLayer + 0x10);
+        uint8_t opacity20 = *(uint8_t *)((uint8_t *)renderLayer + 0x20);
+        bridge_log("CRL_ENCODED[%d]: class=%s cgBg=%p RL+0x10=[%.3f,%.3f,%.3f,%.3f] op=%u",
             g_crl_log_count, object_getClassName(self), preBg,
-            bg[0], bg[1], bg[2], bg[3], (unsigned)opacity);
+            bg10[0], bg10[1], bg10[2], bg10[3], (unsigned)opacity20);
+
+        /* Dump full Render::Layer as floats to find color values */
+        float *fl = (float *)renderLayer;
+        bridge_log("  RL floats[0-15]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+            fl[0],fl[1],fl[2],fl[3],fl[4],fl[5],fl[6],fl[7],
+            fl[8],fl[9],fl[10],fl[11],fl[12],fl[13],fl[14],fl[15]);
+        bridge_log("  RL floats[16-31]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+            fl[16],fl[17],fl[18],fl[19],fl[20],fl[21],fl[22],fl[23],
+            fl[24],fl[25],fl[26],fl[27],fl[28],fl[29],fl[30],fl[31]);
+        bridge_log("  RL floats[32-47]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+            fl[32],fl[33],fl[34],fl[35],fl[36],fl[37],fl[38],fl[39],
+            fl[40],fl[41],fl[42],fl[43],fl[44],fl[45],fl[46],fl[47]);
+
+        /* Scan for 1.0 values (red = [1,0,0,1]) — look for consecutive 1.0 */
+        for (int fi = 0; fi < 80; fi++) {
+            if (fl[fi] > 0.9f && fl[fi] < 1.1f) {
+                bridge_log("  RL float[%d]=%.3f (@+0x%x)", fi, fl[fi], fi * 4);
+            }
+        }
     }
 }
 
