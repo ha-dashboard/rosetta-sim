@@ -2204,23 +2204,36 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         bfix_log("  CUMULATIVE: commits=%d bytes=%llu total_02=%llu total_03=%llu",
                             total_commits, total_bytes, total_02, total_03);
 
-                        /* FLOAT_SCAN: Search for float 1.0 (0x3f800000) — indicates color values */
+                        /* FLOAT_SCAN: Search for color patterns in commit data */
                         {
                             uint32_t *words = (uint32_t *)cmd_data;
                             uint32_t nwords = cmd_size / 4;
                             int float_hits = 0;
+                            int red_pattern = 0; /* [1.0, 0.0, 0.0, 1.0] */
+                            int any_color = 0;   /* any [x, y, z, 1.0] where x|y|z > 0 */
                             for (uint32_t fi = 0; fi + 3 < nwords; fi++) {
-                                if (words[fi] == 0x3f800000) { /* float 1.0 */
-                                    if (float_hits < 10) {
-                                        bfix_log("  FLOAT_1.0 @%u: [%.3f, %.3f, %.3f, %.3f]",
-                                            fi * 4,
-                                            *(float *)&words[fi], *(float *)&words[fi+1],
-                                            *(float *)&words[fi+2], *(float *)&words[fi+3]);
-                                    }
+                                if (words[fi] == 0x3f800000) {
                                     float_hits++;
+                                    /* Check for RED: [1.0, 0.0, 0.0, 1.0] */
+                                    if (words[fi+1] == 0 && words[fi+2] == 0 && words[fi+3] == 0x3f800000) {
+                                        red_pattern++;
+                                        bfix_log("  RED_FOUND @%u: [1.0, 0.0, 0.0, 1.0] !!!", fi * 4);
+                                    }
+                                    /* Check for any RGBA with a=1.0: [?, ?, ?, 1.0] */
+                                    if (fi >= 3 && words[fi] == 0x3f800000) {
+                                        float r = *(float *)&words[fi-3], g = *(float *)&words[fi-2], b = *(float *)&words[fi-1];
+                                        if ((r > 0.01f || g > 0.01f || b > 0.01f) &&
+                                            r >= 0.0f && r <= 1.0f && g >= 0.0f && g <= 1.0f && b >= 0.0f && b <= 1.0f) {
+                                            any_color++;
+                                            if (any_color <= 5)
+                                                bfix_log("  COLOR_RGBA @%u: [%.3f, %.3f, %.3f, 1.0]",
+                                                    (fi-3) * 4, r, g, b);
+                                        }
+                                    }
                                 }
                             }
-                            bfix_log("  FLOAT_SCAN: %d occurrences of 1.0f in %u bytes", float_hits, cmd_size);
+                            bfix_log("  FLOAT_SCAN: hits=%d red=%d colors=%d in %u bytes",
+                                float_hits, red_pattern, any_color, cmd_size);
                         }
 
                         /* DECODE_TRACE: Try to parse as CA command stream.
