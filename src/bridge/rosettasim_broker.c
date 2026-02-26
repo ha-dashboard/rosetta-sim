@@ -2834,14 +2834,12 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
         if (fp) { fprintf(fp, "%u\n", g_broker_port); fclose(fp); }
     }
 
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);
-
+    /* Don't set TASK_BOOTSTRAP_PORT via posix_spawnattr — it's unreliable under
+     * Rosetta 2. Instead, the app discovers the broker via macOS bootstrap lookup
+     * of "com.rosettasim.broker" in its constructor (bootstrap_fix.c). */
     char *argv[] = { exec_path, NULL };
     pid_t pid;
-    int result = posix_spawn(&pid, exec_path, NULL, &attr, argv, env);
-    posix_spawnattr_destroy(&attr);
+    int result = posix_spawn(&pid, exec_path, NULL, NULL, argv, env);
 
     if (result != 0) {
         broker_log("[broker] app spawn failed: %s\n", strerror(result));
@@ -2943,6 +2941,16 @@ int main(int argc, char *argv[]) {
 
     /* Write PID file */
     write_pid_file();
+
+    /* Register broker with REAL macOS bootstrap so apps can find us
+     * even when posix_spawnattr_setspecialport_np fails under Rosetta 2. */
+    {
+        kern_return_t bkr = bootstrap_register(bootstrap_port, "com.rosettasim.broker", g_broker_port);
+        broker_log("[broker] bootstrap_register(com.rosettasim.broker) = %d\n", bkr);
+        if (bkr != KERN_SUCCESS) {
+            broker_log("[broker] WARNING: could not register with macOS bootstrap\n");
+        }
+    }
 
     /* Pre-create MachServices from daemon plists.
      * These must exist BEFORE daemons spawn so their XPC listeners

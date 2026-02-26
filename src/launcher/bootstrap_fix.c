@@ -3997,28 +3997,29 @@ static void bootstrap_fix_constructor(void) {
     }
 
     mach_port_t bp = get_bootstrap_port();
-    bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
+    bfix_log("[bfix] constructor: TASK_BOOTSTRAP_PORT = 0x%x, bootstrap_port = 0x%x\n", bp, bootstrap_port);
 
-    /* If bootstrap port is dead, WAIT for the broker to set it via task_set_special_port.
-     * The broker retries task_for_pid + task_set_special_port in a loop after spawn. */
+    /* If the bootstrap port is the broker's (valid, set by posix_spawnattr for daemons),
+     * use it directly. If it's dead/invalid (app process), discover the broker
+     * via the REAL macOS bootstrap. */
     if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-        bfix_log("[bfix] constructor: bootstrap port invalid (0x%x), waiting for broker...\n", bp);
-        for (int retry = 0; retry < 100; retry++) {
-            usleep(20000); /* 20ms */
-            task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
-            if (bp != MACH_PORT_NULL && bp != (mach_port_t)-1) {
-                mach_port_type_t pt = 0;
-                mach_port_type(mach_task_self(), bp, &pt);
-                if (pt & MACH_PORT_TYPE_SEND) {
-                    bfix_log("[bfix] constructor: bootstrap port recovered: 0x%x after %dms\n",
-                        bp, (retry + 1) * 20);
-                    break;
-                }
+        /* App process: inherited real macOS bootstrap. Look up broker. */
+        mach_port_t macos_bp = bootstrap_port; /* the real macOS bootstrap */
+        if (macos_bp != MACH_PORT_NULL && macos_bp != (mach_port_t)-1) {
+            mach_port_t broker = MACH_PORT_NULL;
+            kern_return_t lkr = bootstrap_look_up(macos_bp, "com.rosettasim.broker", &broker);
+            bfix_log("[bfix] constructor: macOS bootstrap lookup 'com.rosettasim.broker': kr=%d port=0x%x\n",
+                lkr, broker);
+            if (lkr == KERN_SUCCESS && broker != MACH_PORT_NULL) {
+                bp = broker;
+                task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
+                bootstrap_port = bp;
+                bfix_log("[bfix] constructor: SWITCHED to broker port 0x%x via macOS bootstrap!\n", bp);
+            } else {
+                bfix_log("[bfix] constructor: broker not found via macOS bootstrap\n");
             }
-            bp = MACH_PORT_NULL; /* reset for next iteration */
-        }
-        if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-            bfix_log("[bfix] constructor: bootstrap port NOT recovered after 2s!\n");
+        } else {
+            bfix_log("[bfix] constructor: no valid macOS bootstrap port either\n");
         }
     }
 
