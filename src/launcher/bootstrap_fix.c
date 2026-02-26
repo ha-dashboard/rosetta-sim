@@ -2164,6 +2164,26 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         }
                     }
 
+                    /* SHMEM_PTR_CHECK: For 40003 (OOL commits), check if Shmem header
+                     * contains an untranslated client-side pointer at +0x1c */
+                    if (msg->msgh_id == 40003 && cmd_data && cmd_size >= 0x30) {
+                        uint32_t magic = *(uint32_t *)(cmd_data + 0x14);
+                        void *cmd_ptr = *(void **)(cmd_data + 0x1c);
+                        uint32_t cmd_len = *(uint32_t *)(cmd_data + 0x28);
+                        int in_range = ((uintptr_t)cmd_ptr >= (uintptr_t)cmd_data &&
+                                        (uintptr_t)cmd_ptr < (uintptr_t)cmd_data + cmd_size);
+                        bfix_log("SHMEM_PTR: magic=0x%x cmd_ptr=%p cmd_len=%u base=%p end=%p in_range=%d",
+                            magic, cmd_ptr, cmd_len, cmd_data, cmd_data + cmd_size, in_range);
+                        if (!in_range && cmd_ptr != NULL) {
+                            bfix_log("SHMEM_PTR: *** CLIENT-SIDE POINTER DETECTED! cmd_ptr=%p is NOT in OOL [%p..%p] ***",
+                                cmd_ptr, cmd_data, cmd_data + cmd_size);
+                            /* Dump first 0x30 bytes of Shmem header */
+                            uint64_t *hw = (uint64_t *)cmd_data;
+                            bfix_log("SHMEM_HDR: +00=%016llx +08=%016llx +10=%016llx +18=%016llx +20=%016llx +28=%016llx",
+                                hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
+                        }
+                    }
+
                     if (cmd_data && cmd_size >= 16) {
                         /* FULL SCAN: scan entire buffer for visual opcodes 0x02 and 0x03 */
                         uint32_t count_02 = 0, count_03 = 0;
@@ -3835,31 +3855,53 @@ static void bootstrap_fix_constructor(void) {
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
 
-    /* If bootstrap port is dead (0xffffffff), try to recover from broker's file */
+    /* If bootstrap port is dead, recover via macOS bootstrap lookup.
+     * The broker registers "com.rosettasim.broker" with the REAL macOS bootstrap.
+     * Even when posix_spawnattr fails, the child can find it via the host bootstrap. */
     if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-        FILE *fp = fopen("/tmp/rosettasim_broker_port", "r");
-        if (fp) {
-            unsigned int file_port = 0;
-            if (fscanf(fp, "%u", &file_port) == 1 && file_port != 0) {
-                /* The port name from the file is in the BROKER's namespace.
-                 * We need to use bootstrap_look_up with the real macOS bootstrap
-                 * to find the broker. But we don't have a valid bootstrap port...
-                 * Instead, try setting the port directly — it might work if
-                 * the port name was inherited via posix_spawn. */
-                bp = (mach_port_t)file_port;
-                mach_port_type_t pt = 0;
-                kern_return_t tkr = mach_port_type(mach_task_self(), bp, &pt);
-                bfix_log("[bfix] constructor: recovered port 0x%x from file, type=0x%x kr=%d\n",
-                    bp, pt, tkr);
-                if (tkr != KERN_SUCCESS || !(pt & MACH_PORT_TYPE_SEND)) {
-                    bfix_log("[bfix] constructor: recovered port is NOT valid send right\n");
-                    bp = MACH_PORT_NULL;
-                } else {
-                    task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
-                    bfix_log("[bfix] constructor: set TASK_BOOTSTRAP_PORT = 0x%x from file\n", bp);
-                }
+        /* Get the REAL macOS bootstrap port (not the sim's) */
+        mach_port_t host_bp = MACH_PORT_NULL;
+        /* The real bootstrap is available via the host special port or
+         * by reading the bootstrap_port global BEFORE we overwrite it.
+         * Since bootstrap_port is already 0xffffffff, try host_get_special_port. */
+        extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+
+        /* Try all possible bootstrap ports: the global, the special port, and port 0x80b (common macOS bootstrap) */
+        mach_port_t try_ports[] = { bootstrap_port, MACH_PORT_NULL };
+        task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &try_ports[1]);
+
+        for (int ti = 0; ti < 2; ti++) {
+            if (try_ports[ti] == MACH_PORT_NULL || try_ports[ti] == (mach_port_t)-1) continue;
+            mach_port_t broker = MACH_PORT_NULL;
+            kern_return_t lkr = bootstrap_look_up(try_ports[ti], "com.rosettasim.broker", &broker);
+            bfix_log("[bfix] constructor: broker lookup via port 0x%x: kr=%d broker=0x%x\n",
+                try_ports[ti], lkr, broker);
+            if (lkr == KERN_SUCCESS && broker != MACH_PORT_NULL) {
+                bp = broker;
+                task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
+                bfix_log("[bfix] constructor: RECOVERED broker port 0x%x via macOS bootstrap!\n", bp);
+                break;
             }
-            fclose(fp);
+        }
+
+        /* Also try reading from file as last resort */
+        if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
+            FILE *fp = fopen("/tmp/rosettasim_broker_port", "r");
+            if (fp) {
+                unsigned int file_port = 0;
+                if (fscanf(fp, "%u", &file_port) == 1 && file_port != 0) {
+                    bp = (mach_port_t)file_port;
+                    mach_port_type_t pt = 0;
+                    kern_return_t tkr = mach_port_type(mach_task_self(), bp, &pt);
+                    if (tkr == KERN_SUCCESS && (pt & MACH_PORT_TYPE_SEND)) {
+                        task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
+                        bfix_log("[bfix] constructor: recovered port 0x%x from file\n", bp);
+                    } else {
+                        bp = MACH_PORT_NULL;
+                    }
+                }
+                fclose(fp);
+            }
         }
     }
 

@@ -2956,6 +2956,13 @@ int main(int argc, char *argv[]) {
 
     broker_log("[broker] broker port created: 0x%x\n", g_broker_port);
 
+    /* Register broker port with REAL macOS bootstrap so children can find it
+     * even when posix_spawnattr_setspecialport_np fails under Rosetta 2. */
+    {
+        kern_return_t bkr = bootstrap_register(bootstrap_port, "com.rosettasim.broker", g_broker_port);
+        broker_log("[broker] bootstrap_register(com.rosettasim.broker) = %d\n", bkr);
+    }
+
     /* Write PID file */
     write_pid_file();
 
