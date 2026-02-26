@@ -2844,6 +2844,21 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
 
     broker_log("[broker] app spawned with pid %d\n", pid);
 
+    /* FIX: posix_spawnattr_setspecialport_np doesn't work reliably under Rosetta 2.
+     * Explicitly set the child's bootstrap port via task_set_special_port. */
+    {
+        mach_port_t child_task = MACH_PORT_NULL;
+        kern_return_t tkr = task_for_pid(mach_task_self(), pid, &child_task);
+        if (tkr == KERN_SUCCESS && child_task != MACH_PORT_NULL) {
+            kern_return_t skr = task_set_special_port(child_task, TASK_BOOTSTRAP_PORT, g_broker_port);
+            broker_log("[broker] task_set_special_port on app pid=%d: kr=%d (child_task=0x%x)\n",
+                pid, skr, child_task);
+            mach_port_deallocate(mach_task_self(), child_task);
+        } else {
+            broker_log("[broker] task_for_pid(%d) failed: kr=%d — bootstrap port not set!\n", pid, tkr);
+        }
+    }
+
     /* Write PID + bundle-id for SpringBoard-side lifecycle shims.
      * In strict mode, SpringBoard may fail bootstrap early if it cannot
      * produce a BSProcessHandle for the app (normally provided via

@@ -1606,6 +1606,17 @@ static void _pcr_do_render(void) {
                     continue;
                 }
 
+                /* Read Render::Layer visual properties (Agent A layout) */
+                {
+                    float *bg = (float *)((uint8_t *)root_layer + 0x10);
+                    uint8_t opacity = *(uint8_t *)((uint8_t *)root_layer + 0x20);
+                    void *contents = *(void **)((uint8_t *)root_layer + 0x60);
+                    void *sublayers = *(void **)((uint8_t *)root_layer + 0x70);
+                    bfix_log("  RENDER_LAYER[%llu]: bg=[%.3f,%.3f,%.3f,%.3f] opacity=%u contents=%p sublayers=%p",
+                        (unsigned long long)ci, bg[0], bg[1], bg[2], bg[3],
+                        (unsigned)opacity, contents, sublayers);
+                }
+
                 /* Scan root layer for dimension-like doubles */
                 int found_dims = 0;
                 for (int off = 0x20; off < 0x200 && !found_dims; off += 8) {
