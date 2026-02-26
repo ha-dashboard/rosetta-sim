@@ -1477,7 +1477,7 @@ static void _pcr_do_render(void) {
         bfix_log("POST_COMMIT_RENDER[%d]: render_for_time on thread='%s'",
             g_pcr_render_count, tname[0] ? tname : "(unnamed)");
 
-        if (g_pcr_render_count <= 5 || g_pcr_render_count == 100 || g_pcr_render_count == 500 || g_pcr_render_count == 1000) {
+        if (g_pcr_render_count <= 5 || g_pcr_render_count == 20 || g_pcr_render_count == 50 || g_pcr_render_count == 100 || g_pcr_render_count == 200 || g_pcr_render_count == 500 || g_pcr_render_count == 1000) {
             /* Check SWContext pixel buffer (FRESH read after render) */
             void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
             if (swctx) {
@@ -1570,6 +1570,23 @@ static void _pcr_do_render(void) {
                 }
                 if (!found_dims)
                     bfix_log("  ROOT: no dimension-like doubles found");
+
+                /* Scan root layer for non-zero heap pointers (contents/backing store?) */
+                if (g_pcr_render_count == 5) {
+                    bfix_log("  ROOT_SCAN: scanning +0x80 to +0x200 for heap ptrs");
+                    for (int off = 0x80; off < 0x200; off += 8) {
+                        uint64_t val = *(uint64_t *)((uint8_t *)root_layer + off);
+                        if (val > 0x100000000ULL && val < 0x800000000000ULL) {
+                            bfix_log("  ROOT+0x%03x = %p (heap ptr?)", off, (void *)val);
+                        } else if (val != 0 && val != 0xFFFFFFFFFFFFFFFFULL) {
+                            /* Non-zero, non-pointer value — could be color/float */
+                            double dval = *(double *)((uint8_t *)root_layer + off);
+                            if (dval > 0.0 && dval < 1000.0) {
+                                bfix_log("  ROOT+0x%03x = 0x%llx (%.4f)", off, val, dval);
+                            }
+                        }
+                    }
+                }
 
                 /* Sublayer array at +0x70 */
                 void *sub_array = *(void **)((uint8_t *)root_layer + 0x70);

@@ -4134,6 +4134,31 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         _layer_check_count++;
         if (_layer_check_count == 60) { /* ~2s at 30fps */
             @autoreleasepool {
+                /* BG_FORCE: Set backgroundColor on UIWindow + rootVC.view to test commit path */
+                {
+                    id _app = ((id(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                    id _win = _app ? ((id(*)(id,SEL))objc_msgSend)(_app, sel_registerName("keyWindow")) : nil;
+                    if (_win) {
+                        id redColor = ((id(*)(id,SEL))objc_msgSend)(
+                            (id)objc_getClass("UIColor"), sel_registerName("redColor"));
+                        ((void(*)(id,SEL,id))objc_msgSend)(_win, sel_registerName("setBackgroundColor:"), redColor);
+
+                        id _vc = ((id(*)(id,SEL))objc_msgSend)(_win, sel_registerName("rootViewController"));
+                        if (_vc) {
+                            id _v = ((id(*)(id,SEL))objc_msgSend)(_vc, sel_registerName("view"));
+                            if (_v) {
+                                id blueColor = ((id(*)(id,SEL))objc_msgSend)(
+                                    (id)objc_getClass("UIColor"), sel_registerName("blueColor"));
+                                ((void(*)(id,SEL,id))objc_msgSend)(_v, sel_registerName("setBackgroundColor:"), blueColor);
+                            }
+                        }
+                        ((void(*)(id,SEL))objc_msgSend)(
+                            (id)objc_getClass("CATransaction"), sel_registerName("flush"));
+                        bridge_log("BG_FORCE: set window=RED rootVC.view=BLUE flushed");
+                    }
+                }
+
                 /* 1. Window and root VC */
                 id app = ((id(*)(id,SEL))objc_msgSend)(
                     (id)objc_getClass("UIApplication"),
@@ -5038,37 +5063,17 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
             }
         }
 
-        /* HYBRID: temporarily set server_port=0 so renderInContext treats the
-         * context as LOCAL. With a REMOTE context (server_port != 0),
-         * renderInContext tries to sync with CARenderServer and crashes. */
-        uint32_t saved_srv_port = 0;
-        void *srv_port_addr = NULL;
-        {
-            Ivar lcI2 = class_getInstanceVariable(
-                object_getClass(_bridge_root_window), "_layerContext");
-            id lctx2 = lcI2 ? *(id *)((uint8_t *)_bridge_root_window +
-                                        ivar_getOffset(lcI2)) : nil;
-            if (lctx2) {
-                Ivar implI2 = class_getInstanceVariable(object_getClass(lctx2), "_impl");
-                if (implI2) {
-                    void *imp2 = *(void **)((uint8_t *)lctx2 + ivar_getOffset(implI2));
-                    if (imp2) {
-                        srv_port_addr = (uint8_t *)imp2 + 0x98;
-                        saved_srv_port = *(uint32_t *)srv_port_addr;
-                        *(uint32_t *)srv_port_addr = 0;
-                    }
-                }
-            }
-        }
+        /* REMOVED: port zeroing at impl+0x98.
+         * Session 24: zeroing the port causes commit_transaction to SKIP encoding
+         * because commit_transaction checks Context+0x98: if zero → skip.
+         * This was zeroing the port 30x/sec, racing with CA commits.
+         * renderInContext may crash with a REMOTE context, but that's preferable
+         * to silently preventing ALL server commits from encoding layer data.
+         * TODO: if renderInContext crashes, catch with sigsetjmp. */
 
         /* Render the layer tree into the local buffer */
         ((void(*)(id, SEL, void *))objc_msgSend)(
             layer, sel_registerName("renderInContext:"), ctx);
-
-        /* Restore server_port for CARenderServer communication */
-        if (srv_port_addr) {
-            *(uint32_t *)srv_port_addr = saved_srv_port;
-        }
 
         _cg_Release(ctx);
 
@@ -7166,11 +7171,48 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                 }
                                             }
 
+                                            /* === BG_TEST: Set backgroundColor on root + sublayers === */
+                                            {
+                                                id bgKw = kw;
+                                                if (bgKw) {
+                                                    id rootLayer = ((id(*)(id, SEL))objc_msgSend)(bgKw, sel_registerName("layer"));
+                                                    if (rootLayer) {
+                                                        /* Set RED backgroundColor on root layer */
+                                                        id redColor = ((id(*)(id, SEL))objc_msgSend)(
+                                                            (id)objc_getClass("UIColor"), sel_registerName("redColor"));
+                                                        void *redCG = ((void *(*)(id, SEL))objc_msgSend)(redColor, sel_registerName("CGColor"));
+                                                        ((void(*)(id, SEL, void *))objc_msgSend)(
+                                                            rootLayer, sel_registerName("setBackgroundColor:"), redCG);
+                                                        bridge_log("BG_TEST: set RED bg on root layer %p", (void *)rootLayer);
+
+                                                        /* Set GREEN backgroundColor on all sublayers */
+                                                        id subs = ((id(*)(id, SEL))objc_msgSend)(rootLayer, sel_registerName("sublayers"));
+                                                        unsigned long subCount = subs ? [(NSArray *)subs count] : 0;
+                                                        if (subCount > 0) {
+                                                            id greenColor = ((id(*)(id, SEL))objc_msgSend)(
+                                                                (id)objc_getClass("UIColor"), sel_registerName("greenColor"));
+                                                            void *greenCG = ((void *(*)(id, SEL))objc_msgSend)(greenColor, sel_registerName("CGColor"));
+                                                            for (unsigned long si = 0; si < subCount && si < 10; si++) {
+                                                                id sub = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                                                    subs, sel_registerName("objectAtIndex:"), si);
+                                                                ((void(*)(id, SEL, void *))objc_msgSend)(
+                                                                    sub, sel_registerName("setBackgroundColor:"), greenCG);
+                                                            }
+                                                            bridge_log("BG_TEST: set GREEN bg on %lu sublayers", subCount);
+                                                        }
+
+                                                        /* Also set opaque to ensure no transparency issues */
+                                                        ((void(*)(id, SEL, BOOL))objc_msgSend)(
+                                                            rootLayer, sel_registerName("setOpaque:"), YES);
+                                                    }
+                                                }
+                                            }
+
                                             /* Flush to push everything to server */
                                             ((void(*)(id, SEL))objc_msgSend)(
                                                 (id)objc_getClass("CATransaction"),
                                                 sel_registerName("flush"));
-                                            bridge_log("Display Pipeline [delayed]: Flushed after invalidation");
+                                            bridge_log("Display Pipeline [delayed]: Flushed after invalidation + BG_TEST");
 
                                             /* Post-flush: check if commits happened + fix server_port */
                                             {
