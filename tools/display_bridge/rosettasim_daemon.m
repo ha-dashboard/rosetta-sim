@@ -347,6 +347,7 @@ static void activate_device(DeviceContext *ctx, id device) {
         (id)kIOSurfaceBytesPerRow:     @(ctx->bytes_per_row),
         (id)kIOSurfacePixelFormat:     @(0x42475241),
         (id)kIOSurfaceAllocSize:       @(ctx->surface_alloc),
+        (id)kIOSurfaceIsGlobal:        @YES,
     };
     ctx->iosurface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (!ctx->iosurface) {
