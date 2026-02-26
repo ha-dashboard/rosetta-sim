@@ -1585,8 +1585,9 @@ static void _pcr_do_render(void) {
                 /* Dump context fields to find server port and flags.
                  * Scan uint32s looking for port-sized values (1000-65535 range) */
                 uint32_t *ctx32 = (uint32_t *)ctx;
-                bfix_log("CTX[%llu]: id=%u seed=%u handle=%p",
-                    (unsigned long long)ci, cid, commit_seed, root_handle);
+                bfix_log("CTX[%llu]: id=%u seed=%u handle=%p +0x98=%u +0xa0=%u +0xa8=%u",
+                    (unsigned long long)ci, cid, commit_seed, root_handle,
+                    ctx32[0x98/4], ctx32[0xa0/4], ctx32[0xa8/4]);
                 if (g_pcr_render_count <= 2 && ci == 0) {
                     /* Dump first 64 uint32s of context to map layout */
                     for (int off32 = 0; off32 < 64; off32 += 8) {
@@ -2022,8 +2023,13 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         commit_ports[n_commit_ports++] = cp;
 
                     static int _cpm_log = 0;
-                    if (_cpm_log < 5 && g_pcr_rft_srv) {
+                    if (_cpm_log < 10) {
                         _cpm_log++;
+                        if (!g_pcr_rft_srv) {
+                            bfix_log("CTX_PORT_MATCH[%d]: commit_port=%u (server not init, %d unique)",
+                                _cpm_log, cp, n_commit_ports);
+                            goto cpm_done;
+                        }
                         void *srv = g_pcr_rft_srv;
                         void **ctx_list = *(void ***)((uint8_t *)srv + 0x68);
                         uint64_t ctx_count = *(uint64_t *)((uint8_t *)srv + 0x78);
@@ -2056,6 +2062,7 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                 pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%u ", commit_ports[i]);
                             bfix_log("  commit_ports: %s", pbuf);
                         }
+                        cpm_done:;
                     }
                 }
 
