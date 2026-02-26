@@ -4134,6 +4134,60 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
         _layer_check_count++;
         if (_layer_check_count == 60) { /* ~2s at 30fps */
             @autoreleasepool {
+                /* APP_CTX: Dump ALL context ports to find which have port=0 (skip encoding) */
+                {
+                    Class ctxCls = (Class)objc_getClass("CAContext");
+                    if (ctxCls) {
+                        id allCtxs = ((id(*)(id,SEL))objc_msgSend)((id)ctxCls, sel_registerName("allContexts"));
+                        unsigned long ctxCount = allCtxs ? [(NSArray *)allCtxs count] : 0;
+                        bridge_log("APP_CTX: %lu contexts in app process", ctxCount);
+                        for (unsigned long ci = 0; ci < ctxCount && ci < 10; ci++) {
+                            id ctx = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                                allCtxs, sel_registerName("objectAtIndex:"), ci);
+                            unsigned int cid = ((unsigned int(*)(id,SEL))objc_msgSend)(
+                                ctx, sel_registerName("contextId"));
+                            id layer = ((id(*)(id,SEL))objc_msgSend)(ctx, sel_registerName("layer"));
+                            Ivar implI = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                            uint32_t port98 = 0;
+                            uint8_t dead_d0 = 0;
+                            void *encoder_a0 = NULL;
+                            if (implI) {
+                                void *impl = *(void **)((uint8_t *)ctx + ivar_getOffset(implI));
+                                if (impl) {
+                                    port98 = *(uint32_t *)((uint8_t *)impl + 0x98);
+                                    dead_d0 = *(uint8_t *)((uint8_t *)impl + 0xd0);
+                                    encoder_a0 = *(void **)((uint8_t *)impl + 0xa0);
+                                }
+                            }
+                            bridge_log("APP_CTX[%lu]: id=%u port=0x%x dead=%d encoder=%p layer=%p class=%s",
+                                ci, cid, port98, dead_d0 & 1, encoder_a0, (void *)layer,
+                                class_getName(object_getClass(ctx)));
+                        }
+
+                        /* Also check UIWindow._layerContext specifically */
+                        id _a2 = ((id(*)(id,SEL))objc_msgSend)(
+                            (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                        id _kw2 = _a2 ? ((id(*)(id,SEL))objc_msgSend)(_a2, sel_registerName("keyWindow")) : nil;
+                        if (_kw2) {
+                            Ivar lcI = class_getInstanceVariable(objc_getClass("UIWindow"), "_layerContext");
+                            id lc = lcI ? *(id *)((uint8_t *)_kw2 + ivar_getOffset(lcI)) : nil;
+                            bridge_log("APP_CTX: UIWindow._layerContext=%p", (void *)lc);
+                            if (lc) {
+                                unsigned int wCid = ((unsigned int(*)(id,SEL))objc_msgSend)(
+                                    lc, sel_registerName("contextId"));
+                                Ivar implI2 = class_getInstanceVariable(object_getClass(lc), "_impl");
+                                if (implI2) {
+                                    void *impl2 = *(void **)((uint8_t *)lc + ivar_getOffset(implI2));
+                                    if (impl2) {
+                                        uint32_t p2 = *(uint32_t *)((uint8_t *)impl2 + 0x98);
+                                        bridge_log("APP_CTX: window ctx id=%u port=0x%x", wCid, p2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 /* BG_FORCE: Set backgroundColor on UIWindow + rootVC.view to test commit path */
                 {
                     id _app = ((id(*)(id,SEL))objc_msgSend)(
