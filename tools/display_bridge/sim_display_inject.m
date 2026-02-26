@@ -25,6 +25,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 /* --- Per-device display state --- */
 
@@ -40,6 +41,7 @@ typedef struct {
     void     *layer_ref;  /* CFRetain'd CALayer* — use DEVICE_LAYER() to access */
     uint8_t  *read_buf;
     BOOL     active;
+    time_t   last_mtime;  /* last seen modification time of fb file */
 } DeviceDisplay;
 
 #define DEVICE_LAYER(dd) ((__bridge CALayer *)(dd)->layer_ref)
@@ -52,7 +54,7 @@ static void device_set_layer(DeviceDisplay *dd, CALayer *layer) {
 static DeviceDisplay *g_devices = NULL;
 static int g_device_count = 0;
 static int g_device_capacity = 0;
-static NSTimer *g_refresh_timer = nil;
+static id g_display_link = nil; /* CADisplayLink or NSTimer fallback */
 static int g_frame_count = 0;
 static BOOL g_multi_device_mode = NO;
 
@@ -277,8 +279,9 @@ static CALayer *rescan_window_layer(NSWindow *win) {
     return get_surface_layer(renderable);
 }
 
-static void refresh_device(DeviceDisplay *dd) {
-    if (!dd->layer_ref || !dd->read_buf || !dd->fb_path[0]) return;
+/* Returns YES if a new frame was displayed */
+static BOOL refresh_device(DeviceDisplay *dd) {
+    if (!dd->layer_ref || !dd->read_buf || !dd->fb_path[0]) return NO;
 
     /* Check layer is still in the view hierarchy — Simulator.app may have replaced it */
     CALayer *layer = DEVICE_LAYER(dd);
@@ -300,19 +303,26 @@ static void refresh_device(DeviceDisplay *dd) {
                     device_set_layer(dd, nil);
                     dd->active = NO;
                     NSLog(@"[inject] No renderable view found for '%s'", dd->name);
-                    return;
+                    return NO;
                 }
                 break;
             }
         }
-        if (!dd->layer_ref) return;
+        if (!dd->layer_ref) return NO;
     }
 
+    /* Check if file changed (mtime) before expensive read */
+    struct stat st;
+    if (stat(dd->fb_path, &st) != 0) return NO;
+    if (st.st_mtimespec.tv_sec == dd->last_mtime && st.st_size == (off_t)dd->fb_size)
+        return NO; /* no change */
+    dd->last_mtime = st.st_mtimespec.tv_sec;
+
     int fd = open(dd->fb_path, O_RDONLY);
-    if (fd < 0) return;
+    if (fd < 0) return NO;
     ssize_t nread = read(fd, dd->read_buf, dd->fb_size);
     close(fd);
-    if (nread < (ssize_t)dd->fb_size) return;
+    if (nread < (ssize_t)dd->fb_size) return NO;
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(dd->read_buf, dd->width, dd->height,
@@ -329,23 +339,33 @@ static void refresh_device(DeviceDisplay *dd) {
         CGContextRelease(ctx);
     }
     CGColorSpaceRelease(cs);
+    return YES;
 }
 
 /* Forward declarations */
 static void attempt_injection(void);
 static BOOL g_injection_done;
 
-/* --- 30fps refresh timer callback --- */
+/* --- CADisplayLink tick — vsync-aligned, zero-cost when idle --- */
 
-static void refresh_all(NSTimer *timer) {
+static NSTimeInterval g_last_rescan = 0;
+
+/* ObjC target for CADisplayLink (or NSTimer fallback) */
+@interface RosettaSimRefreshTarget : NSObject
+- (void)tick:(id)sender;
+@end
+
+@implementation RosettaSimRefreshTarget
+- (void)tick:(id)sender {
     g_frame_count++;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
 
     if (g_multi_device_mode) {
-        /* Periodically reload device list (every 5s) */
-        if (g_frame_count % 150 == 0) {
+        /* Reload device list every 5s */
+        if (now - g_last_rescan > 5.0) {
+            g_last_rescan = now;
             int prev_count = g_device_count;
             load_multi_device_list();
-            /* If new devices appeared, re-scan windows to match them */
             if (g_device_count > prev_count) {
                 NSLog(@"[inject] New devices in JSON (%d → %d) — re-scanning windows",
                       prev_count, g_device_count);
@@ -358,13 +378,12 @@ static void refresh_all(NSTimer *timer) {
                 refresh_device(&g_devices[i]);
         }
     } else {
-        /* Single-device fallback */
         load_single_device();
         if (g_single_device.active)
             refresh_device(&g_single_device);
     }
 
-    /* Count active devices and re-scan if all lost */
+    /* Count active and re-scan if all lost */
     int active = 0;
     if (g_multi_device_mode) {
         for (int i = 0; i < g_device_count; i++)
@@ -373,17 +392,20 @@ static void refresh_all(NSTimer *timer) {
         active = 1;
     }
 
-    /* Re-scan every 5s if no active devices (layer may have been released) */
-    if (active == 0 && g_frame_count % 150 == 0) {
+    if (active == 0 && now - g_last_rescan > 5.0) {
+        g_last_rescan = now;
         NSLog(@"[inject] No active devices — re-scanning windows...");
         g_injection_done = NO;
         attempt_injection();
     }
 
-    if (g_frame_count <= 3 || g_frame_count % 300 == 0) {
-        NSLog(@"[inject] frame %d: %d active device(s)", g_frame_count, active);
+    if (g_frame_count <= 3 || g_frame_count % 1800 == 0) {
+        NSLog(@"[inject] tick %d: %d active device(s)", g_frame_count, active);
     }
 }
+@end
+
+static RosettaSimRefreshTarget *g_refresh_target = nil;
 
 /* --- Match windows to devices and set up layers --- */
 
@@ -470,19 +492,39 @@ static void attempt_injection(void) {
         }
     }
 
-    if (connected > 0) {
-        NSLog(@"[inject] Connected %d device(s). Starting 30fps refresh.", connected);
+    if (connected > 0 && !g_display_link) {
+        if (!g_refresh_target)
+            g_refresh_target = [[RosettaSimRefreshTarget alloc] init];
 
-        if (g_refresh_timer) {
-            [g_refresh_timer invalidate];
-            g_refresh_timer = nil;
+        /* Try CADisplayLink (macOS 14+) for vsync-aligned rendering */
+        Class dlClass = NSClassFromString(@"CADisplayLink");
+        if (dlClass) {
+            g_display_link = [dlClass displayLinkWithTarget:g_refresh_target
+                                                   selector:@selector(tick:)];
+            /* Prefer 60fps, allow 10-120fps range */
+            @try {
+                SEL setPref = sel_registerName("setPreferredFrameRateRange:");
+                typedef struct { float min, max, preferred; } CAFrameRateRange;
+                CAFrameRateRange range = {10, 120, 60};
+                ((void(*)(id, SEL, CAFrameRateRange))objc_msgSend)(
+                    g_display_link, setPref, range);
+            } @catch (id e) { /* pre-macOS 15 — no frame rate range */ }
+            [g_display_link addToRunLoop:[NSRunLoop mainRunLoop]
+                                 forMode:NSRunLoopCommonModes];
+            NSLog(@"[inject] Connected %d device(s). CADisplayLink active (vsync).", connected);
+        } else {
+            /* Fallback: NSTimer at 60fps */
+            NSTimer *t = [NSTimer timerWithTimeInterval:1.0/60.0 repeats:YES
+                                                  block:^(NSTimer *timer) {
+                [g_refresh_target tick:timer];
+            }];
+            [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+            g_display_link = t;
+            NSLog(@"[inject] Connected %d device(s). NSTimer fallback at 60fps.", connected);
         }
-        g_refresh_timer = [NSTimer timerWithTimeInterval:1.0/30.0 repeats:YES
-                                                   block:^(NSTimer *t) { refresh_all(t); }];
-        [[NSRunLoop mainRunLoop] addTimer:g_refresh_timer forMode:NSRunLoopCommonModes];
 
         /* First frame immediately */
-        refresh_all(nil);
+        [g_refresh_target tick:nil];
     }
 }
 
