@@ -197,8 +197,8 @@ static void handle_msg_for_device(DeviceContext *ctx) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        r.pt_width = ctx->pixel_width;
-        r.pt_height = ctx->pixel_height;
+        r.pt_width = (uint32_t)(ctx->pixel_width / ctx->scale);
+        r.pt_height = (uint32_t)(ctx->pixel_height / ctx->scale);
 
         kr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
                       0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
@@ -230,8 +230,22 @@ static void handle_msg_for_device(DeviceContext *ctx) {
             }
         }
 
-        if (ctx->flush_count <= 5 || ctx->flush_count % 100 == 0)
+        /* Periodic pixel stats for diagnostics */
+        if (ctx->surface_base && (ctx->flush_count <= 10 || ctx->flush_count % 50 == 0)) {
+            uint32_t *px = (uint32_t *)ctx->surface_base;
+            int nz = 0;
+            for (uint32_t i = 0; i < ctx->pixel_width * ctx->pixel_height; i++) {
+                uint8_t r = (px[i] >> 16) & 0xFF;
+                uint8_t g = (px[i] >> 8) & 0xFF;
+                uint8_t b = px[i] & 0xFF;
+                if (r || g || b) nz++;
+            }
+            NSLog(@"[daemon] %s: flush #%d: %d/%d non-zero RGB (%.0f%%)",
+                  ctx->name, ctx->flush_count, nz, ctx->pixel_width * ctx->pixel_height,
+                  100.0 * nz / (ctx->pixel_width * ctx->pixel_height));
+        } else if (ctx->flush_count <= 5 || ctx->flush_count % 100 == 0) {
             NSLog(@"[daemon] %s: flush #%d", ctx->name, ctx->flush_count);
+        }
 
     } else if (msg->msgh_id == 1011) {
         /* Display state change */

@@ -37,10 +37,17 @@ typedef struct {
     uint32_t bpr;
     uint32_t fb_size;
     float    scale;
-    CALayer  *__unsafe_unretained layer;  /* surfaceLayer for this device */
+    void     *layer_ref;  /* CFRetain'd CALayer* — use DEVICE_LAYER() to access */
     uint8_t  *read_buf;
     BOOL     active;
 } DeviceDisplay;
+
+#define DEVICE_LAYER(dd) ((__bridge CALayer *)(dd)->layer_ref)
+
+static void device_set_layer(DeviceDisplay *dd, CALayer *layer) {
+    if (dd->layer_ref) CFRelease(dd->layer_ref);
+    dd->layer_ref = layer ? (void *)CFRetain((__bridge CFTypeRef)layer) : NULL;
+}
 
 static DeviceDisplay *g_devices = NULL;
 static int g_device_count = 0;
@@ -126,7 +133,7 @@ static BOOL load_multi_device_list(void) {
         dd->scale   = s ? s.floatValue : 2.0f;
         dd->bpr     = dd->width * 4;
         dd->fb_size = dd->bpr * dd->height;
-        dd->layer   = nil;
+        device_set_layer(dd, nil);
         dd->active  = NO;
         if (!dd->read_buf || dd->fb_size > dd->bpr * dd->height) {
             free(dd->read_buf);
@@ -175,7 +182,7 @@ static void load_single_device(void) {
 /* --- Refresh a single device display --- */
 
 static void refresh_device(DeviceDisplay *dd) {
-    if (!dd->layer || !dd->read_buf || !dd->fb_path[0]) return;
+    if (!dd->layer_ref || !dd->read_buf || !dd->fb_path[0]) return;
 
     int fd = open(dd->fb_path, O_RDONLY);
     if (fd < 0) return;
@@ -191,7 +198,7 @@ static void refresh_device(DeviceDisplay *dd) {
         if (img) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            dd->layer.contents = (__bridge id)img;
+            DEVICE_LAYER(dd).contents = (__bridge id)img;
             [CATransaction commit];
             CGImageRelease(img);
         }
@@ -277,7 +284,7 @@ static void attempt_injection(void) {
             for (int i = 0; i < g_device_count; i++) {
                 DeviceDisplay *dd = &g_devices[i];
                 if ([title containsString:[NSString stringWithUTF8String:dd->name]]) {
-                    dd->layer = layer;
+                    device_set_layer(dd, layer);
                     dd->active = YES;
                     layer.contentsScale = dd->scale;
                     layer.contentsGravity = kCAGravityResize;
@@ -294,7 +301,7 @@ static void attempt_injection(void) {
         } else {
             /* Single-device: use first window with a renderable view */
             load_single_device();
-            g_single_device.layer = layer;
+            device_set_layer(&g_single_device, layer);
             g_single_device.active = YES;
             layer.contentsScale = g_single_device.scale;
             layer.contentsGravity = kCAGravityResize;
@@ -353,10 +360,44 @@ static void retry_injection(void) {
     }
 }
 
+/* --- Keyboard crash fix: swizzle setHardwareKeyboardEnabled:keyboardType:error: --- */
+
+static IMP g_orig_setHardwareKeyboard = NULL;
+
+static BOOL swizzled_setHardwareKeyboardEnabled(id self, SEL _cmd, BOOL enabled, id keyboardType, NSError **error) {
+    @try {
+        typedef BOOL (*OrigFn)(id, SEL, BOOL, id, NSError **);
+        return ((OrigFn)g_orig_setHardwareKeyboard)(self, _cmd, enabled, keyboardType, error);
+    } @catch (id e) {
+        NSLog(@"[inject] Caught exception in setHardwareKeyboardEnabled: %@ (ignored)", e);
+        return YES;
+    }
+}
+
+static void install_keyboard_swizzle(void) {
+    /* SimDevice is loaded from CoreSimulator.framework */
+    Class cls = objc_getClass("SimDevice");
+    if (!cls) {
+        NSLog(@"[inject] SimDevice class not found — keyboard swizzle skipped");
+        return;
+    }
+    SEL sel = sel_registerName("setHardwareKeyboardEnabled:keyboardType:error:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        NSLog(@"[inject] setHardwareKeyboardEnabled: method not found — swizzle skipped");
+        return;
+    }
+    g_orig_setHardwareKeyboard = method_setImplementation(m, (IMP)swizzled_setHardwareKeyboardEnabled);
+    NSLog(@"[inject] Installed keyboard crash swizzle on SimDevice");
+}
+
 __attribute__((constructor))
 static void inject_init(void) {
     NSLog(@"[inject] sim_display_inject loaded into %s (pid=%d)",
           getprogname(), getpid());
+
+    /* Install keyboard crash fix immediately (before any SimDevice calls) */
+    install_keyboard_swizzle();
 
     /* Wait for Simulator.app to finish launching and create windows */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC),
