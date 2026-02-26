@@ -90,6 +90,76 @@ static CALayer *get_surface_layer(NSView *renderableView) {
     return renderableView.layer;
 }
 
+/* --- Helper: extract device UDID from a Simulator.app window --- */
+
+static NSString *extract_udid_from_window(NSWindow *win) {
+    /* Try windowController → device → UDID */
+    @try {
+        id wc = win.windowController;
+        if (wc) {
+            /* Try KVC paths that Simulator's DeviceCoordinator might expose */
+            for (NSString *path in @[@"device.UDID", @"device.udid",
+                                      @"simDevice.UDID", @"simDevice.udid",
+                                      @"deviceUDID"]) {
+                @try {
+                    id val = [wc valueForKeyPath:path];
+                    if ([val isKindOfClass:[NSUUID class]])
+                        return [val UUIDString];
+                    if ([val isKindOfClass:[NSString class]] && [val length] == 36)
+                        return val;
+                } @catch (id e) { /* try next path */ }
+            }
+        }
+    } @catch (id e) { /* no windowController */ }
+
+    /* Try window's contentViewController.representedObject */
+    @try {
+        id vc = win.contentViewController;
+        if (vc) {
+            for (NSString *path in @[@"representedObject.UDID",
+                                      @"representedObject.udid",
+                                      @"representedObject.device.UDID",
+                                      @"device.UDID", @"deviceUDID"]) {
+                @try {
+                    id val = [vc valueForKeyPath:path];
+                    if ([val isKindOfClass:[NSUUID class]])
+                        return [val UUIDString];
+                    if ([val isKindOfClass:[NSString class]] && [val length] == 36)
+                        return val;
+                } @catch (id e) { /* try next */ }
+            }
+        }
+    } @catch (id e) { /* no contentViewController */ }
+
+    /* Try SimDisplayView.device (the SimDisplayView wraps the renderable view) */
+    @try {
+        NSView *renderable = find_renderable_view(win.contentView);
+        if (renderable) {
+            /* Walk up to SimDisplayView (parent of SimDisplayRenderableView) */
+            NSView *displayView = renderable.superview;
+            while (displayView) {
+                const char *cls = object_getClassName(displayView);
+                if (cls && strstr(cls, "SimDisplayView")) {
+                    @try {
+                        id dev = [displayView valueForKey:@"device"];
+                        if (dev) {
+                            @try {
+                                id udid = [dev valueForKey:@"UDID"];
+                                if ([udid isKindOfClass:[NSUUID class]])
+                                    return [udid UUIDString];
+                            } @catch (id e) { /* no UDID on device */ }
+                        }
+                    } @catch (id e) { /* no device on view */ }
+                    break;
+                }
+                displayView = displayView.superview;
+            }
+        }
+    } @catch (id e) { /* view walk failed */ }
+
+    return nil; /* couldn't extract UDID — fall back to name matching */
+}
+
 /* --- Load device list from daemon or single bridge --- */
 
 static BOOL load_multi_device_list(void) {
@@ -272,8 +342,16 @@ static void refresh_all(NSTimer *timer) {
 
     if (g_multi_device_mode) {
         /* Periodically reload device list (every 5s) */
-        if (g_frame_count % 150 == 0)
+        if (g_frame_count % 150 == 0) {
+            int prev_count = g_device_count;
             load_multi_device_list();
+            /* If new devices appeared, re-scan windows to match them */
+            if (g_device_count > prev_count) {
+                NSLog(@"[inject] New devices in JSON (%d → %d) — re-scanning windows",
+                      prev_count, g_device_count);
+                attempt_injection();
+            }
+        }
 
         for (int i = 0; i < g_device_count; i++) {
             if (g_devices[i].active)
@@ -333,24 +411,49 @@ static void attempt_injection(void) {
               title, NSStringFromRect(layer.bounds));
 
         if (g_multi_device_mode) {
-            /* Match window title to device name */
-            BOOL matched = NO;
-            for (int i = 0; i < g_device_count; i++) {
-                DeviceDisplay *dd = &g_devices[i];
-                if ([title containsString:[NSString stringWithUTF8String:dd->name]]) {
-                    device_set_layer(dd, layer);
-                    dd->active = YES;
-                    layer.contentsScale = dd->scale;
-                    layer.contentsGravity = kCAGravityResize;
-                    NSLog(@"[inject] Matched '%s' → window '%@' (%ux%u @%.0fx)",
-                          dd->name, title, dd->width, dd->height, dd->scale);
-                    connected++;
-                    matched = YES;
-                    break;
+            /* Match by UDID first (reliable), fall back to longest name match */
+            int match_idx = -1;
+
+            /* Try UDID extraction from Simulator.app object graph */
+            NSString *winUDID = extract_udid_from_window(win);
+            if (winUDID) {
+                for (int i = 0; i < g_device_count; i++) {
+                    if (strcmp(g_devices[i].udid, winUDID.UTF8String) == 0) {
+                        match_idx = i;
+                        break;
+                    }
                 }
+                if (match_idx >= 0)
+                    NSLog(@"[inject] UDID match: %@ → '%s'", winUDID, g_devices[match_idx].name);
             }
-            if (!matched) {
-                NSLog(@"[inject] Window '%@' — no matching device in daemon list", title);
+
+            /* Fall back to longest name match if UDID extraction failed */
+            if (match_idx < 0) {
+                size_t best_len = 0;
+                for (int i = 0; i < g_device_count; i++) {
+                    NSString *name = [NSString stringWithUTF8String:g_devices[i].name];
+                    if ([title containsString:name] && name.length > best_len) {
+                        match_idx = i;
+                        best_len = name.length;
+                    }
+                }
+                if (match_idx >= 0)
+                    NSLog(@"[inject] Name match: '%s' → window '%@' (len=%zu)",
+                          g_devices[match_idx].name, title, best_len);
+            }
+
+            if (match_idx >= 0) {
+                DeviceDisplay *dd = &g_devices[match_idx];
+                device_set_layer(dd, layer);
+                dd->active = YES;
+                layer.contentsScale = dd->scale;
+                layer.contentsGravity = kCAGravityResize;
+                NSLog(@"[inject] Connected '%s' → window '%@' (%ux%u @%.0fx)",
+                      dd->name, title, dd->width, dd->height, dd->scale);
+                connected++;
+            } else {
+                NSLog(@"[inject] Window '%@' — no matching device (UDID=%@)",
+                      title, winUDID ?: @"unknown");
             }
         } else {
             /* Single-device: use first window with a renderable view */
