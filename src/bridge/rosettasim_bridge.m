@@ -4213,13 +4213,20 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     }
                 }
 
-                /* LAYER_FLAGS_CHECK: Read CA::Layer internal flags at Layer+0x4 */
+                /* LAYER_FLAGS_CHECK: Discover CALayer internal struct layout */
                 {
                     Class calayerCls = (Class)objc_getClass("CALayer");
-                    Ivar attrIvar = calayerCls ? class_getInstanceVariable(calayerCls, "_attr") : NULL;
-                    if (attrIvar) {
-                        ptrdiff_t attrOff = ivar_getOffset(attrIvar);
-                        bridge_log("LAYER_FLAGS: _attr ivar offset = %td", attrOff);
+                    if (calayerCls) {
+                        /* List ALL ivars */
+                        unsigned int ivarCount = 0;
+                        Ivar *ivars = class_copyIvarList(calayerCls, &ivarCount);
+                        bridge_log("LAYER_IVARS: CALayer has %u ivars:", ivarCount);
+                        for (unsigned int iv = 0; iv < ivarCount && iv < 20; iv++) {
+                            bridge_log("  [%u] '%s' offset=%td type='%s'",
+                                iv, ivar_getName(ivars[iv]), ivar_getOffset(ivars[iv]),
+                                ivar_getTypeEncoding(ivars[iv]) ?: "?");
+                        }
+                        if (ivars) free(ivars);
 
                         id _lf_app = ((id(*)(id,SEL))objc_msgSend)(
                             (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
@@ -4227,85 +4234,29 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                         id _lf_root = _lf_win ? ((id(*)(id,SEL))objc_msgSend)(_lf_win, sel_registerName("layer")) : nil;
 
                         if (_lf_root) {
-                            void *attrPtr = *(void **)((uint8_t *)(void *)_lf_root + attrOff);
-                            bridge_log("LAYER_FLAGS: rootLayer=%p attrPtr=%p", (void *)_lf_root, attrPtr);
-                            if (attrPtr) {
-                                uint64_t *aw = (uint64_t *)attrPtr;
-                                bridge_log("LAYER_FLAGS: attr[0]=0x%llx attr[1]=0x%llx attr[2]=0x%llx attr[3]=0x%llx",
-                                    aw[0], aw[1], aw[2], aw[3]);
+                            /* Dump raw memory of the CALayer object */
+                            uint64_t *raw = (uint64_t *)(void *)_lf_root;
+                            bridge_log("LAYER_RAW: rootLayer=%p dump:", (void *)_lf_root);
+                            for (int ri = 0; ri < 20; ri++) {
+                                bridge_log("  +0x%02x = 0x%016llx", ri * 8, raw[ri]);
+                            }
 
-                                uint32_t flags_direct = *(uint32_t *)((uint8_t *)attrPtr + 0x4);
-                                uint32_t changed_direct = *(uint32_t *)((uint8_t *)attrPtr + 0x2c);
-                                bridge_log("LAYER_FLAGS: attr+0x4 = 0x%08x bit25=%d bit17=%d bit18=%d  attr+0x2c=0x%08x",
-                                    flags_direct, (flags_direct >> 25) & 1,
-                                    (flags_direct >> 17) & 1, (flags_direct >> 18) & 1, changed_direct);
-
-                                void *layerPtr = *(void **)((uint8_t *)attrPtr + 0x8);
-                                if (layerPtr && (uintptr_t)layerPtr > 0x1000 && (uintptr_t)layerPtr < 0x800000000000ULL) {
-                                    uint32_t flags_indirect = *(uint32_t *)((uint8_t *)layerPtr + 0x4);
-                                    uint32_t changed_indirect = *(uint32_t *)((uint8_t *)layerPtr + 0x2c);
-                                    bridge_log("LAYER_FLAGS: (attr+0x8)+0x4 = 0x%08x bit25=%d bit17=%d bit18=%d  +0x2c=0x%08x layerPtr=%p",
-                                        flags_indirect, (flags_indirect >> 25) & 1,
-                                        (flags_indirect >> 17) & 1, (flags_indirect >> 18) & 1,
-                                        changed_indirect, layerPtr);
+                            /* Scan for heap pointers that could be CA::Layer* */
+                            for (int ri = 0; ri < 20; ri++) {
+                                uint64_t val = raw[ri];
+                                if (val > 0x100000000ULL && val < 0x800000000000ULL && (val & 0x7) == 0) {
+                                    /* Looks like a heap pointer — try reading +0x4 for flags */
+                                    uint32_t maybe_flags = *(uint32_t *)((uint8_t *)(uintptr_t)val + 0x4);
+                                    uint32_t maybe_changed = *(uint32_t *)((uint8_t *)(uintptr_t)val + 0x2c);
+                                    bridge_log("LAYER_PTR_SCAN: +0x%02x -> %p  +0x4=0x%08x bit25=%d bit17=%d bit18=%d  +0x2c=0x%08x",
+                                        ri * 8, (void *)(uintptr_t)val, maybe_flags,
+                                        (maybe_flags >> 25) & 1, (maybe_flags >> 17) & 1, (maybe_flags >> 18) & 1,
+                                        maybe_changed);
                                 }
-
-                                /* Check sublayers */
-                                id subs = ((id(*)(id,SEL))objc_msgSend)(_lf_root, sel_registerName("sublayers"));
-                                unsigned long sc = subs ? ((unsigned long(*)(id,SEL))objc_msgSend)(subs, sel_registerName("count")) : 0;
-                                for (unsigned long si = 0; si < sc && si < 3; si++) {
-                                    id sub = ((id(*)(id,SEL,unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), si);
-                                    if (!sub) continue;
-                                    void *subAttr = *(void **)((uint8_t *)(void *)sub + attrOff);
-                                    if (subAttr) {
-                                        uint32_t sf = *(uint32_t *)((uint8_t *)subAttr + 0x4);
-                                        uint32_t sc2c = *(uint32_t *)((uint8_t *)subAttr + 0x2c);
-                                        void *subLP = *(void **)((uint8_t *)subAttr + 0x8);
-                                        uint32_t sf2 = 0xDEAD, sl2c = 0xDEAD;
-                                        if (subLP && (uintptr_t)subLP > 0x1000 && (uintptr_t)subLP < 0x800000000000ULL) {
-                                            sf2 = *(uint32_t *)((uint8_t *)subLP + 0x4);
-                                            sl2c = *(uint32_t *)((uint8_t *)subLP + 0x2c);
-                                        }
-                                        bridge_log("LAYER_FLAGS: sub[%lu] attr+0x4=0x%08x +0x2c=0x%08x  (attr+0x8)+0x4=0x%08x +0x2c=0x%08x class=%s",
-                                            si, sf, sc2c, sf2, sl2c, object_getClassName(sub));
-                                    }
-                                }
-
-                                /* FIX: Set bit 25 (0x2000000), clear bits 17/18, set +0x2c=0xfffff */
-                                bridge_log("LAYER_FLAGS: SETTING bit25 + changed props on root...");
-                                *(uint32_t *)((uint8_t *)attrPtr + 0x4) |= 0x2000000;
-                                *(uint32_t *)((uint8_t *)attrPtr + 0x4) &= ~0x60000; /* clear bits 17+18 */
-                                *(uint32_t *)((uint8_t *)attrPtr + 0x2c) |= 0xfffff; /* mark all props changed */
-                                if (layerPtr && (uintptr_t)layerPtr > 0x1000 && (uintptr_t)layerPtr < 0x800000000000ULL) {
-                                    *(uint32_t *)((uint8_t *)layerPtr + 0x4) |= 0x2000000;
-                                    *(uint32_t *)((uint8_t *)layerPtr + 0x4) &= ~0x60000;
-                                    *(uint32_t *)((uint8_t *)layerPtr + 0x2c) |= 0xfffff;
-                                }
-                                for (unsigned long si = 0; si < sc && si < 3; si++) {
-                                    id sub = ((id(*)(id,SEL,unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), si);
-                                    if (!sub) continue;
-                                    void *subAttr = *(void **)((uint8_t *)(void *)sub + attrOff);
-                                    if (subAttr) {
-                                        *(uint32_t *)((uint8_t *)subAttr + 0x4) |= 0x2000000;
-                                        *(uint32_t *)((uint8_t *)subAttr + 0x4) &= ~0x60000;
-                                        *(uint32_t *)((uint8_t *)subAttr + 0x2c) |= 0xfffff;
-                                        void *subLP = *(void **)((uint8_t *)subAttr + 0x8);
-                                        if (subLP && (uintptr_t)subLP > 0x1000 && (uintptr_t)subLP < 0x800000000000ULL) {
-                                            *(uint32_t *)((uint8_t *)subLP + 0x4) |= 0x2000000;
-                                            *(uint32_t *)((uint8_t *)subLP + 0x4) &= ~0x60000;
-                                            *(uint32_t *)((uint8_t *)subLP + 0x2c) |= 0xfffff;
-                                        }
-                                    }
-                                }
-                                ((void(*)(id,SEL))objc_msgSend)(
-                                    (id)objc_getClass("CATransaction"), sel_registerName("flush"));
-                                bridge_log("LAYER_FLAGS: bit25 set + flushed — check next commit for visual opcodes");
                             }
                         } else {
                             bridge_log("LAYER_FLAGS: no root layer available");
                         }
-                    } else {
-                        bridge_log("LAYER_FLAGS: _attr ivar not found");
                     }
                 }
 
