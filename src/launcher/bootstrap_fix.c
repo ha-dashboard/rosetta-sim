@@ -63,6 +63,9 @@ static void bfix_log(const char *fmt, ...) {
 static mach_port_t g_processinfoservice_port = MACH_PORT_NULL;
 static int g_is_assertiond = 0; /* set in constructor if process is assertiond */
 
+/* Exported bootstrap port for bridge to read if task_get_special_port fails */
+mach_port_t g_bfix_bootstrap_port __attribute__((visibility("default"))) = MACH_PORT_NULL;
+
 /* Forward declarations for functions defined later */
 static mach_port_t get_bootstrap_port(void);
 kern_return_t replacement_bootstrap_check_in(mach_port_t bp,
@@ -3686,6 +3689,7 @@ static void bootstrap_fix_constructor(void) {
 
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
+    g_bfix_bootstrap_port = bp; /* export for bridge recovery */
     if (bp != MACH_PORT_NULL) {
         bootstrap_port = bp;
 

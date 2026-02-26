@@ -9202,14 +9202,39 @@ static void rosettasim_bridge_init(void) {
     {
         mach_port_t bp = MACH_PORT_NULL;
         kern_return_t bkr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
-        if (bkr == KERN_SUCCESS && bp != MACH_PORT_NULL) {
+        mach_port_type_t pt = 0;
+        if (bp != MACH_PORT_NULL && bp != (mach_port_t)-1)
+            mach_port_type(mach_task_self(), bp, &pt);
+        bridge_log("  BOOTSTRAP_DIAG: task_get_special kr=%d port=0x%x type=0x%x send=%d recv=%d dead=%d",
+            bkr, bp, pt,
+            (pt & MACH_PORT_TYPE_SEND) != 0,
+            (pt & MACH_PORT_TYPE_RECEIVE) != 0,
+            (pt & MACH_PORT_TYPE_DEAD_NAME) != 0);
+        bridge_log("  BOOTSTRAP_DIAG: bootstrap_port=0x%x (libSystem global)", bootstrap_port);
+        /* Also check environment for any hints */
+        bridge_log("  BOOTSTRAP_DIAG: pid=%d ppid=%d", getpid(), getppid());
+
+        if (bkr == KERN_SUCCESS && bp != MACH_PORT_NULL && bp != (mach_port_t)-1) {
             g_bridge_broker_port = bp;
             bridge_log("  broker port = 0x%x (from TASK_BOOTSTRAP_PORT)", bp);
+        } else if (bp == (mach_port_t)-1 || (pt & MACH_PORT_TYPE_DEAD_NAME)) {
+            /* Port is dead — try to recover from bfix's saved port */
+            bridge_log("  BOOTSTRAP_DIAG: port is DEAD (0x%x) — checking bfix export...", bp);
+            /* bfix may have saved the real port before it died */
+            mach_port_t *bfix_port = (mach_port_t *)dlsym(RTLD_DEFAULT, "g_bfix_bootstrap_port");
+            if (bfix_port && *bfix_port != MACH_PORT_NULL) {
+                g_bridge_broker_port = *bfix_port;
+                bridge_log("  BOOTSTRAP_DIAG: recovered from bfix: 0x%x", *bfix_port);
+                /* Also fix the global bootstrap_port */
+                bootstrap_port = *bfix_port;
+            } else {
+                bridge_log("  BOOTSTRAP_DIAG: bfix export not found, no recovery");
+            }
         } else {
             bridge_log("  no broker port (standalone mode)");
         }
     }
-    if (bootstrap_port != MACH_PORT_NULL) {
+    if (bootstrap_port != MACH_PORT_NULL && bootstrap_port != (mach_port_t)-1) {
         bridge_log("  bootstrap_port = 0x%x (broker mode available)", bootstrap_port);
     }
 
