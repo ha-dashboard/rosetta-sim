@@ -136,10 +136,10 @@ static void handle_msg(mach_port_t port) {
         r.width = g_pixel_width;
         r.height = g_pixel_height;
         /* pt_width/pt_height = point dimensions for layout.
-         * Must be pixel_width/scale for correct UIKit layout.
-         * The host CALayer's contentsScale handles Retina display. */
-        r.pt_width = (uint32_t)(g_pixel_width / g_scale);
-        r.pt_height = (uint32_t)(g_pixel_height / g_scale);
+         * Set equal to pixel dims so compositor uses full buffer at 1x.
+         * (Previously 375x667 caused 1/4 size rendering) */
+        r.pt_width = g_pixel_width;
+        r.pt_height = g_pixel_height;
 
         kr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         NSLog(@">>> map_surface reply sent: kr=%d (%ux%u stride=%u)", kr, g_pixel_width, g_pixel_height, g_bytes_per_row);

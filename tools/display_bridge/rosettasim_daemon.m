@@ -197,14 +197,13 @@ static void handle_msg_for_device(DeviceContext *ctx) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        r.pt_width = (uint32_t)(ctx->pixel_width / ctx->scale);
-        r.pt_height = (uint32_t)(ctx->pixel_height / ctx->scale);
+        r.pt_width = ctx->pixel_width;
+        r.pt_height = ctx->pixel_height;
 
         kr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
                       0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u pt=%ux%u)",
-              ctx->name, kr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row,
-              r.pt_width, r.pt_height);
+        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u)",
+              ctx->name, kr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row);
 
     } else if (msg->msgh_id == 3) {
         /* flush_shmem — reply and dump pixels */
@@ -273,9 +272,7 @@ static void activate_device(DeviceContext *ctx, id device) {
     /* Query dimensions from SimDeviceType */
     @try {
         id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
-        if (!deviceType) {
-            NSLog(@"[daemon] WARNING: %s has no device type profile, using defaults", ctx->name);
-        } else if (deviceType) {
+        if (deviceType) {
             CGSize sz = ((CGSize(*)(id, SEL))objc_msgSend)(deviceType,
                           sel_registerName("mainScreenSize"));
             float scale = ((float(*)(id, SEL))objc_msgSend)(deviceType,
@@ -412,12 +409,7 @@ static BOOL is_legacy_runtime(id device) {
                            sel_registerName("runtimeIdentifier"));
         if (!rtId) return NO;
         /* Legacy = iOS 9.x or 10.x (uses PurpleFBServer) */
-        if (![rtId containsString:@"iOS-9"] && ![rtId containsString:@"iOS-10"])
-            return NO;
-        /* Verify device has a valid device type profile */
-        id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
-        if (!deviceType) return NO;
-        return YES;
+        return [rtId containsString:@"iOS-9"] || [rtId containsString:@"iOS-10"];
     } @catch (id e) {
         return NO;
     }
