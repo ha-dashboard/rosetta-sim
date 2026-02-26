@@ -1729,6 +1729,23 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                             bfix_log("DISPLAY_BIND: set opts {displayId=1} on commit_ctx id=%u", commit_ctx_id);
                                         } @catch (id ex) {}
 
+                                        /* Verify CA_CFDictionaryGetInt returns 1 */
+                                        {
+                                            typedef int (*GetIntFn)(void *, void *);
+                                            GetIntFn getInt = (GetIntFn)(qc_base + 0x136156);
+                                            void *stored_opts = *(void **)((uint8_t *)commit_ctx + 0x10);
+                                            void *kp = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
+                                            void *kdid_cf = kp ? *(void **)kp : NULL;
+                                            int got_id = kdid_cf ? getInt(stored_opts, kdid_cf) : -1;
+                                            bfix_log("DISPLAY_BIND: CA_CFDictionaryGetInt(opts, displayId) = %d", got_id);
+
+                                            /* Also check what server+0x58 points to */
+                                            void *srv58 = *(void **)((uint8_t *)_srv + 0x58);
+                                            uint32_t disp_at_10 = *(uint32_t *)((uint8_t *)srv58 + 0x10);
+                                            bfix_log("DISPLAY_BIND: srv+0x58=%p disp+0x10=%u (should match %d)",
+                                                srv58, disp_at_10, got_id);
+                                        }
+
                                         /* Set display_info */
                                         SetDispInfoFn set_disp2 = (SetDispInfoFn)(qc_base + 0x5e2c2);
                                         set_disp2(commit_ctx, 1);
