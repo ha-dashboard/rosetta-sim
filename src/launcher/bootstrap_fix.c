@@ -1605,35 +1605,9 @@ static void _pcr_do_render(void) {
                 static void *prev_layer[10] = {0};
                 static float prev_bg[10][4] = {{0}};
 
-                /* Root layer: try multiple handle offsets.
-                 * handle+0x18 was from static analysis but might be wrong.
-                 * Try handle+0x00, +0x08, +0x10, +0x18 to find the actual layer. */
-                void *root_layer = NULL;
-                int rl_offset = -1;
-                for (int ho = 0; ho <= 0x20; ho += 8) {
-                    void *candidate = *(void **)((uint8_t *)root_handle + ho);
-                    if (candidate && (uintptr_t)candidate > 0x100000 &&
-                        (uintptr_t)candidate < 0x800000000000ULL) {
-                        /* Check if this looks like a Render::Layer (vtable at +0x00) */
-                        void *vtable = *(void **)candidate;
-                        if (vtable && (uintptr_t)vtable > 0x100000000ULL &&
-                            (uintptr_t)vtable < 0x200000000ULL) {
-                            /* Code pointer range — likely vtable */
-                            float *maybe_bg = (float *)((uint8_t *)candidate + 0x10);
-                            if (maybe_bg[0] >= 0.0f && maybe_bg[0] <= 1.0f &&
-                                maybe_bg[3] >= 0.0f && maybe_bg[3] <= 1.0f) {
-                                root_layer = candidate;
-                                rl_offset = ho;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!root_layer) {
-                    /* Fallback to +0x18 */
-                    root_layer = *(void **)((uint8_t *)root_handle + 0x18);
-                    rl_offset = 0x18;
-                }
+                /* Root layer at handle+0x18 */
+                void *root_layer = *(void **)((uint8_t *)root_handle + 0x18);
+                int rl_offset = 0x18;
                 if (!root_layer) {
                     bfix_log("  ROOT: handle=%p but layer=NULL", root_handle);
                     continue;
