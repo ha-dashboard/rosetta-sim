@@ -3999,27 +3999,22 @@ static void bootstrap_fix_constructor(void) {
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: TASK_BOOTSTRAP_PORT = 0x%x, bootstrap_port = 0x%x\n", bp, bootstrap_port);
 
-    /* If the bootstrap port is the broker's (valid, set by posix_spawnattr for daemons),
-     * use it directly. If it's dead/invalid (app process), discover the broker
-     * via the REAL macOS bootstrap. */
-    if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-        /* App process: inherited real macOS bootstrap. Look up broker. */
-        mach_port_t macos_bp = bootstrap_port; /* the real macOS bootstrap */
-        if (macos_bp != MACH_PORT_NULL && macos_bp != (mach_port_t)-1) {
+    /* ALWAYS try to discover broker via macOS bootstrap lookup.
+     * For daemons (bp IS the broker from posix_spawnattr), lookup fails → use bp as-is.
+     * For the app (bp IS the macOS bootstrap, no posix_spawnattr), lookup succeeds → switch. */
+    {
+        mach_port_t try_bp = (bp != MACH_PORT_NULL && bp != (mach_port_t)-1) ? bp : bootstrap_port;
+        if (try_bp != MACH_PORT_NULL && try_bp != (mach_port_t)-1) {
             mach_port_t broker = MACH_PORT_NULL;
-            kern_return_t lkr = bootstrap_look_up(macos_bp, "com.rosettasim.broker", &broker);
-            bfix_log("[bfix] constructor: macOS bootstrap lookup 'com.rosettasim.broker': kr=%d port=0x%x\n",
-                lkr, broker);
-            if (lkr == KERN_SUCCESS && broker != MACH_PORT_NULL) {
+            kern_return_t lkr = bootstrap_look_up(try_bp, "com.rosettasim.broker", &broker);
+            if (lkr == KERN_SUCCESS && broker != MACH_PORT_NULL && broker != try_bp) {
                 bp = broker;
                 task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
                 bootstrap_port = bp;
-                bfix_log("[bfix] constructor: SWITCHED to broker port 0x%x via macOS bootstrap!\n", bp);
+                bfix_log("[bfix] constructor: SWITCHED to broker 0x%x via macOS bootstrap!\n", bp);
             } else {
-                bfix_log("[bfix] constructor: broker not found via macOS bootstrap\n");
+                bfix_log("[bfix] constructor: broker lookup kr=%d (using bp=0x%x as-is)\n", lkr, bp);
             }
-        } else {
-            bfix_log("[bfix] constructor: no valid macOS bootstrap port either\n");
         }
     }
 
