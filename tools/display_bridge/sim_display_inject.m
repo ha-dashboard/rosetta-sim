@@ -115,7 +115,8 @@ static BOOL load_multi_device_list(void) {
         g_device_capacity = count;
     }
 
-    g_device_count = 0;
+    /* Build new device list, preserving layer/active for existing UDIDs */
+    int new_count = 0;
     for (NSDictionary *dev in devices) {
         NSString *udid = dev[@"udid"];
         NSString *name = dev[@"name"];
@@ -124,7 +125,13 @@ static BOOL load_multi_device_list(void) {
         NSNumber *s = dev[@"scale"];
         if (!udid || !name || !w || !h) continue;
 
-        DeviceDisplay *dd = &g_devices[g_device_count];
+        DeviceDisplay *dd = &g_devices[new_count];
+
+        /* Check if this slot already has the same UDID with a live layer */
+        BOOL preserve = (new_count < g_device_count &&
+                         strcmp(dd->udid, udid.UTF8String) == 0 &&
+                         dd->layer_ref != NULL);
+
         strlcpy(dd->udid, udid.UTF8String, sizeof(dd->udid));
         strlcpy(dd->name, name.UTF8String, sizeof(dd->name));
         snprintf(dd->fb_path, sizeof(dd->fb_path), "/tmp/rosettasim_fb_%s.raw", dd->udid);
@@ -133,14 +140,26 @@ static BOOL load_multi_device_list(void) {
         dd->scale   = s ? s.floatValue : 2.0f;
         dd->bpr     = dd->width * 4;
         dd->fb_size = dd->bpr * dd->height;
-        device_set_layer(dd, nil);
-        dd->active  = NO;
+
+        if (!preserve) {
+            /* New device or no layer yet — reset */
+            device_set_layer(dd, nil);
+            dd->active = NO;
+        }
+        /* else: keep existing layer_ref and active state */
+
         if (!dd->read_buf || dd->fb_size > dd->bpr * dd->height) {
             free(dd->read_buf);
             dd->read_buf = malloc(dd->fb_size);
         }
-        g_device_count++;
+        new_count++;
     }
+    /* Release layers for devices that were removed */
+    for (int i = new_count; i < g_device_count; i++) {
+        device_set_layer(&g_devices[i], nil);
+        g_devices[i].active = NO;
+    }
+    g_device_count = new_count;
 
     if (g_device_count > 0) {
         NSLog(@"[inject] Loaded %d devices from daemon", g_device_count);
