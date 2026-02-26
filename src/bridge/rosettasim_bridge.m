@@ -9152,9 +9152,21 @@ static void replacement_copyRenderLayer(id self, SEL _cmd, void *renderLayer,
         bridge_log("CRL_SUMMARY: total=%d bit3_set=%d bit3_clear=%d",
             g_crl_total, g_crl_bit3_set, g_crl_bit3_clear);
     }
+    /* Check CALayer.backgroundColor BEFORE encoding */
+    void *preBg = ((void*(*)(id,SEL))objc_msgSend)(self, sel_registerName("backgroundColor"));
+
     /* Call original */
     ((void(*)(id, SEL, void*, unsigned char, void*))g_orig_copyRenderLayer)(
         self, _cmd, renderLayer, layerFlags, commitFlags);
+
+    /* AFTER encoding: read Render::Layer+0x10 for backgroundColor */
+    if (g_crl_log_count <= 30 && renderLayer) {
+        float *bg = (float *)((uint8_t *)renderLayer + 0x10);
+        uint8_t opacity = *(uint8_t *)((uint8_t *)renderLayer + 0x20);
+        bridge_log("CRL_ENCODED[%d]: class=%s cgBg=%p RL_bg=[%.3f,%.3f,%.3f,%.3f] opacity=%u",
+            g_crl_log_count, object_getClassName(self), preBg,
+            bg[0], bg[1], bg[2], bg[3], (unsigned)opacity);
+    }
 }
 
 static void install_copyRenderLayer_hook(void) {
