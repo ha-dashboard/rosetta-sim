@@ -361,14 +361,24 @@ static NSTimeInterval g_last_rescan = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
 
     if (g_multi_device_mode) {
-        /* Reload device list every 5s */
+        /* Reload device list every 5s and re-scan if needed */
         if (now - g_last_rescan > 5.0) {
             g_last_rescan = now;
             int prev_count = g_device_count;
             load_multi_device_list();
-            if (g_device_count > prev_count) {
-                NSLog(@"[inject] New devices in JSON (%d → %d) — re-scanning windows",
-                      prev_count, g_device_count);
+
+            /* Re-scan if count changed or any device lacks a layer */
+            BOOL needs_scan = (g_device_count != prev_count);
+            if (!needs_scan) {
+                for (int i = 0; i < g_device_count; i++) {
+                    if (!g_devices[i].active && !g_devices[i].layer_ref) {
+                        needs_scan = YES;
+                        break;
+                    }
+                }
+            }
+            if (needs_scan) {
+                NSLog(@"[inject] Device list changed or unmatched devices — re-scanning windows");
                 attempt_injection();
             }
         }
