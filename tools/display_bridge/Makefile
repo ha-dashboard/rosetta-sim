@@ -44,9 +44,13 @@ DAEMON_CFLAGS = $(CFLAGS_COMMON)
 DAEMON_LDFLAGS = -framework Foundation -framework IOSurface -framework CoreGraphics \
                  -Wl,-undefined,dynamic_lookup
 
-.PHONY: all bridge inject viewer daemon clean
+# Scale fix: x86_64 interpose dylib injected into sim processes
+SCALE_SRC     = sim_scale_fix.c
+SCALE_BIN     = sim_scale_fix.dylib
 
-all: bridge inject viewer daemon
+.PHONY: all bridge inject viewer daemon scale_fix clean
+
+all: bridge inject viewer daemon scale_fix
 
 bridge: $(BRIDGE_BIN)
 
@@ -72,6 +76,12 @@ $(DAEMON_BIN): $(DAEMON_SRC)
 	$(CC) $(DAEMON_CFLAGS) $(DAEMON_LDFLAGS) -o $@ $<
 	@echo "Built: $@"
 
+scale_fix: $(SCALE_BIN)
+
+$(SCALE_BIN): $(SCALE_SRC)
+	$(CC) -arch x86_64 -shared -Wl,-undefined,dynamic_lookup -o $@ $<
+	@echo "Built: $@"
+
 clean:
-	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN)
+	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN) $(SCALE_BIN)
 	@echo "Cleaned."

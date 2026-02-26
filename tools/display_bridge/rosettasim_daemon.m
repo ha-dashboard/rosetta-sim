@@ -206,8 +206,9 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        /* pt_width = pixel_width (NOT pixel/scale — renderer viewport
-         * is constrained by pt_width, dividing by scale causes 1/4 area) */
+        /* pt_width = pixel_width for now (scale=1).
+         * Finding 33/34: BSMainScreenScale interpose + set_scale needed for 2x.
+         * Simple constant patch breaks display init. Need insert_dylib approach. */
         r.pt_width = ctx->pixel_width;
         r.pt_height = ctx->pixel_height;
 

@@ -101,6 +101,16 @@ if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
 fi
 echo "  Daemon running (PID $DAEMON_PID)"
 
+# --- Step 2a: Set scale fix for sim processes ---
+SCALE_FIX="$PROJECT_ROOT/tools/display_bridge/sim_scale_fix.dylib"
+if [[ -f "$SCALE_FIX" ]]; then
+    export SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$SCALE_FIX"
+    export SIMCTL_CHILD_ROSETTA_SCREEN_SCALE=2
+    echo "  Scale fix active (BSMainScreenScale → 2.0)"
+else
+    echo "  WARNING: sim_scale_fix.dylib not found — icons may render incorrectly"
+fi
+
 # --- Step 2b: Boot a default device (Simulator crashes without a booted device) ---
 echo "Booting default legacy device..."
 DEFAULT_UDID=$(xcrun simctl list devices 2>/dev/null \
