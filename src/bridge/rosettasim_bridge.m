@@ -9474,9 +9474,9 @@ static void rosettasim_bridge_init(void) {
         }
     });
 
-    /* BG_FORCE via dispatch_after — reliable 5s timer independent of frame_capture_tick */
+    /* BG_FORCE via dispatch_after — use global queue since main queue may not drain */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @autoreleasepool {
             id app = ((id(*)(id,SEL))objc_msgSend)(
                 (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
