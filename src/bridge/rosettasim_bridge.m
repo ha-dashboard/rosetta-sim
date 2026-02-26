@@ -9474,9 +9474,11 @@ static void rosettasim_bridge_init(void) {
         }
     });
 
-    /* BG_FORCE via dispatch_after — use global queue since main queue may not drain */
+    /* BG_FORCE via dispatch_after on global queue, then CFRunLoopPerformBlock to main */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
         dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        bridge_log("BG_FORCE_DISPATCH: scheduling on main runloop via CFRunLoopPerformBlock");
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
         @autoreleasepool {
             id app = ((id(*)(id,SEL))objc_msgSend)(
                 (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
@@ -9527,6 +9529,8 @@ static void rosettasim_bridge_init(void) {
                 bridge_log("BG_FORCE_DISPATCH: no keyWindow at t=5s");
             }
         }
+        }); /* end CFRunLoopPerformBlock */
+        CFRunLoopWakeUp(CFRunLoopGetMain());
     });
 
     bridge_log("========================================");
