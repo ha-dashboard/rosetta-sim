@@ -1106,6 +1106,7 @@ static void *g_pcr_rft_srv = NULL;  /* CA::Render::Server* C++ object */
 static int g_pcr_init = 0;
 static int g_pcr_render_count = 0;
 static mach_port_t g_pcr_car_port = MACH_PORT_NULL; /* CARenderServer port */
+static mach_port_t g_client_task_port = MACH_PORT_NULL; /* client task port from 40203 */
 
 /* Send kick_server (msg_id 40001) to CARenderServer port.
  * This is the NATIVE mechanism for waking the render loop.
@@ -2198,7 +2199,50 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                 red_in_ool++;
                             }
                         }
-                        bfix_log("  SHMEM_SUMMARY: ptrs=%d red=%d size=%u", ptr_count, red_in_ool, cmd_size);
+                        bfix_log("  SHMEM_SUMMARY: ptrs=%d red=%d size=%u client_task=%u",
+                            ptr_count, red_in_ool, cmd_size, g_client_task_port);
+
+                        /* SHMEM_FIX: If client pointers detected and we have a task port,
+                         * try mach_vm_read to copy the command data from the client */
+                        if (ptr_count > 0 && g_client_task_port != MACH_PORT_NULL) {
+                            /* Scan for the LARGEST client pointer — likely the command data ptr */
+                            for (uint32_t pi = 0; pi < cmd_size / 8 && pi < 16; pi++) {
+                                uint64_t val = hw[pi];
+                                if (val > 0x100000000ULL && val < 0x800000000000ULL) {
+                                    int in_range = (val >= (uintptr_t)cmd_data &&
+                                                    val < (uintptr_t)cmd_data + cmd_size);
+                                    if (!in_range) {
+                                        /* Try mach_vm_read from client */
+                                        vm_offset_t rd = 0;
+                                        mach_msg_type_number_t rc = 0;
+                                        /* Read a small chunk first to test */
+                                        kern_return_t vkr = vm_read(g_client_task_port,
+                                            (vm_address_t)val, 256, &rd, &rc);
+                                        bfix_log("  SHMEM_FIX: vm_read(task=%u, addr=0x%llx, 256) = %d (%s) got=%u",
+                                            g_client_task_port, val, vkr, mach_error_string(vkr), rc);
+                                        if (vkr == KERN_SUCCESS && rc >= 16) {
+                                            /* Check if this data has the red color pattern */
+                                            uint32_t *rw = (uint32_t *)rd;
+                                            int has_floats = 0;
+                                            for (uint32_t fi = 0; fi + 3 < rc/4; fi++) {
+                                                if (rw[fi] == 0x3f800000) has_floats++;
+                                            }
+                                            bfix_log("  SHMEM_FIX: read OK — first 32 bytes:");
+                                            uint8_t *rp = (uint8_t *)rd;
+                                            bfix_log("    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
+                                                     " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                                                rp[0],rp[1],rp[2],rp[3],rp[4],rp[5],rp[6],rp[7],
+                                                rp[8],rp[9],rp[10],rp[11],rp[12],rp[13],rp[14],rp[15],
+                                                rp[16],rp[17],rp[18],rp[19],rp[20],rp[21],rp[22],rp[23],
+                                                rp[24],rp[25],rp[26],rp[27],rp[28],rp[29],rp[30],rp[31]);
+                                            bfix_log("  SHMEM_FIX: float_1.0_count=%d", has_floats);
+                                            vm_deallocate(mach_task_self(), rd, rc);
+                                        }
+                                        break; /* only try first client ptr */
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (cmd_data && cmd_size >= 16) {
@@ -2350,6 +2394,11 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                             bfix_log("40203_RECV: desc[%u] PORT name=%u disp=%u ptype=0x%x (kr=%d)",
                                 d, pd->name, pd->disposition, pt, tkr);
 
+                            /* Capture client task port from first descriptor */
+                            if (d == 0 && tkr == KERN_SUCCESS && (pt & MACH_PORT_TYPE_SEND)) {
+                                g_client_task_port = pd->name;
+                                bfix_log("40203_RECV: captured client task port = %u", g_client_task_port);
+                            }
                             /* If this looks like a task port (send right, no receive), try vm_read */
                             if (tkr == KERN_SUCCESS && (pt & MACH_PORT_TYPE_SEND) && d == 0) {
                                 vm_offset_t rd = 0;
