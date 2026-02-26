@@ -234,7 +234,10 @@ static BOOL load_multi_device_list(void) {
     g_device_count = new_count;
 
     if (g_device_count > 0) {
-        NSLog(@"[inject] Loaded %d devices from daemon", g_device_count);
+        static int prev_loaded_count = -1;
+        if (g_device_count != prev_loaded_count)
+            NSLog(@"[inject] Loaded %d device(s) from daemon", g_device_count);
+        prev_loaded_count = g_device_count;
         g_multi_device_mode = YES;
         return YES;
     }
@@ -419,17 +422,25 @@ static RosettaSimRefreshTarget *g_refresh_target = nil;
 
 /* --- Match windows to devices and set up layers --- */
 
+static int g_scan_count = 0;
+
 static void attempt_injection(void) {
-    NSLog(@"[inject] Scanning Simulator.app windows...");
+    g_scan_count++;
+    BOOL verbose = (g_scan_count <= 3); /* only verbose on first few scans */
+
+    if (verbose)
+        NSLog(@"[inject] Scanning Simulator.app windows...");
 
     /* Try multi-device mode first */
     if (!g_multi_device_mode)
         load_multi_device_list();
 
     NSArray *windows = [NSApp windows];
-    NSLog(@"[inject] Found %lu windows", (unsigned long)windows.count);
+    if (verbose)
+        NSLog(@"[inject] Found %lu windows", (unsigned long)windows.count);
 
     int connected = 0;
+    int newly_connected = 0;
 
     for (NSWindow *win in windows) {
         NSView *renderable = find_renderable_view(win.contentView);
@@ -439,8 +450,6 @@ static void attempt_injection(void) {
         if (!layer) continue;
 
         NSString *title = win.title;
-        NSLog(@"[inject] Window '%@' has SimDisplayRenderableView, layer bounds=%@",
-              title, NSStringFromRect(layer.bounds));
 
         if (g_multi_device_mode) {
             /* Match by UDID first (reliable), fall back to longest name match */
@@ -455,8 +464,6 @@ static void attempt_injection(void) {
                         break;
                     }
                 }
-                if (match_idx >= 0)
-                    NSLog(@"[inject] UDID match: %@ → '%s'", winUDID, g_devices[match_idx].name);
             }
 
             /* Fall back to longest name match if UDID extraction failed */
@@ -469,27 +476,37 @@ static void attempt_injection(void) {
                         best_len = name.length;
                     }
                 }
-                if (match_idx >= 0)
-                    NSLog(@"[inject] Name match: '%s' → window '%@' (len=%zu)",
-                          g_devices[match_idx].name, title, best_len);
             }
 
             if (match_idx >= 0) {
                 DeviceDisplay *dd = &g_devices[match_idx];
+                /* Skip if already connected to this exact layer */
+                if (dd->active && dd->layer_ref == (__bridge void *)layer) {
+                    connected++;
+                    continue;
+                }
+                BOOL was_active = dd->active;
                 device_set_layer(dd, layer);
                 dd->active = YES;
                 layer.contentsScale = dd->scale;
                 layer.contentsGravity = kCAGravityResize;
-                NSLog(@"[inject] Connected '%s' → window '%@' (%ux%u @%.0fx)",
-                      dd->name, title, dd->width, dd->height, dd->scale);
                 connected++;
-            } else {
+                if (!was_active) {
+                    newly_connected++;
+                    NSLog(@"[inject] Connected '%s' → window '%@' (%ux%u @%.0fx)",
+                          dd->name, title, dd->width, dd->height, dd->scale);
+                }
+            } else if (verbose) {
                 NSLog(@"[inject] Window '%@' — no matching device (UDID=%@)",
                       title, winUDID ?: @"unknown");
             }
         } else {
             /* Single-device: use first window with a renderable view */
             load_single_device();
+            if (g_single_device.active && g_single_device.layer_ref) {
+                connected++;
+                break;
+            }
             device_set_layer(&g_single_device, layer);
             g_single_device.active = YES;
             layer.contentsScale = g_single_device.scale;
@@ -498,6 +515,7 @@ static void attempt_injection(void) {
                   title, g_single_device.width, g_single_device.height,
                   g_single_device.scale);
             connected++;
+            newly_connected++;
             break; /* only one in single mode */
         }
     }
@@ -521,7 +539,7 @@ static void attempt_injection(void) {
             } @catch (id e) { /* pre-macOS 15 — no frame rate range */ }
             [g_display_link addToRunLoop:[NSRunLoop mainRunLoop]
                                  forMode:NSRunLoopCommonModes];
-            NSLog(@"[inject] Connected %d device(s). CADisplayLink active (vsync).", connected);
+            NSLog(@"[inject] %d device(s) active. CADisplayLink active (vsync).", connected);
         } else {
             /* Fallback: NSTimer at 60fps */
             NSTimer *t = [NSTimer timerWithTimeInterval:1.0/60.0 repeats:YES
@@ -530,12 +548,15 @@ static void attempt_injection(void) {
             }];
             [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
             g_display_link = t;
-            NSLog(@"[inject] Connected %d device(s). NSTimer fallback at 60fps.", connected);
+            NSLog(@"[inject] %d device(s) active. NSTimer fallback at 60fps.", connected);
         }
 
         /* First frame immediately */
         [g_refresh_target tick:nil];
     }
+
+    if (newly_connected > 0)
+        NSLog(@"[inject] Scan #%d: %d newly connected, %d total active", g_scan_count, newly_connected, connected);
 }
 
 /* --- Retry injection until windows appear --- */

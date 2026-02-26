@@ -9,7 +9,21 @@
  *   rosettasim_daemon              # run in foreground
  *   rosettasim_daemon --list       # list legacy devices and exit
  *
- * Can be installed as a launchd agent for automatic startup.
+ * Handles SIGTERM/SIGINT gracefully (cleans up ports, files, IOSurfaces).
+ * Logs a warning if any active device hasn't flushed in 60s.
+ *
+ * To run under launchd, create ~/Library/LaunchAgents/com.rosetta.daemon.plist:
+ *   <plist version="1.0"><dict>
+ *     <key>Label</key><string>com.rosetta.daemon</string>
+ *     <key>ProgramArguments</key><array>
+ *       <string>/path/to/rosettasim_daemon</string>
+ *     </array>
+ *     <key>RunAtLoad</key><true/>
+ *     <key>KeepAlive</key><true/>
+ *     <key>StandardOutPath</key><string>/tmp/rosettasim_daemon.log</string>
+ *     <key>StandardErrorPath</key><string>/tmp/rosettasim_daemon.log</string>
+ *   </dict></plist>
+ *   Then: launchctl load ~/Library/LaunchAgents/com.rosetta.daemon.plist
  */
 
 #import <Foundation/Foundation.h>
@@ -65,6 +79,7 @@ typedef struct DeviceContext {
     dispatch_source_t recv_source;
     int             flush_count;
     int             active;
+    time_t          last_flush_time;
 } DeviceContext;
 
 #define MAX_DEVICES 32
@@ -220,6 +235,7 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
     } else if (msg->msgh_id == 3) {
         /* flush_shmem — reply and dump pixels */
         ctx->flush_count++;
+        ctx->last_flush_time = time(NULL);
         if (msg->msgh_remote_port) {
             mach_msg_header_t reply;
             memset(&reply, 0, sizeof(reply));
@@ -243,7 +259,7 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
         }
 
         /* Periodic pixel stats for diagnostics */
-        if (ctx->surface_base && (ctx->flush_count <= 10 || ctx->flush_count % 50 == 0)) {
+        if (ctx->surface_base && (ctx->flush_count <= 5 || ctx->flush_count % 200 == 0)) {
             uint32_t *px = (uint32_t *)ctx->surface_base;
             int nz = 0;
             for (uint32_t i = 0; i < ctx->pixel_width * ctx->pixel_height; i++) {
@@ -255,7 +271,7 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
             NSLog(@"[daemon] %s: flush #%d: %d/%d non-zero RGB (%.0f%%)",
                   ctx->name, ctx->flush_count, nz, ctx->pixel_width * ctx->pixel_height,
                   100.0 * nz / (ctx->pixel_width * ctx->pixel_height));
-        } else if (ctx->flush_count <= 5 || ctx->flush_count % 100 == 0) {
+        } else if (ctx->flush_count <= 3 || ctx->flush_count % 500 == 0) {
             NSLog(@"[daemon] %s: flush #%d", ctx->name, ctx->flush_count);
         }
 
@@ -594,6 +610,50 @@ int main(int argc, const char *argv[]) {
               (unsigned long)legacyDevices.count);
 
         write_active_devices();
+
+        /* Signal handling: clean shutdown on SIGTERM/SIGINT */
+        dispatch_source_t sig_term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,
+                                                             SIGTERM, 0, dispatch_get_main_queue());
+        dispatch_source_t sig_int = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,
+                                                            SIGINT, 0, dispatch_get_main_queue());
+        void (^cleanup_and_exit)(void) = ^{
+            NSLog(@"[daemon] Shutting down...");
+            for (int i = 0; i < g_device_count; i++) {
+                if (g_devices[i].active)
+                    deactivate_device(&g_devices[i]);
+            }
+            unlink("/tmp/rosettasim_active_devices.json");
+            unlink("/tmp/rosettasim_dimensions.json");
+            unlink("/tmp/rosettasim_surface_id");
+            unlink("/tmp/sim_framebuffer.raw");
+            unlink("/tmp/sim_framebuffer.raw.tmp");
+            NSLog(@"[daemon] Clean shutdown complete.");
+            exit(0);
+        };
+        dispatch_source_set_event_handler(sig_term, cleanup_and_exit);
+        dispatch_source_set_event_handler(sig_int, cleanup_and_exit);
+        signal(SIGTERM, SIG_IGN); /* let dispatch handle it */
+        signal(SIGINT, SIG_IGN);
+        dispatch_activate(sig_term);
+        dispatch_activate(sig_int);
+
+        /* Watchdog: check for stale devices every 30s */
+        dispatch_source_t watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                                                             0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(watchdog, dispatch_time(DISPATCH_TIME_NOW, 30*NSEC_PER_SEC),
+                                  30*NSEC_PER_SEC, 5*NSEC_PER_SEC);
+        dispatch_source_set_event_handler(watchdog, ^{
+            time_t now = time(NULL);
+            for (int i = 0; i < g_device_count; i++) {
+                DeviceContext *d = &g_devices[i];
+                if (!d->active) continue;
+                if (d->last_flush_time > 0 && (now - d->last_flush_time) > 60) {
+                    NSLog(@"[daemon] WARNING: %s has not flushed in %lds",
+                          d->name, (long)(now - d->last_flush_time));
+                }
+            }
+        });
+        dispatch_activate(watchdog);
 
         /* Run forever */
         CFRunLoopRun();
