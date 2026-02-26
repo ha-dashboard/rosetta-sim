@@ -1899,6 +1899,9 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
         }
     }
 
+    /* Real server port — captured from first 40200 (Ping) or 40203 (RegisterClient) receipt */
+    static mach_port_t _real_srv_port = 0;
+
     /* Track CA MIG messages RECEIVED in backboardd */
     if ((option & MACH_RCV_MSG) && kr == KERN_SUCCESS && msg) {
         static int _recv_is_bbd = -1;
@@ -1921,6 +1924,12 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 }
             }
 
+            /* Capture real server port from 40200 (Ping) or 40203 (RegisterClient) */
+            if (!_real_srv_port && (msg->msgh_id == 40200 || msg->msgh_id == 40203)) {
+                _real_srv_port = msg->msgh_local_port;
+                bfix_log("REAL_SRV_PORT: %u (from msg_id=%u)", _real_srv_port, msg->msgh_id);
+            }
+
             /* Always log 40002/40003 commit data messages with thread info */
             if (msg->msgh_id == 40002 || msg->msgh_id == 40003) {
                 int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
@@ -1940,22 +1949,16 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 /* Schedule render_for_time on the next mach_msg call */
                 g_commit_render_pending = 1;
 
-                /* Check if commit arrives on server port vs context port.
-                 * If on server port, context_by_server_port returns NULL
-                 * and run_command_stream processes with no context → commands lost. */
+                /* CORRECTED port check: use RegisterClient (40200) local_port as the
+                 * known server port reference. CARenderServerGetServerPort returned 0
+                 * (broken), so we capture the real port from the first 40200 message. */
                 {
-                    static mach_port_t _cached_srv_port = 0;
                     static int _port_chk_n = 0;
-                    if (!_cached_srv_port) {
-                        typedef mach_port_t (*GSPFn)(void);
-                        GSPFn gsp = (GSPFn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
-                        if (gsp) _cached_srv_port = gsp();
-                    }
                     if (_port_chk_n < 10) {
                         _port_chk_n++;
-                        bfix_log("COMMIT_PORT: local=%u srv=%u %s",
-                            msg->msgh_local_port, _cached_srv_port,
-                            (msg->msgh_local_port == _cached_srv_port)
+                        bfix_log("COMMIT_PORT_V2: local=%u srv=%u %s",
+                            msg->msgh_local_port, _real_srv_port,
+                            (_real_srv_port && msg->msgh_local_port == _real_srv_port)
                                 ? "ON_SERVER(ctx=NULL!)" : "ON_CONTEXT(ok)");
                     }
                 }
@@ -3416,6 +3419,40 @@ static void patch_bootstrap_functions(void) {
 /* Also set the global for any code that reads it directly */
 __attribute__((constructor))
 static void bootstrap_fix_constructor(void) {
+    /* PUI bundle path diagnostic — check where backboardd looks for apple-logo */
+    {
+        const char *pn = getprogname();
+        if (pn && strstr(pn, "backboardd")) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                Class puiClass = (Class)objc_getClass("PUIProgressWindow");
+                if (puiClass) {
+                    id bundle = ((id(*)(Class, SEL, Class))objc_msgSend)(
+                        (Class)objc_getClass("NSBundle"), sel_registerName("bundleForClass:"), puiClass);
+                    id path = bundle ? ((id(*)(id, SEL))objc_msgSend)(bundle, sel_registerName("resourcePath")) : nil;
+                    const char *cpath = path ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : NULL;
+                    bfix_log("PUI_BUNDLE: resourcePath = '%s'", cpath ? cpath : "NULL");
+                    if (cpath) {
+                        char imgpath[512];
+                        snprintf(imgpath, sizeof(imgpath), "%s/apple-logo@2x~iphone.png", cpath);
+                        bfix_log("PUI_BUNDLE: '%s' exists=%d", imgpath, access(imgpath, F_OK) == 0);
+                        snprintf(imgpath, sizeof(imgpath), "%s/apple-logo.png", cpath);
+                        bfix_log("PUI_BUNDLE: '%s' exists=%d", imgpath, access(imgpath, F_OK) == 0);
+                    }
+
+                    /* Also check the ProgressUI framework bundle directly */
+                    id puiBundle = ((id(*)(Class, SEL, Class))objc_msgSend)(
+                        (Class)objc_getClass("NSBundle"), sel_registerName("bundleForClass:"), puiClass);
+                    id bundlePath = puiBundle ? ((id(*)(id, SEL))objc_msgSend)(puiBundle, sel_registerName("bundlePath")) : nil;
+                    const char *bpath = bundlePath ? ((const char *(*)(id, SEL))objc_msgSend)(bundlePath, sel_registerName("UTF8String")) : NULL;
+                    bfix_log("PUI_BUNDLE: bundlePath = '%s'", bpath ? bpath : "NULL");
+                } else {
+                    bfix_log("PUI_BUNDLE: PUIProgressWindow class NOT found");
+                }
+            });
+        }
+    }
+
     /* Force backing stores to be encoded inline in commits.
      * Without this, CAEncodeBackingStores=0 (default) means pixel data
      * is NOT sent in commits. The server expects to access pixels via

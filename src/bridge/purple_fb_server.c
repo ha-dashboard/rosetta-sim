@@ -2437,6 +2437,29 @@ static void pfb_init(void) {
         g_cached_display = disp;
         pfb_log("GPU_INJECT: set g_cached_display=%p", (void *)disp);
 
+        /* PUI bundle diagnostic: check where PUI looks for images */
+        {
+            Class puiClass = (Class)objc_getClass("PUIProgressWindow");
+            if (puiClass) {
+                id bundle = ((id(*)(Class, SEL, Class))objc_msgSend)(
+                    (Class)objc_getClass("NSBundle"), sel_registerName("bundleForClass:"), puiClass);
+                id path = bundle ? ((id(*)(id, SEL))objc_msgSend)(bundle, sel_registerName("resourcePath")) : nil;
+                const char *cpath = path ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : NULL;
+                pfb_log("PUI_BUNDLE: resourcePath = '%s'", cpath ? cpath : "NULL");
+
+                /* Check if apple-logo exists at that path */
+                if (cpath) {
+                    char imgpath[512];
+                    snprintf(imgpath, sizeof(imgpath), "%s/apple-logo@2x~iphone.png", cpath);
+                    pfb_log("PUI_BUNDLE: '%s' exists=%d", imgpath, access(imgpath, F_OK) == 0);
+                    snprintf(imgpath, sizeof(imgpath), "%s/apple-logo.png", cpath);
+                    pfb_log("PUI_BUNDLE: '%s' exists=%d", imgpath, access(imgpath, F_OK) == 0);
+                }
+            } else {
+                pfb_log("PUI_BUNDLE: PUIProgressWindow class NOT found");
+            }
+        }
+
         /* Cache the Display's actual render surface (Display+0x138)
          * This is where CARenderServer writes rendered pixels. */
         {
