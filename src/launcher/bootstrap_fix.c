@@ -3503,6 +3503,82 @@ static void bootstrap_fix_constructor(void) {
         }
     }
 
+    /* SERVER_TEST: Create a red CALayer directly on the server (backboardd)
+     * and set it on a context. This bypasses the ENTIRE cross-process commit
+     * pipeline and tests JUST the renderer. If red pixels appear → renderer works,
+     * issue is in commit content. If 0 pixels → renderer itself is broken. */
+    {
+        const char *pn2 = getprogname();
+        if (pn2 && strstr(pn2, "backboardd")) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                @autoreleasepool {
+                    bfix_log("SERVER_TEST: creating red test layer in backboardd...");
+
+                    Class layerClass = (Class)objc_getClass("CALayer");
+                    if (!layerClass) { bfix_log("SERVER_TEST: no CALayer class"); return; }
+
+                    id testLayer = ((id(*)(id, SEL))objc_msgSend)(
+                        ((id(*)(id, SEL))objc_msgSend)((id)layerClass, sel_registerName("alloc")),
+                        sel_registerName("init"));
+                    if (!testLayer) { bfix_log("SERVER_TEST: failed to create layer"); return; }
+
+                    /* Set bounds: 375x667 (full screen) */
+                    /* CGRect = {origin.x, origin.y, size.w, size.h} = 4 doubles */
+                    double bounds[4] = {0, 0, 375, 667};
+                    ((void(*)(id, SEL, double*))objc_msgSend)(
+                        testLayer, sel_registerName("setBounds:"), bounds);
+                    double pos[2] = {187.5, 333.5};
+                    ((void(*)(id, SEL, double*))objc_msgSend)(
+                        testLayer, sel_registerName("setPosition:"), pos);
+
+                    /* Set red backgroundColor */
+                    Class uiColorClass = (Class)objc_getClass("UIColor");
+                    if (uiColorClass) {
+                        id redColor = ((id(*)(id, SEL))objc_msgSend)((id)uiColorClass, sel_registerName("redColor"));
+                        void *redCG = ((void*(*)(id, SEL))objc_msgSend)(redColor, sel_registerName("CGColor"));
+                        ((void(*)(id, SEL, void*))objc_msgSend)(testLayer, sel_registerName("setBackgroundColor:"), redCG);
+                    }
+                    ((void(*)(id, SEL, BOOL))objc_msgSend)(testLayer, sel_registerName("setOpaque:"), YES);
+
+                    bfix_log("SERVER_TEST: red layer created, finding contexts...");
+
+                    /* Find server-side contexts and set the test layer */
+                    Class ctxClass = (Class)objc_getClass("CAContext");
+                    if (ctxClass) {
+                        id allCtxs = ((id(*)(id, SEL))objc_msgSend)((id)ctxClass, sel_registerName("allContexts"));
+                        unsigned long count = allCtxs ? [(NSArray *)allCtxs count] : 0;
+                        bfix_log("SERVER_TEST: %lu server contexts", count);
+
+                        for (unsigned long i = 0; i < count; i++) {
+                            id ctx = ((id(*)(id, SEL, unsigned long))objc_msgSend)(
+                                allCtxs, sel_registerName("objectAtIndex:"), i);
+                            unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
+                                ctx, sel_registerName("contextId"));
+                            @try {
+                                SEL setLayerSel = sel_registerName("setLayer:");
+                                if ([(id)ctx respondsToSelector:setLayerSel]) {
+                                    ((void(*)(id, SEL, id))objc_msgSend)(ctx, setLayerSel, testLayer);
+                                    bfix_log("SERVER_TEST: set red layer on ctx[%lu] id=%u", i, cid);
+                                } else {
+                                    bfix_log("SERVER_TEST: ctx[%lu] id=%u no setLayer:", i, cid);
+                                }
+                            } @catch (NSException *e) {
+                                bfix_log("SERVER_TEST: ctx[%lu] id=%u rejected: %s",
+                                    i, cid, [[e reason] UTF8String]);
+                            }
+                        }
+                    }
+
+                    /* Flush */
+                    ((void(*)(id, SEL))objc_msgSend)(
+                        (id)objc_getClass("CATransaction"), sel_registerName("flush"));
+                    bfix_log("SERVER_TEST: flushed — check pixels on next render");
+                }
+            });
+        }
+    }
+
     /* Force backing stores to be encoded inline in commits.
      * Without this, CAEncodeBackingStores=0 (default) means pixel data
      * is NOT sent in commits. The server expects to access pixels via
