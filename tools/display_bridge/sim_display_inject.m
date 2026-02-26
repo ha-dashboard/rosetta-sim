@@ -527,6 +527,8 @@ static void attempt_injection(void) {
 
             /* Fall back to longest name match if UDID extraction failed */
             if (match_idx < 0) {
+                if (verbose && winUDID)
+                    NSLog(@"[inject] Window '%@': UDID %@ extracted but no matching device", title, winUDID);
                 size_t best_len = 0;
                 for (int i = 0; i < g_device_count; i++) {
                     NSString *name = [NSString stringWithUTF8String:g_devices[i].name];
@@ -544,6 +546,13 @@ static void attempt_injection(void) {
                     connected++;
                     continue;
                 }
+                /* Skip if this device was already matched to a different window this scan */
+                if (dd->active && dd->layer_ref != NULL) {
+                    if (verbose)
+                        NSLog(@"[inject] Window '%@' — device '%s' already matched to another window",
+                              title, dd->name);
+                    continue;
+                }
                 BOOL was_active = dd->active;
                 device_set_layer(dd, layer);
                 dd->active = YES;
@@ -552,8 +561,9 @@ static void attempt_injection(void) {
                 connected++;
                 if (!was_active) {
                     newly_connected++;
-                    NSLog(@"[inject] Connected '%s' → window '%@' (%ux%u @%.0fx)",
-                          dd->name, title, dd->width, dd->height, dd->scale);
+                    NSLog(@"[inject] Connected '%s' → window '%@' (%ux%u @%.0fx, UDID=%@)",
+                          dd->name, title, dd->width, dd->height, dd->scale,
+                          winUDID ?: @"name-match");
                 }
             } else if (verbose) {
                 NSLog(@"[inject] Window '%@' — no matching device (UDID=%@)",
