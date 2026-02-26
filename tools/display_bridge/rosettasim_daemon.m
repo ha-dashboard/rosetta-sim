@@ -258,8 +258,8 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
             }
         }
 
-        /* Periodic pixel stats for diagnostics */
-        if (ctx->surface_base && (ctx->flush_count <= 5 || ctx->flush_count % 200 == 0)) {
+        /* Periodic pixel stats: every flush <=10, every 10th <=50, every 200th after */
+        if (ctx->surface_base && (ctx->flush_count <= 10 || (ctx->flush_count <= 50 && ctx->flush_count % 10 == 0) || ctx->flush_count % 200 == 0)) {
             uint32_t *px = (uint32_t *)ctx->surface_base;
             int nz = 0;
             for (uint32_t i = 0; i < ctx->pixel_width * ctx->pixel_height; i++) {
@@ -271,7 +271,7 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
             NSLog(@"[daemon] %s: flush #%d: %d/%d non-zero RGB (%.0f%%)",
                   ctx->name, ctx->flush_count, nz, ctx->pixel_width * ctx->pixel_height,
                   100.0 * nz / (ctx->pixel_width * ctx->pixel_height));
-        } else if (ctx->flush_count <= 3 || ctx->flush_count % 500 == 0) {
+        } else if (ctx->flush_count % 500 == 0) {
             NSLog(@"[daemon] %s: flush #%d", ctx->name, ctx->flush_count);
         }
 
