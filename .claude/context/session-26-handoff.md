@@ -147,6 +147,17 @@
 | iPad Pro (12.9) | 2048x2732 | 1024x1366 | 2x | 8192 |
 | iPad Pro (9.7) | 1536x2048 | 768x1024 | 2x | 6144 |
 
+## Gotchas (from Session 25 debugging)
+
+1. **`cc` alias**: The shell has `cc` aliased to an interactive process that hangs. Always use `/usr/bin/cc` for compilation.
+2. **IOSurfaceLookup fails cross-process**: Cannot share IOSurface by ID between bridge and viewer. Use file-based transfer (`/tmp/sim_framebuffer.raw`) instead.
+3. **IOSurface as CALayer.contents shows black**: Setting an IOSurface directly on `layer.contents` doesn't render. Must convert to CGImage via `CGBitmapContextCreate` + `CGBitmapContextCreateImage`.
+4. **Re-signed Simulator crashes without booted sim**: The XPC bridge to CoreSimulatorService fails on `setHardwareKeyboardEnabled:` if no device is booted. Always boot the sim BEFORE launching the re-signed Simulator.
+5. **Bridge must write every flush**: The viewer reads `/tmp/sim_framebuffer.raw` at 30fps. Bridge uses atomic rename (`write to .tmp`, then `rename`) to avoid partial reads.
+6. **pt_width/pt_height must equal pixel dimensions**: Setting pt_width=375 (points) causes compositor to render at 1/4 size. Set pt_width=750 (same as pixels) for full-screen rendering.
+7. **DYLD_INSERT silently ignored on Apple-signed binaries**: Must re-sign with `codesign --force --sign - --options=0` to remove library-validation.
+8. **lldb attach blocked even with DevToolsSecurity**: The `lldb -p` approach failed from our CLI session. The DYLD_INSERT approach on re-signed binary is the working path.
+
 ## How to Run (current state)
 
 ```bash
