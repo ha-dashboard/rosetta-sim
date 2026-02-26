@@ -73,6 +73,7 @@ typedef struct DeviceContext {
     uint32_t        surface_size;
     uint32_t        surface_alloc;
     IOSurfaceRef    iosurface;
+    uint32_t        surface_id;
     void           *surface_base;
     mach_port_t     mem_entry;
     mach_port_t     service_port;
@@ -162,11 +163,13 @@ static void write_active_devices(void) {
         if (!g_devices[i].active) continue;
         if (!first) fprintf(f, ",\n");
         fprintf(f, "  {\"udid\":\"%s\",\"name\":\"%s\",\"width\":%u,\"height\":%u,\"scale\":%.1f,"
+                "\"surface_id\":%u,"
                 "\"fb\":\"/tmp/rosettasim_fb_%s.raw\","
                 "\"dims\":\"/tmp/rosettasim_dims_%s.json\"}",
                 g_devices[i].udid, g_devices[i].name,
                 g_devices[i].pixel_width, g_devices[i].pixel_height,
                 g_devices[i].scale,
+                g_devices[i].surface_id,
                 g_devices[i].udid, g_devices[i].udid);
         first = 0;
     }
@@ -401,9 +404,9 @@ static void activate_device(DeviceContext *ctx, id device) {
     dispatch_activate(ctx->recv_source);
 
     /* Write metadata */
-    uint32_t sid = IOSurfaceGetID(ctx->iosurface);
+    ctx->surface_id = IOSurfaceGetID(ctx->iosurface);
     FILE *idf = fopen("/tmp/rosettasim_surface_id", "w");
-    if (idf) { fprintf(idf, "%u\n", sid); fclose(idf); }
+    if (idf) { fprintf(idf, "%u\n", ctx->surface_id); fclose(idf); }
 
     write_device_metadata(ctx);
     ctx->active = 1;
@@ -411,7 +414,7 @@ static void activate_device(DeviceContext *ctx, id device) {
     write_active_devices();
 
     NSLog(@"[daemon] %s: PurpleFBServer registered (port=0x%x, surface=%ux%u id=%u)",
-          ctx->name, ctx->service_port, ctx->pixel_width, ctx->pixel_height, sid);
+          ctx->name, ctx->service_port, ctx->pixel_width, ctx->pixel_height, ctx->surface_id);
 }
 
 static void deactivate_device(DeviceContext *ctx) {
