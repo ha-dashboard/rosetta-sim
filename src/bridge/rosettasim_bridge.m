@@ -4213,50 +4213,126 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     }
                 }
 
-                /* LAYER_FLAGS_CHECK: Discover CALayer internal struct layout */
+                /* LAYER_FLAGS + CONTEXT CHECK */
                 {
                     Class calayerCls = (Class)objc_getClass("CALayer");
-                    if (calayerCls) {
-                        /* List ALL ivars */
-                        unsigned int ivarCount = 0;
-                        Ivar *ivars = class_copyIvarList(calayerCls, &ivarCount);
-                        bridge_log("LAYER_IVARS: CALayer has %u ivars:", ivarCount);
-                        for (unsigned int iv = 0; iv < ivarCount && iv < 20; iv++) {
-                            bridge_log("  [%u] '%s' offset=%td type='%s'",
-                                iv, ivar_getName(ivars[iv]), ivar_getOffset(ivars[iv]),
-                                ivar_getTypeEncoding(ivars[iv]) ?: "?");
-                        }
-                        if (ivars) free(ivars);
+                    Ivar attrIvar = calayerCls ? class_getInstanceVariable(calayerCls, "_attr") : NULL;
+                    ptrdiff_t attrOff = attrIvar ? ivar_getOffset(attrIvar) : -1;
 
-                        id _lf_app = ((id(*)(id,SEL))objc_msgSend)(
-                            (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
-                        id _lf_win = _lf_app ? ((id(*)(id,SEL))objc_msgSend)(_lf_app, sel_registerName("keyWindow")) : nil;
-                        id _lf_root = _lf_win ? ((id(*)(id,SEL))objc_msgSend)(_lf_win, sel_registerName("layer")) : nil;
+                    id _lf_app = ((id(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                    id _lf_win = _lf_app ? ((id(*)(id,SEL))objc_msgSend)(_lf_app, sel_registerName("keyWindow")) : nil;
+                    id _lf_root = _lf_win ? ((id(*)(id,SEL))objc_msgSend)(_lf_win, sel_registerName("layer")) : nil;
 
-                        if (_lf_root) {
-                            /* Dump raw memory of the CALayer object */
-                            uint64_t *raw = (uint64_t *)(void *)_lf_root;
-                            bridge_log("LAYER_RAW: rootLayer=%p dump:", (void *)_lf_root);
-                            for (int ri = 0; ri < 20; ri++) {
-                                bridge_log("  +0x%02x = 0x%016llx", ri * 8, raw[ri]);
+                    if (_lf_root && attrOff >= 0) {
+                        /* CA::Layer* is at _attr + 0x8 (inline struct: refcount, magic, layer*) */
+                        void *caLayer = *(void **)((uint8_t *)(void *)_lf_root + attrOff + 0x8);
+                        bridge_log("CA_LAYER: rootLayer=%p CA::Layer*=%p", (void *)_lf_root, caLayer);
+
+                        if (caLayer && (uintptr_t)caLayer > 0x1000) {
+                            /* Dump first 0x60 bytes of CA::Layer struct */
+                            uint64_t *lraw = (uint64_t *)caLayer;
+                            bridge_log("CA_LAYER: raw dump of CA::Layer:");
+                            for (int ri = 0; ri < 12; ri++) {
+                                bridge_log("  L+0x%02x = 0x%016llx", ri * 8, lraw[ri]);
                             }
 
-                            /* Scan for heap pointers that could be CA::Layer* */
-                            for (int ri = 0; ri < 20; ri++) {
-                                uint64_t val = raw[ri];
-                                if (val > 0x100000000ULL && val < 0x800000000000ULL && (val & 0x7) == 0) {
-                                    /* Looks like a heap pointer — try reading +0x4 for flags */
-                                    uint32_t maybe_flags = *(uint32_t *)((uint8_t *)(uintptr_t)val + 0x4);
-                                    uint32_t maybe_changed = *(uint32_t *)((uint8_t *)(uintptr_t)val + 0x2c);
-                                    bridge_log("LAYER_PTR_SCAN: +0x%02x -> %p  +0x4=0x%08x bit25=%d bit17=%d bit18=%d  +0x2c=0x%08x",
-                                        ri * 8, (void *)(uintptr_t)val, maybe_flags,
-                                        (maybe_flags >> 25) & 1, (maybe_flags >> 17) & 1, (maybe_flags >> 18) & 1,
-                                        maybe_changed);
+                            uint32_t flags = *(uint32_t *)((uint8_t *)caLayer + 0x4);
+                            uint32_t changed = *(uint32_t *)((uint8_t *)caLayer + 0x2c);
+                            uint32_t layer_ctx_id = *(uint32_t *)((uint8_t *)caLayer + 0xa4);
+                            bridge_log("CA_LAYER: +0x4=0x%08x bit25=%d bit17=%d bit18=%d  +0x2c=0x%08x  +0xa4(ctx_id)=%u",
+                                flags, (flags >> 25) & 1, (flags >> 17) & 1, (flags >> 18) & 1,
+                                changed, layer_ctx_id);
+                        }
+
+                        /* Check UIWindow._layerContext */
+                        SEL lcSel = sel_registerName("_layerContext");
+                        if (_lf_win && [(id)_lf_win respondsToSelector:lcSel]) {
+                            id layerCtx = ((id(*)(id,SEL))objc_msgSend)(_lf_win, lcSel);
+                            bridge_log("CA_CTX: window._layerContext = %p class=%s",
+                                (void *)layerCtx, layerCtx ? object_getClassName(layerCtx) : "nil");
+                            if (layerCtx) {
+                                /* Dump CAContext internals — look for impl pointer */
+                                Class cactxCls = (Class)objc_getClass("CAContext");
+                                Ivar ctxAttr = cactxCls ? class_getInstanceVariable(cactxCls, "_attr") : NULL;
+                                ptrdiff_t ctxOff = ctxAttr ? ivar_getOffset(ctxAttr) : -1;
+                                bridge_log("CA_CTX: CAContext._attr offset=%td", ctxOff);
+
+                                /* Dump raw CAContext memory */
+                                uint64_t *craw = (uint64_t *)(void *)layerCtx;
+                                bridge_log("CA_CTX: CAContext raw dump:");
+                                for (int ri = 0; ri < 16; ri++) {
+                                    bridge_log("  C+0x%02x = 0x%016llx", ri * 8, craw[ri]);
+                                }
+
+                                /* Check if context has a valid layer reference */
+                                SEL layerSel = sel_registerName("layer");
+                                if ([(id)layerCtx respondsToSelector:layerSel]) {
+                                    id ctxLayer = ((id(*)(id,SEL))objc_msgSend)(layerCtx, layerSel);
+                                    bridge_log("CA_CTX: context.layer = %p (rootLayer=%p match=%d)",
+                                        (void *)ctxLayer, (void *)_lf_root, ctxLayer == _lf_root);
                                 }
                             }
                         } else {
-                            bridge_log("LAYER_FLAGS: no root layer available");
+                            bridge_log("CA_CTX: window doesn't respond to _layerContext");
                         }
+
+                        /* Also check allContexts */
+                        Class cactxCls2 = (Class)objc_getClass("CAContext");
+                        if (cactxCls2) {
+                            id allCtxs = ((id(*)(id,SEL))objc_msgSend)((id)cactxCls2, sel_registerName("allContexts"));
+                            unsigned long ctxCount = allCtxs ? ((unsigned long(*)(id,SEL))objc_msgSend)(allCtxs, sel_registerName("count")) : 0;
+                            bridge_log("CA_CTX: allContexts count=%lu", ctxCount);
+                            for (unsigned long ci = 0; ci < ctxCount && ci < 5; ci++) {
+                                id ctx = ((id(*)(id,SEL,unsigned long))objc_msgSend)(allCtxs, sel_registerName("objectAtIndex:"), ci);
+                                SEL layerSel2 = sel_registerName("layer");
+                                id cLayer = [(id)ctx respondsToSelector:layerSel2] ?
+                                    ((id(*)(id,SEL))objc_msgSend)(ctx, layerSel2) : nil;
+                                SEL cidSel = sel_registerName("contextId");
+                                uint32_t cid = [(id)ctx respondsToSelector:cidSel] ?
+                                    ((uint32_t(*)(id,SEL))objc_msgSend)(ctx, cidSel) : 0;
+
+                                /* Read internal C++ context to get +0x5c (local_id).
+                                   CAContext also has _attr inline struct like CALayer. */
+                                Class cactxCls3 = (Class)objc_getClass("CAContext");
+                                Ivar ctxAttrI = cactxCls3 ? class_getInstanceVariable(cactxCls3, "_attr") : NULL;
+                                uint32_t local_id = 0xDEAD;
+                                if (ctxAttrI) {
+                                    ptrdiff_t co2 = ivar_getOffset(ctxAttrI);
+                                    /* Try: CAContext _attr might also be inline. Dump raw. */
+                                    uint64_t *ctxRaw = (uint64_t *)(void *)ctx;
+                                    bridge_log("CA_CTX[%lu]: raw +0x00=0x%llx +0x08=0x%llx +0x10=0x%llx +0x18=0x%llx +0x20=0x%llx",
+                                        ci, ctxRaw[0], ctxRaw[1], ctxRaw[2], ctxRaw[3], ctxRaw[4]);
+                                    /* The C++ CA::Context* may be at _attr+0x8 like CA::Layer */
+                                    void *cppCtx = *(void **)((uint8_t *)(void *)ctx + co2 + 0x8);
+                                    if (cppCtx && (uintptr_t)cppCtx > 0x1000 && (uintptr_t)cppCtx < 0x800000000000ULL) {
+                                        local_id = *(uint32_t *)((uint8_t *)cppCtx + 0x5c);
+                                        bridge_log("CA_CTX[%lu]: cppCtx=%p +0x5c(local_id)=%u",
+                                            ci, cppCtx, local_id);
+                                    }
+                                }
+
+                                bridge_log("CA_CTX[%lu]: id=%u local_id=%u class=%s layer=%p hasLayer=%d",
+                                    ci, cid, local_id, object_getClassName(ctx), (void *)cLayer, cLayer != nil);
+                            }
+                        }
+
+                        /* NOW: Set bit25 + changed + flush using correct offset */
+                        if (caLayer && (uintptr_t)caLayer > 0x1000) {
+                            uint32_t pre = *(uint32_t *)((uint8_t *)caLayer + 0x4);
+                            *(uint32_t *)((uint8_t *)caLayer + 0x4) |= 0x2000000;
+                            *(uint32_t *)((uint8_t *)caLayer + 0x4) &= ~0x60000;
+                            *(uint32_t *)((uint8_t *)caLayer + 0x2c) |= 0xfffff;
+                            uint32_t post = *(uint32_t *)((uint8_t *)caLayer + 0x4);
+                            bridge_log("CA_LAYER_FIX: flags 0x%08x -> 0x%08x  +0x2c now=0x%08x",
+                                pre, post, *(uint32_t *)((uint8_t *)caLayer + 0x2c));
+                            ((void(*)(id,SEL))objc_msgSend)(
+                                (id)objc_getClass("CATransaction"), sel_registerName("flush"));
+                            bridge_log("CA_LAYER_FIX: flushed");
+                        }
+                    } else {
+                        bridge_log("CA_LAYER: no root layer (win=%p root=%p attrOff=%td)",
+                            (void *)_lf_win, (void *)_lf_root, attrOff);
                     }
                 }
 
