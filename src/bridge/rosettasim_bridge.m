@@ -9474,6 +9474,61 @@ static void rosettasim_bridge_init(void) {
         }
     });
 
+    /* BG_FORCE via dispatch_after — reliable 5s timer independent of frame_capture_tick */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            id app = ((id(*)(id,SEL))objc_msgSend)(
+                (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+            id win = app ? ((id(*)(id,SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
+            if (win) {
+                id winLayer = ((id(*)(id,SEL))objc_msgSend)(win, sel_registerName("layer"));
+
+                /* Set UIView backgroundColor */
+                id redUI = ((id(*)(id,SEL))objc_msgSend)(
+                    (id)objc_getClass("UIColor"), sel_registerName("redColor"));
+                ((void(*)(id,SEL,id))objc_msgSend)(win, sel_registerName("setBackgroundColor:"), redUI);
+
+                /* Set CALayer.backgroundColor directly via CGColor */
+                typedef void *(*CGCSCreate_t)(void);
+                typedef void *(*CGCCreate_t)(void *, const float *);
+                CGCSCreate_t csCreate = (CGCSCreate_t)dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+                CGCCreate_t cCreate = (CGCCreate_t)dlsym(RTLD_DEFAULT, "CGColorCreate");
+                if (csCreate && cCreate && winLayer) {
+                    void *cs = csCreate();
+                    float red[] = {1.0f, 0.0f, 0.0f, 1.0f};
+                    float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+                    void *redCG = cCreate(cs, red);
+                    void *greenCG = cCreate(cs, green);
+
+                    ((void(*)(id,SEL,void*))objc_msgSend)(winLayer,
+                        sel_registerName("setBackgroundColor:"), redCG);
+                    ((void(*)(id,SEL,float))objc_msgSend)(winLayer,
+                        sel_registerName("setOpacity:"), 1.0f);
+
+                    id subs = ((id(*)(id,SEL))objc_msgSend)(winLayer, sel_registerName("sublayers"));
+                    unsigned long sc = subs ?
+                        ((unsigned long(*)(id,SEL))objc_msgSend)(subs, sel_registerName("count")) : 0;
+                    for (unsigned long si = 0; si < sc && si < 10; si++) {
+                        id sub = ((id(*)(id,SEL,unsigned long))objc_msgSend)(
+                            subs, sel_registerName("objectAtIndex:"), si);
+                        ((void(*)(id,SEL,void*))objc_msgSend)(sub,
+                            sel_registerName("setBackgroundColor:"), greenCG);
+                    }
+
+                    ((void(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("CATransaction"), sel_registerName("flush"));
+                    bridge_log("BG_FORCE_DISPATCH: RED root + GREEN %lu subs, flushed at t=5s (crl_total=%d)",
+                        sc, g_crl_total);
+                } else {
+                    bridge_log("BG_FORCE_DISPATCH: CGColor funcs not found");
+                }
+            } else {
+                bridge_log("BG_FORCE_DISPATCH: no keyWindow at t=5s");
+            }
+        }
+    });
+
     bridge_log("========================================");
 }
 
