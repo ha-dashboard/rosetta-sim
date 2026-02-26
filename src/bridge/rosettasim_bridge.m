@@ -4213,6 +4213,56 @@ static void frame_capture_tick(CFRunLoopTimerRef timer, void *info) {
                     }
                 }
 
+                /* BG_FORCE_LAYER: Set backgroundColor directly on CALayer via CGColor */
+                {
+                    id _app2 = ((id(*)(id,SEL))objc_msgSend)(
+                        (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
+                    id _win2 = _app2 ? ((id(*)(id,SEL))objc_msgSend)(_app2, sel_registerName("keyWindow")) : nil;
+                    id _rootL = _win2 ? ((id(*)(id,SEL))objc_msgSend)(_win2, sel_registerName("layer")) : nil;
+                    if (_rootL) {
+                        /* Create red CGColor: CGColorSpaceCreateDeviceRGB + CGColorCreate */
+                        typedef void *(*CGCSCreate_t)(void);
+                        typedef void *(*CGCCreate_t)(void *, const float *);
+                        CGCSCreate_t csCreate = (CGCSCreate_t)dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+                        CGCCreate_t cCreate = (CGCCreate_t)dlsym(RTLD_DEFAULT, "CGColorCreate");
+                        if (csCreate && cCreate) {
+                            void *cs = csCreate();
+                            float red[] = {1.0f, 0.0f, 0.0f, 1.0f};
+                            float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+                            void *redCG = cCreate(cs, red);
+                            void *greenCG = cCreate(cs, green);
+
+                            /* Set on root layer */
+                            ((void(*)(id,SEL,void*))objc_msgSend)(_rootL,
+                                sel_registerName("setBackgroundColor:"), redCG);
+                            ((void(*)(id,SEL,float))objc_msgSend)(_rootL,
+                                sel_registerName("setOpacity:"), 1.0f);
+                            ((void(*)(id,SEL,BOOL))objc_msgSend)(_rootL,
+                                sel_registerName("setOpaque:"), YES);
+
+                            /* Set on all sublayers */
+                            id subs = ((id(*)(id,SEL))objc_msgSend)(_rootL, sel_registerName("sublayers"));
+                            unsigned long sc = subs ? ((unsigned long(*)(id,SEL))objc_msgSend)(subs, sel_registerName("count")) : 0;
+                            for (unsigned long si = 0; si < sc && si < 5; si++) {
+                                id sub = ((id(*)(id,SEL,unsigned long))objc_msgSend)(subs, sel_registerName("objectAtIndex:"), si);
+                                ((void(*)(id,SEL,void*))objc_msgSend)(sub,
+                                    sel_registerName("setBackgroundColor:"), greenCG);
+                                ((void(*)(id,SEL,float))objc_msgSend)(sub,
+                                    sel_registerName("setOpacity:"), 1.0f);
+                                ((void(*)(id,SEL,BOOL))objc_msgSend)(sub,
+                                    sel_registerName("setOpaque:"), YES);
+                            }
+
+                            /* Force commit */
+                            ((void(*)(id,SEL))objc_msgSend)(
+                                (id)objc_getClass("CATransaction"), sel_registerName("flush"));
+                            bridge_log("BG_FORCE_LAYER: set RED root + GREEN subs (%lu), flushed via CGColor", sc);
+                        } else {
+                            bridge_log("BG_FORCE_LAYER: CGColor functions not found");
+                        }
+                    }
+                }
+
                 /* LAYER_FLAGS + CONTEXT CHECK */
                 {
                     Class calayerCls = (Class)objc_getClass("CALayer");

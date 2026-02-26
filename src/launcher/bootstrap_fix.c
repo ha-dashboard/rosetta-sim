@@ -1492,6 +1492,30 @@ static void _pcr_do_render(void) {
 
     /* === END DIRTY FLAG EXPERIMENTS === */
 
+    /* GRADIENT_TEST: At render 10, write a red gradient directly to SWContext pixbuf
+     * to confirm pixel transport works independently of compositing */
+    if (g_pcr_render_count == 10) {
+        void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
+        if (swctx) {
+            void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
+            uint32_t stride = *(uint32_t *)((uint8_t *)swctx + 0x678);
+            if (pixbuf && (uint64_t)pixbuf > 0x100000 && stride > 0) {
+                uint8_t *pp = (uint8_t *)pixbuf;
+                /* Write red gradient: 750 wide x 100 tall */
+                for (int y = 0; y < 100 && y * stride < 300000; y++) {
+                    for (int x = 0; x < 750; x++) {
+                        int off = y * stride + x * 4;
+                        pp[off + 0] = (uint8_t)(x * 255 / 750); /* B */
+                        pp[off + 1] = 0;                          /* G */
+                        pp[off + 2] = (uint8_t)(255 - y * 2);    /* R */
+                        pp[off + 3] = 255;                        /* A */
+                    }
+                }
+                bfix_log("GRADIENT_TEST: wrote red gradient to pixbuf=%p stride=%u", pixbuf, stride);
+            }
+        }
+    }
+
     g_pcr_render_count++;
     extern double CACurrentMediaTime(void);
     typedef void (*RFTFn)(void*, double, void*, unsigned int);
