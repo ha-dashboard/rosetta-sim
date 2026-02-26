@@ -1092,8 +1092,9 @@ static void bfix_trace_received_on_pi_port(mach_msg_header_t *msg, uint32_t tota
 }
 
 /* Thread-local flag: set when a CA commit (40002/40003) is received.
- * On the NEXT mach_msg call (after MIG processes the commit), we call
- * render_for_time to composite the newly-committed scene graph. */
+ * On the NEXT mach_msg call (after MIG processes the commit), we send
+ * a kick_server message (40001) to the CARenderServer port to trigger
+ * rendering on the correct PurpleMain display thread. */
 static __thread int g_commit_render_pending = 0;
 
 /* File-scope state for post-commit rendering */
@@ -1101,6 +1102,31 @@ static void *g_pcr_rft_fn = NULL;   /* render_for_time function pointer */
 static void *g_pcr_rft_srv = NULL;  /* CA::Render::Server* C++ object */
 static int g_pcr_init = 0;
 static int g_pcr_render_count = 0;
+static mach_port_t g_pcr_car_port = MACH_PORT_NULL; /* CARenderServer port */
+
+/* Send kick_server (msg_id 40001) to CARenderServer port.
+ * This is the NATIVE mechanism for waking the render loop.
+ * The PurpleMain display thread should handle it and trigger
+ * render_display on the correct thread with correct CA state. */
+static void _pcr_send_kick(void) {
+    if (!g_pcr_car_port) return;
+
+    mach_msg_header_t kick = {0};
+    kick.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    kick.msgh_size = sizeof(kick);
+    kick.msgh_remote_port = g_pcr_car_port;
+    kick.msgh_id = 40001; /* kick_server native message */
+    kern_return_t kr = mach_msg(&kick, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                 sizeof(kick), 0, 0, 100, 0);
+
+    static int _kick_log = 0;
+    if (_kick_log < 5 || _kick_log % 200 == 0) {
+        bfix_log("KICK_SERVER[%d]: msg_id=40001 to port=%u kr=%d(%s)",
+            _kick_log, g_pcr_car_port, kr,
+            kr == KERN_SUCCESS ? "ok" : mach_error_string(kr));
+    }
+    _kick_log++;
+}
 
 static void _pcr_do_render(void) {
     /* Lazy init */
@@ -1109,10 +1135,13 @@ static void _pcr_do_render(void) {
         const char *pn = getprogname();
         if (!(pn && strstr(pn, "backboardd"))) return;
 
-        void *sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
-        if (sym) {
+        /* Get CARenderServer port for kick_server messages */
+        typedef mach_port_t (*GSPFn)(void);
+        GSPFn gsp = (GSPFn)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+        if (gsp) {
+            g_pcr_car_port = gsp();
             Dl_info dinfo;
-            if (dladdr(sym, &dinfo) && dinfo.dli_fbase) {
+            if (dladdr((void *)gsp, &dinfo) && dinfo.dli_fbase) {
                 uintptr_t qc_base = (uintptr_t)dinfo.dli_fbase;
                 g_pcr_rft_fn = (void *)(qc_base + 0x1287ea);
             }
@@ -1135,12 +1164,249 @@ static void _pcr_do_render(void) {
                 }
             }
         }
-        bfix_log("POST_COMMIT_RENDER: init fn=%p srv=%p %s",
-            g_pcr_rft_fn, g_pcr_rft_srv,
+        bfix_log("POST_COMMIT_RENDER: init fn=%p srv=%p car_port=%u %s",
+            g_pcr_rft_fn, g_pcr_rft_srv, g_pcr_car_port,
             (g_pcr_rft_fn && g_pcr_rft_srv) ? "READY" : "FAILED");
+
+        /* Check PurpleDisplay::can_update() gate — Display+0xfa bit 1
+         * If bit 1 is set, can_update returns false and render_for_time
+         * SKIPS ALL RENDERING (jumps to cleanup at 0x129413). */
+        if (g_pcr_rft_srv) {
+            void *display_cpp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+            if (display_cpp) {
+                uint8_t fa_byte = *(uint8_t *)((uint8_t *)display_cpp + 0xfa);
+                bfix_log("CAN_UPDATE: Display+0xfa = 0x%02x bit1=%d can_update=%d",
+                    fa_byte, (fa_byte >> 1) & 1, !(fa_byte & 0x2));
+                if (fa_byte & 0x2) {
+                    *(uint8_t *)((uint8_t *)display_cpp + 0xfa) &= ~0x02;
+                    bfix_log("CAN_UPDATE: CLEARED bit 1 → can_update=1");
+                }
+            } else {
+                bfix_log("CAN_UPDATE: display_cpp is NULL!");
+            }
+
+            /* Check OGL::Renderer at Server+0xc0 — if NULL, no compositor */
+            void *renderer = *(void **)((uint8_t *)g_pcr_rft_srv + 0xc0);
+            bfix_log("RENDERER: Server+0xc0 = %p", renderer);
+
+            /* Dump full Server layout from +0x00 to +0xd8 to map fields */
+            uint8_t *srv = (uint8_t *)g_pcr_rft_srv;
+            bfix_log("SERVER_LAYOUT: ptr=%p", g_pcr_rft_srv);
+            for (int off = 0; off <= 0xd8; off += 8) {
+                void *val = *(void **)(srv + off);
+                bfix_log("  Server+0x%02x = %p", off, val);
+            }
+        }
     }
 
+    /* APPROACH A: Send kick_server (40001) to trigger render on PurpleMain thread */
+    _pcr_send_kick();
+
+    /* APPROACH B (fallback): Direct render_for_time on current thread */
     if (!g_pcr_rft_fn || !g_pcr_rft_srv) return;
+
+    /* Ensure can_update gate is open BEFORE each render */
+    {
+        void *display_cpp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+        if (display_cpp) {
+            uint8_t fa_byte = *(uint8_t *)((uint8_t *)display_cpp + 0xfa);
+            if (fa_byte & 0x2) {
+                *(uint8_t *)((uint8_t *)display_cpp + 0xfa) &= ~0x02;
+                static int _cu_clear = 0;
+                if (_cu_clear < 5)
+                    bfix_log("CAN_UPDATE[%d]: cleared bit1 before render (was 0x%02x)",
+                        ++_cu_clear, fa_byte);
+            }
+        }
+    }
+
+    /* Log renderer pointer on first few renders to verify it's populated */
+    if (g_pcr_render_count < 3) {
+        void *renderer = *(void **)((uint8_t *)g_pcr_rft_srv + 0xc0);
+        void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
+        bfix_log("PRE_RENDER[%d]: renderer=%p swctx=%p", g_pcr_render_count, renderer, swctx);
+    }
+
+    /* Check display vtable gates — is_ready, ignore_update_p, is_enabled */
+    if (g_pcr_render_count < 5) {
+        void *display_cpp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+        if (display_cpp) {
+            void **dv = *(void ***)display_cpp;
+
+            /* is_ready: vtable[9] = +0x48 */
+            typedef int (*IsReadyFn)(void*);
+            int ready = ((IsReadyFn)dv[9])(display_cpp);
+
+            /* ignore_update_p: vtable[16] = +0x80 */
+            typedef int (*IgnoreUpdateFn)(void*);
+            int ignore = ((IgnoreUpdateFn)dv[16])(display_cpp);
+
+            /* is_enabled: Display+0x1e0 bit 0 */
+            uint8_t e0 = *(uint8_t *)((uint8_t *)display_cpp + 0x1e0);
+
+            bfix_log("DISPLAY_GATES[%d]: is_ready=%d ignore_update=%d is_enabled=%d(+0x1e0=0x%02x)",
+                g_pcr_render_count, ready, ignore, e0 & 1, e0);
+        }
+    }
+
+    /* EXPERIMENT: Inject server contexts into display context list.
+     * The display list at display+0xC0 contains only a sentinel (0xFFFFFFFFFFFFFFFF).
+     * Try replacing it with actual server context handles to see if render_display
+     * produces pixels when it has real contexts to iterate. */
+    static int _ctx_injected = 0;
+    if (!_ctx_injected && g_pcr_rft_srv && g_pcr_render_count >= 2) {
+        void *display_cpp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+        if (display_cpp) {
+            void **dlist_begin = (void **)*(void **)((uint8_t *)display_cpp + 0xC0);
+            void **dlist_end   = (void **)*(void **)((uint8_t *)display_cpp + 0xC8);
+            int dcount = (dlist_begin && dlist_end && dlist_end > dlist_begin) ?
+                (int)((uintptr_t)dlist_end - (uintptr_t)dlist_begin) / sizeof(void*) : 0;
+
+            /* Find first server context with a valid handle (non-NULL, seed > 0) */
+            /* Server context list: pointer at +0x68, iterate looking for handles */
+            void *ctx_list_ptr = *(void **)((uint8_t *)g_pcr_rft_srv + 0x68);
+            if (ctx_list_ptr && dcount == 1 && dlist_begin) {
+                /* The server ctx list layout: array of pointers to Context objects.
+                 * Each Context has: +0x00=vtable, we iterate Server+0x68 entries.
+                 * But we need the Context* pointers themselves.
+                 *
+                 * Actually, the CTX dump shows handle= values. Let me collect
+                 * non-NULL handles from the server ctx list. The list at +0x68
+                 * is a std::vector-like structure. Let me read it as pointer pairs. */
+
+                /* Read from the hash map at Server+0x68 to find Context* pointers */
+                /* For now, try the simplest approach: iterate the known context
+                 * dump and find the first one with a handle. We already have the
+                 * server at g_pcr_rft_srv.
+                 *
+                 * Server ctx iteration: the CTX dump code walks an internal map.
+                 * Let me just try writing the first context's handle directly. */
+
+                /* Actually let's just gather context handles from the CTX_DIAG path.
+                 * We need to walk the server's context map. For simplicity, store
+                 * context handles we've seen in the CTX dump. */
+
+                /* Walk server context list (same layout as CTX_DIAG code).
+                 * Array at Server+0x68, count at Server+0x78, stride=0x10 per entry.
+                 * Context* at offset 0 of each 0x10-byte entry. */
+                uint64_t ctx_count = *(uint64_t *)((uint8_t *)g_pcr_rft_srv + 0x78);
+
+                /* Collect up to 8 valid Context* pointers */
+                void *ctx_handles[8];
+                int n_handles = 0;
+
+                if (ctx_count > 0 && ctx_count < 100) {
+                    for (uint64_t ci = 0; ci < ctx_count && n_handles < 8; ci++) {
+                        void *ctx = *(void **)((uint8_t *)ctx_list_ptr + ci * 0x10);
+                        if (ctx && (uintptr_t)ctx > 0x100000) {
+                            ctx_handles[n_handles++] = ctx;
+                        }
+                    }
+                }
+
+                if (n_handles > 0) {
+                    bfix_log("CTX_INJECT: found %d contexts, injecting into display list", n_handles);
+
+                    /* Allocate new display context array.
+                     * For safety, use malloc (lives in our heap, won't be freed by CA). */
+                    void **new_list = (void **)malloc(n_handles * sizeof(void *));
+                    if (new_list) {
+                        for (int i = 0; i < n_handles; i++) {
+                            new_list[i] = ctx_handles[i];
+                            bfix_log("CTX_INJECT[%d]: %p", i, ctx_handles[i]);
+                        }
+
+                        /* Overwrite display context list pointers */
+                        *(void **)((uint8_t *)display_cpp + 0xC0) = new_list;
+                        *(void **)((uint8_t *)display_cpp + 0xC8) = new_list + n_handles;
+                        *(void **)((uint8_t *)display_cpp + 0xD0) = new_list + n_handles;
+                        _ctx_injected = 1;
+                        bfix_log("CTX_INJECT: display ctx list updated, count=%d", n_handles);
+                    }
+                } else {
+                    bfix_log("CTX_INJECT: no valid context handles found in server map");
+                }
+            }
+        }
+    }
+
+    /* === DIRTY FLAG PROPAGATION EXPERIMENTS === */
+    static uintptr_t _qc_base = 0;
+    if (!_qc_base) {
+        void *sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+        if (sym) {
+            Dl_info di;
+            if (dladdr(sym, &di) && di.dli_fbase)
+                _qc_base = (uintptr_t)di.dli_fbase;
+        }
+    }
+
+    /* Option A: Try Server::invalidate(NULL) via dlsym */
+    {
+        static void *_inv_fn = NULL;
+        static int _inv_tried = 0;
+        if (!_inv_tried) {
+            _inv_tried = 1;
+            _inv_fn = dlsym(RTLD_DEFAULT, "_ZN2CA12WindowServer6Server10invalidateEPNS_5ShapeE");
+            bfix_log("INVALIDATE: dlsym=%p", _inv_fn);
+        }
+        if (_inv_fn) {
+            typedef void (*InvFn)(void*, void*);
+            ((InvFn)_inv_fn)(g_pcr_rft_srv, NULL);
+        }
+    }
+
+    /* Option D: Call Server->vtable[3] set_next_update(0.0, 0.0) to mark server dirty.
+     * This is the native mechanism for telling the server it needs to render.
+     * Without add_observers (deadlocked by context_created MIG 40400 self-send),
+     * did_commit notifications go nowhere → server never marked dirty. */
+    {
+        void **srv_vt = *(void ***)g_pcr_rft_srv;
+        typedef void (*SetNextUpdateFn)(void*, double, double);
+        SetNextUpdateFn set_next = (SetNextUpdateFn)srv_vt[3];
+        static int _snu_log = 0;
+        if (_snu_log < 3)
+            bfix_log("SET_NEXT_UPDATE[%d]: vtable[3]=%p srv=%p", _snu_log, (void *)srv_vt[3], g_pcr_rft_srv);
+        set_next(g_pcr_rft_srv, 0.0, 0.0);
+        if (_snu_log < 3) {
+            _snu_log++;
+            bfix_log("SET_NEXT_UPDATE[%d]: called successfully", _snu_log);
+        }
+    }
+
+    /* Option B: Check Display+0x28/+0x30 early exit flags */
+    {
+        void *display_cpp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+        if (display_cpp) {
+            void *d28 = *(void **)((uint8_t *)display_cpp + 0x28);
+            uint8_t d30 = *(uint8_t *)((uint8_t *)display_cpp + 0x30);
+            static int _exit_log = 0;
+            if (_exit_log < 5) {
+                _exit_log++;
+                bfix_log("EARLY_EXIT[%d]: Display+0x28=%p +0x30=0x%02x bit5=%d",
+                    _exit_log, d28, d30, (d30 >> 5) & 1);
+            }
+            /* Clear bit 5 if set — might prevent early exit */
+            if (d30 & 0x20) {
+                *(uint8_t *)((uint8_t *)display_cpp + 0x30) &= ~0x20;
+                bfix_log("EARLY_EXIT: cleared bit5 of Display+0x30");
+            }
+        }
+    }
+
+    /* Option C: Call kick_server at QC+0xb2cde BEFORE render */
+    if (_qc_base) {
+        typedef void (*KickFn)(void*);
+        KickFn kick = (KickFn)(_qc_base + 0xb2cde);
+        kick(g_pcr_rft_srv);
+        static int _kick_log = 0;
+        if (_kick_log < 5) {
+            _kick_log++;
+            bfix_log("KICK_DIRECT[%d]: called kick_server(%p)", _kick_log, g_pcr_rft_srv);
+        }
+    }
+
+    /* === END DIRTY FLAG EXPERIMENTS === */
 
     g_pcr_render_count++;
     extern double CACurrentMediaTime(void);
@@ -1208,8 +1474,20 @@ static void _pcr_do_render(void) {
                 uint32_t cid = *(uint32_t *)((uint8_t *)ctx + 0x0C);
                 uint32_t commit_seed = *(uint32_t *)((uint8_t *)ctx + 0x24);
                 void *root_handle = *(void **)((uint8_t *)ctx + 0xB8);
+                /* Dump context fields to find server port and flags.
+                 * Scan uint32s looking for port-sized values (1000-65535 range) */
+                uint32_t *ctx32 = (uint32_t *)ctx;
                 bfix_log("CTX[%llu]: id=%u seed=%u handle=%p",
                     (unsigned long long)ci, cid, commit_seed, root_handle);
+                if (g_pcr_render_count <= 2 && ci == 0) {
+                    /* Dump first 64 uint32s of context to map layout */
+                    for (int off32 = 0; off32 < 64; off32 += 8) {
+                        bfix_log("  ctx32[%d-%d]: %08x %08x %08x %08x %08x %08x %08x %08x",
+                            off32, off32+7,
+                            ctx32[off32], ctx32[off32+1], ctx32[off32+2], ctx32[off32+3],
+                            ctx32[off32+4], ctx32[off32+5], ctx32[off32+6], ctx32[off32+7]);
+                    }
+                }
 
                 if (!root_handle) continue;
 
@@ -1251,6 +1529,30 @@ static void _pcr_do_render(void) {
                 }
 
                 bfix_log("  ROOT: sublayers=%d", sub_count);
+
+                /* Inspect first sublayer — does it have content/backing store? */
+                if (sub_array && sub_count > 0 && g_pcr_render_count <= 3) {
+                    /* CA::Render::ShmemArray layout: +0x00=count?, +0x04=..., +0x08=reserved, +0x10=data_ptr */
+                    /* Each sublayer is a pointer at data_ptr + i*8 */
+                    void *sub_data = *(void **)((uint8_t *)sub_array + 0x10);
+                    if (!sub_data) sub_data = *(void **)((uint8_t *)sub_array + 0x08);
+                    if (sub_data && (uintptr_t)sub_data > 0x100000) {
+                        void *sublayer = *(void **)sub_data;
+                        if (sublayer && (uintptr_t)sublayer > 0x100000) {
+                            /* Dump sublayer raw data to find contents/backing */
+                            uint64_t *sraw = (uint64_t *)sublayer;
+                            bfix_log("  SUB[0] raw[0-7]:  %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                                sraw[0],sraw[1],sraw[2],sraw[3],sraw[4],sraw[5],sraw[6],sraw[7]);
+                            bfix_log("  SUB[0] raw[8-15]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                                sraw[8],sraw[9],sraw[10],sraw[11],sraw[12],sraw[13],sraw[14],sraw[15]);
+                            /* Check for backgroundColor at known Render::Layer offsets */
+                            /* flags at +0x20, backgroundColor might be at +0xC0-0xE0 range */
+                            double *colors = (double *)((uint8_t *)sublayer + 0xC0);
+                            bfix_log("  SUB[0] potential_colors: %.2f %.2f %.2f %.2f",
+                                colors[0], colors[1], colors[2], colors[3]);
+                        }
+                    }
+                }
             }
 
             /* Check DISPLAY context list — different from server context list */
@@ -1262,6 +1564,14 @@ static void _pcr_do_render(void) {
                 int dcount = (dlist_begin && dlist_end && dlist_end > dlist_begin) ?
                     (int)((uintptr_t)dlist_end - (uintptr_t)dlist_begin) / 8 : 0;
                 bfix_log("DISPLAY_CTX: begin=%p end=%p count=%d", dlist_begin, dlist_end, dcount);
+
+                /* Dump the actual context pointers in the display list */
+                if (dcount > 0 && dcount <= 20 && g_pcr_render_count <= 3) {
+                    void **dptrs = (void **)dlist_begin;
+                    for (int di = 0; di < dcount; di++) {
+                        bfix_log("DISPLAY_CTX[%d]: ctx_ptr=%p", di, dptrs[di]);
+                    }
+                }
 
                 /* Also scan wider range for any vector-like patterns */
                 for (int doff = 0x60; doff <= 0x100; doff += 8) {
@@ -1313,6 +1623,21 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
     }
 
     const int is_assertiond = bfix_is_assertiond_process();
+
+    /* Track flush_shmem (msg_id=3) sends from backboardd */
+    static int g_flush_count = 0;
+    if ((option & MACH_SEND_MSG) && msg && msg->msgh_id == 3) {
+        static int _is_bbd = -1;
+        if (_is_bbd == -1) {
+            const char *pn = getprogname();
+            _is_bbd = (pn && strstr(pn, "backboardd")) ? 1 : 0;
+        }
+        if (_is_bbd) {
+            g_flush_count++;
+            if (g_flush_count <= 5 || g_flush_count % 100 == 0)
+                bfix_log("FLUSH_SHMEM[%d]: msg_id=3 sent", g_flush_count);
+        }
+    }
 
     /* Log ALL 40002/40003 sends from ANY process — identifies which process sends commits */
     if ((option & MACH_SEND_MSG) && msg) {
@@ -1508,6 +1833,19 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
         }
         if (_recv_is_bbd && msg->msgh_id > 40000) {
             static int _ca_recv_count = 0;
+
+            /* Log kick_server (40001) receipt to verify it's dispatched */
+            if (msg->msgh_id == 40001) {
+                static int _kick_recv = 0;
+                _kick_recv++;
+                if (_kick_recv <= 10 || _kick_recv % 200 == 0) {
+                    char _kt[64] = {0};
+                    pthread_getname_np(pthread_self(), _kt, sizeof(_kt));
+                    bfix_log("KICK_RECV[%d]: msg_id=40001 on thread='%s' port=%u",
+                        _kick_recv, _kt[0] ? _kt : "(unnamed)", msg->msgh_local_port);
+                }
+            }
+
             /* Always log 40002/40003 commit data messages with thread info */
             if (msg->msgh_id == 40002 || msg->msgh_id == 40003) {
                 int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
