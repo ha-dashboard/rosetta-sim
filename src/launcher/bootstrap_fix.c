@@ -1356,21 +1356,43 @@ static void _pcr_do_render(void) {
         }
     }
 
-    /* Option D: Call Server->vtable[3] set_next_update(0.0, 0.0) to mark server dirty.
-     * This is the native mechanism for telling the server it needs to render.
-     * Without add_observers (deadlocked by context_created MIG 40400 self-send),
-     * did_commit notifications go nowhere → server never marked dirty. */
+    /* Option D: Call set_next_update + attach_contexts from background thread.
+     * context_created deadlocks from server thread (MIG 40400 self-send).
+     * Dispatching to a background queue lets the server thread process
+     * the 40400 message while we call context_created. */
     {
         void **srv_vt = *(void ***)g_pcr_rft_srv;
         typedef void (*SetNextUpdateFn)(void*, double, double);
         SetNextUpdateFn set_next = (SetNextUpdateFn)srv_vt[3];
-        static int _snu_log = 0;
-        if (_snu_log < 3)
-            bfix_log("SET_NEXT_UPDATE[%d]: vtable[3]=%p srv=%p", _snu_log, (void *)srv_vt[3], g_pcr_rft_srv);
         set_next(g_pcr_rft_srv, 0.0, 0.0);
+        static int _snu_log = 0;
         if (_snu_log < 3) {
-            _snu_log++;
-            bfix_log("SET_NEXT_UPDATE[%d]: called successfully", _snu_log);
+            bfix_log("SET_NEXT_UPDATE[%d]: vtable[3]=%p", ++_snu_log, (void *)srv_vt[3]);
+        }
+    }
+
+    /* Option E: Dispatch attach_contexts to background queue.
+     * attach_contexts at QC+0x1286de calls copy_all_contexts then
+     * context_created on each. Must run on non-server thread. */
+    {
+        static int _attach_tried = 0;
+        if (!_attach_tried && _qc_base && g_pcr_render_count >= 3) {
+            _attach_tried = 1;
+            /* Create a struct to pass to the block */
+            typedef void (*AttachFn)(void*);
+            AttachFn attach = (AttachFn)(_qc_base + 0x1286de);
+            void *srv_copy = g_pcr_rft_srv;
+            bfix_log("ATTACH_CTX: dispatching attach_contexts(%p) to bg queue, fn=%p",
+                srv_copy, (void *)attach);
+
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                bfix_log("ATTACH_CTX: calling attach_contexts from bg thread");
+                char tname[64] = {0};
+                pthread_getname_np(pthread_self(), tname, sizeof(tname));
+                bfix_log("ATTACH_CTX: thread='%s'", tname[0] ? tname : "(unnamed)");
+                attach(srv_copy);
+                bfix_log("ATTACH_CTX: returned!");
+            });
         }
     }
 
@@ -1403,6 +1425,42 @@ static void _pcr_do_render(void) {
         if (_kick_log < 5) {
             _kick_log++;
             bfix_log("KICK_DIRECT[%d]: called kick_server(%p)", _kick_log, g_pcr_rft_srv);
+        }
+    }
+
+    /* Option F: Check if Shmem is mapped at 0x100000000 in backboardd.
+     * The client writes commit data to a Shmem region at this address.
+     * If the server can't access it, layers are empty skeletons. */
+    {
+        static int _shmem_checked = 0;
+        if (!_shmem_checked) {
+            _shmem_checked = 1;
+            vm_offset_t test_data = 0;
+            mach_msg_type_number_t test_cnt = 0;
+            kern_return_t kr = vm_read(mach_task_self(), 0x100000000ULL, 64,
+                                        &test_data, &test_cnt);
+            if (kr == KERN_SUCCESS && test_cnt > 0) {
+                uint32_t *words = (uint32_t *)test_data;
+                bfix_log("SHMEM_TEST: vm_read(self, 0x100000000) SUCCESS cnt=%u "
+                    "magic=0x%x 0x%x 0x%x 0x%x",
+                    test_cnt, words[0], words[1], words[2], words[3]);
+                vm_deallocate(mach_task_self(), test_data, test_cnt);
+            } else {
+                bfix_log("SHMEM_TEST: vm_read(self, 0x100000000) FAILED kr=%d(%s)",
+                    kr, mach_error_string(kr));
+            }
+
+            /* Also scan for mapped regions near 0x100000000 */
+            vm_address_t addr = 0x100000000ULL;
+            vm_size_t size = 0;
+            natural_t depth = 0;
+            struct vm_region_submap_info_64 info;
+            mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+            kr = vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                                       (vm_region_info_64_t)&info, &count);
+            bfix_log("SHMEM_TEST: region at 0x%llx size=0x%llx kr=%d prot=%d/%d",
+                (unsigned long long)addr, (unsigned long long)size, kr,
+                info.protection, info.max_protection);
         }
     }
 
