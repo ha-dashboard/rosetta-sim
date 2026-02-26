@@ -1,26 +1,20 @@
 #!/bin/bash
 #
-# run_legacy_sim.sh — Launch a legacy iOS simulator with display support
+# run_legacy_sim.sh — Launch a legacy iOS simulator with display in Simulator.app
 #
-# Boots a legacy iOS simulator (9.3 / 10.3) with the PurpleFB bridge
-# providing framebuffer services, then optionally injects the display
-# surface into Simulator.app so it appears in the normal Xcode window.
+# Starts PurpleFB bridge, boots the sim, waits for rendering, then launches
+# a re-signed Simulator.app with DYLD_INSERT of the display injection dylib.
 #
 # Usage:
-#   ./scripts/run_legacy_sim.sh                     # default: iOS 9.3 iPhone 6s
-#   ./scripts/run_legacy_sim.sh <UDID>              # specific device
-#   ./scripts/run_legacy_sim.sh --no-inject <UDID>  # skip Simulator.app injection
+#   ./scripts/run_legacy_sim.sh                        # default: first iOS 9.3 device
+#   ./scripts/run_legacy_sim.sh "iPhone 6s"            # by device name
+#   ./scripts/run_legacy_sim.sh "iPad Pro"             # iPad
+#   ./scripts/run_legacy_sim.sh --ios10                # default iOS 10.3 device
+#   ./scripts/run_legacy_sim.sh --no-inject <name>     # bridge only, no Simulator.app
+#   ./scripts/run_legacy_sim.sh <UDID>                 # by exact UDID
 #
 # Prerequisites:
-#   - Device must be created: xcrun simctl create "iPhone 6s (9.3)" ...
-#   - purple_fb_bridge must be built: tools/display_bridge/purple_fb_bridge
-#   - sim_display_inject.dylib must be built: tools/display_bridge/sim_display_inject.dylib
-#
-# How it works:
-#   1. Registers PurpleFBServer Mach service for the device via CoreSimulator API
-#   2. Boots the sim — backboardd finds PurpleFBServer and creates a display
-#   3. Optionally injects display dylib into Simulator.app to show the surface
-#   4. Keeps running until Ctrl-C (bridge must stay alive for display to work)
+#   Run scripts/setup.sh first to build tools and create re-signed Simulator.
 #
 
 set -euo pipefail
@@ -31,14 +25,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Tools
 BRIDGE="$PROJECT_ROOT/tools/display_bridge/purple_fb_bridge"
 INJECT="$PROJECT_ROOT/tools/display_bridge/sim_display_inject.dylib"
+SIMULATOR="/tmp/Simulator_nolv.app/Contents/MacOS/Simulator"
 
-# Default device UDIDs
-DEFAULT_93="647B6002-AD33-46AE-A78B-A7DAE3128A69"
-DEFAULT_103="03291AC5-5138-4486-A818-F86197A9BFAB"
+# Framework paths needed by re-signed Simulator
+DYLD_FW_PATH="/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks:/Library/Developer/PrivateFrameworks"
 
 # Parse args
 DO_INJECT=1
-UDID=""
+DEVICE_SPEC=""
+USE_IOS10=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,127 +42,200 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --ios10|--10.3|--103)
-            UDID="$DEFAULT_103"
+            USE_IOS10=1
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--no-inject] [--ios10] [UDID]"
+            echo "Usage: $0 [OPTIONS] [DEVICE_NAME_OR_UDID]"
             echo ""
             echo "Options:"
-            echo "  --no-inject  Skip Simulator.app display injection"
+            echo "  --no-inject  Skip Simulator.app display injection (bridge + viewer only)"
             echo "  --ios10      Use default iOS 10.3 device"
-            echo "  UDID         Specific device UUID"
             echo ""
-            echo "Default: iOS 9.3 iPhone 6s ($DEFAULT_93)"
+            echo "Examples:"
+            echo "  $0                      # default iOS 9.3 iPhone 6s"
+            echo "  $0 \"iPhone 6s\"          # by name"
+            echo "  $0 \"iPad Pro\"           # iPad"
+            echo "  $0 --ios10              # iOS 10.3"
+            echo "  $0 647B6002-...         # by UDID"
             exit 0
             ;;
         *)
-            UDID="$1"
+            DEVICE_SPEC="$1"
             shift
             ;;
     esac
 done
 
-UDID="${UDID:-$DEFAULT_93}"
+# --- Resolve device UDID ---
+resolve_udid() {
+    local spec="$1"
 
-# Verify tools exist
+    # If it looks like a UDID (contains hyphens, all hex), use directly
+    if [[ "$spec" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+        echo "$spec"
+        return
+    fi
+
+    # Search by name in legacy runtimes
+    local udid
+    udid=$(xcrun simctl list devices 2>/dev/null \
+        | grep -E '9\.3|10\.3' \
+        | grep -v unavailable \
+        | grep "$spec" \
+        | head -1 \
+        | sed 's/.*(\([A-F0-9-]*\)).*/\1/')
+
+    if [[ -z "$udid" ]]; then
+        echo ""
+        return
+    fi
+    echo "$udid"
+}
+
+if [[ -n "$DEVICE_SPEC" ]]; then
+    UDID=$(resolve_udid "$DEVICE_SPEC")
+    if [[ -z "$UDID" ]]; then
+        echo "ERROR: Device '$DEVICE_SPEC' not found in legacy runtimes."
+        echo ""
+        echo "Available legacy devices:"
+        xcrun simctl list devices 2>&1 | grep -E '9\.3|10\.3' | grep -v unavailable | sed 's/^/  /'
+        exit 1
+    fi
+elif [[ "$USE_IOS10" -eq 1 ]]; then
+    UDID=$(xcrun simctl list devices 2>/dev/null \
+        | grep "10\.3" \
+        | grep -v unavailable \
+        | head -1 \
+        | sed 's/.*(\([A-F0-9-]*\)).*/\1/')
+    if [[ -z "$UDID" ]]; then
+        echo "ERROR: No iOS 10.3 device found."
+        exit 1
+    fi
+else
+    # Default: first available iOS 9.3 device
+    UDID=$(xcrun simctl list devices 2>/dev/null \
+        | grep "9\.3" \
+        | grep -v unavailable \
+        | head -1 \
+        | sed 's/.*(\([A-F0-9-]*\)).*/\1/')
+    if [[ -z "$UDID" ]]; then
+        echo "ERROR: No iOS 9.3 device found. Run scripts/setup.sh first."
+        exit 1
+    fi
+fi
+
+# Get device name for display
+DEVICE_NAME=$(xcrun simctl list devices 2>/dev/null | grep "$UDID" | head -1 | sed 's/ *\(.*\) (.*/\1/')
+
+echo "=== RosettaSim ==="
+echo "Device: $DEVICE_NAME ($UDID)"
+echo ""
+
+# --- Verify tools ---
 if [[ ! -x "$BRIDGE" ]]; then
-    echo "ERROR: PurpleFB bridge not found at $BRIDGE"
-    echo "Build it: cd tools/display_bridge && clang -fobjc-arc -fmodules -arch arm64e -framework Foundation -framework IOSurface -Wl,-undefined,dynamic_lookup -o purple_fb_bridge purple_fb_bridge.m"
+    echo "ERROR: Bridge not built. Run: scripts/setup.sh"
     exit 1
 fi
-
-# Verify device exists
-if ! xcrun simctl list devices 2>/dev/null | grep -q "$UDID"; then
-    echo "ERROR: Device $UDID not found"
-    echo "Available legacy devices:"
-    xcrun simctl list devices 2>&1 | grep -E '9\.3|10\.3' | grep -v unavailable
-    exit 1
+if [[ "$DO_INJECT" -eq 1 ]]; then
+    if [[ ! -f "$INJECT" ]]; then
+        echo "ERROR: Injection dylib not built. Run: scripts/setup.sh"
+        exit 1
+    fi
+    if [[ ! -f "$SIMULATOR" ]]; then
+        echo "ERROR: Re-signed Simulator not found. Run: scripts/setup.sh"
+        exit 1
+    fi
 fi
 
-# Ensure device is shutdown
-echo "Ensuring device is shutdown..."
-xcrun simctl shutdown "$UDID" 2>/dev/null || true
-
-# Cleanup on exit
+# --- Cleanup function ---
 BRIDGE_PID=""
+SIM_PID=""
 cleanup() {
     echo ""
     echo "Shutting down..."
-    if [[ -n "$BRIDGE_PID" ]]; then
-        kill "$BRIDGE_PID" 2>/dev/null || true
-        wait "$BRIDGE_PID" 2>/dev/null || true
-    fi
+    [[ -n "$SIM_PID" ]] && kill "$SIM_PID" 2>/dev/null || true
+    [[ -n "$BRIDGE_PID" ]] && kill "$BRIDGE_PID" 2>/dev/null || true
     xcrun simctl shutdown "$UDID" 2>/dev/null || true
+    rm -f /tmp/sim_framebuffer.raw /tmp/sim_framebuffer.raw.tmp /tmp/rosettasim_surface_id
     echo "Done."
 }
 trap cleanup EXIT INT TERM
 
-# Step 1: Start PurpleFB bridge
-echo "Starting PurpleFB bridge for $UDID..."
+# --- Kill existing Simulator.app (only one instance allowed) ---
+if pgrep -x Simulator >/dev/null 2>&1; then
+    echo "Killing existing Simulator.app..."
+    pkill -x Simulator 2>/dev/null || true
+    sleep 2
+fi
+
+# --- Ensure device is shutdown ---
+xcrun simctl shutdown "$UDID" 2>/dev/null || true
+sleep 1
+
+# --- Step 1: Start PurpleFB bridge ---
+echo "Starting PurpleFB bridge..."
 "$BRIDGE" "$UDID" &
 BRIDGE_PID=$!
-
-# Wait for bridge to register service
 sleep 2
 
-# Verify bridge is running
 if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
-    echo "ERROR: PurpleFB bridge died. Check output above."
+    echo "ERROR: Bridge failed to start."
     exit 1
 fi
+echo "  Bridge running (PID $BRIDGE_PID)"
 
-echo "PurpleFB bridge running (PID $BRIDGE_PID)"
-
-# Step 2: Boot the simulator
+# --- Step 2: Boot simulator ---
 echo "Booting simulator..."
-if ! xcrun simctl boot "$UDID"; then
-    echo "ERROR: Failed to boot simulator"
+if ! xcrun simctl boot "$UDID" 2>/dev/null; then
+    echo "ERROR: Failed to boot simulator."
     exit 1
 fi
+echo "  Simulator booted."
 
-echo "Simulator booted. Waiting for backboardd to connect..."
-sleep 5
-
-# Step 3: Verify rendering
-if [[ -f /tmp/sim_framebuffer.raw ]]; then
-    echo "Framebuffer active: $(ls -la /tmp/sim_framebuffer.raw | awk '{print $5}') bytes"
-else
-    echo "WARNING: No framebuffer dump yet. backboardd may still be starting."
-fi
-
-# Step 4: Inject display into Simulator.app (optional)
-if [[ "$DO_INJECT" -eq 1 ]] && [[ -f "$INJECT" ]]; then
-    SIMPID=$(pgrep -x Simulator 2>/dev/null || true)
-    if [[ -n "$SIMPID" ]]; then
-        echo "Injecting display surface into Simulator.app (PID $SIMPID)..."
-        lldb -p "$SIMPID" \
-            -o "expr (void*)dlopen(\"$INJECT\", 2)" \
-            -o "detach" \
-            -o "quit" \
-            2>/dev/null || echo "WARNING: lldb injection failed (may need SIP disabled)"
-        echo "Display injection complete."
-    else
-        echo "NOTE: Simulator.app not running. Start it manually or use 'open -a Simulator'."
-        echo "Then inject: lldb -p \$(pgrep -x Simulator) -o 'expr (void*)dlopen(\"$INJECT\", 2)' -o detach -o quit"
+# --- Step 3: Wait for framebuffer ---
+echo "Waiting for framebuffer..."
+for i in $(seq 1 20); do
+    if [[ -f /tmp/sim_framebuffer.raw ]]; then
+        SIZE=$(wc -c < /tmp/sim_framebuffer.raw)
+        if [[ "$SIZE" -gt 100000 ]]; then
+            echo "  Framebuffer active ($SIZE bytes)"
+            break
+        fi
     fi
-elif [[ "$DO_INJECT" -eq 1 ]]; then
-    echo "NOTE: sim_display_inject.dylib not found. Skipping display injection."
-    echo "Build it: cd tools/display_bridge && clang -dynamiclib -fobjc-arc -fmodules -arch arm64e -framework Foundation -framework IOSurface -framework AppKit -o sim_display_inject.dylib sim_display_inject.m"
+    sleep 1
+done
+
+# --- Step 4: Launch Simulator.app with injection ---
+if [[ "$DO_INJECT" -eq 1 ]]; then
+    echo "Launching Simulator.app with display injection..."
+    DYLD_FRAMEWORK_PATH="$DYLD_FW_PATH" \
+    DYLD_INSERT_LIBRARIES="$INJECT" \
+    "$SIMULATOR" &
+    SIM_PID=$!
+    sleep 5
+
+    if kill -0 "$SIM_PID" 2>/dev/null; then
+        echo "  Simulator.app running (PID $SIM_PID)"
+    else
+        echo "  WARNING: Simulator.app exited. Display may not be available."
+        SIM_PID=""
+    fi
+else
+    echo "Skipping Simulator.app injection (--no-inject)."
+    echo "Use the standalone viewer: tools/display_bridge/sim_viewer"
 fi
 
-# Step 5: Keep running
+# --- Summary ---
 echo ""
-echo "=== Legacy simulator running ==="
-echo "  Device: $UDID"
+echo "=== Legacy Simulator Running ==="
+echo "  Device: $DEVICE_NAME"
+echo "  UDID:   $UDID"
 echo "  Bridge: PID $BRIDGE_PID"
-echo "  Framebuffer: /tmp/sim_framebuffer.raw"
-echo "  Surface ID: $(cat /tmp/rosettasim_surface_id 2>/dev/null || echo 'unknown')"
-echo ""
-echo "View framebuffer:"
-echo "  swift tools/display_bridge/../view_raw_framebuffer.swift"
+[[ -n "$SIM_PID" ]] && echo "  Simulator: PID $SIM_PID"
 echo ""
 echo "Press Ctrl-C to stop."
 echo ""
 
-wait "$BRIDGE_PID"
+# Keep running until interrupted
+wait "$BRIDGE_PID" 2>/dev/null || true

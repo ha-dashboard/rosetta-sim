@@ -1,0 +1,168 @@
+#!/bin/bash
+#
+# setup.sh — One-time setup for RosettaSim legacy iOS simulator
+#
+# Checks prerequisites, builds tools, creates re-signed Simulator.app,
+# and creates default legacy simulator devices.
+#
+# Usage:
+#   ./scripts/setup.sh
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TOOLS_DIR="$PROJECT_ROOT/tools/display_bridge"
+
+SIMULATOR_SRC="/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app"
+SIMULATOR_DST="/tmp/Simulator_nolv.app"
+
+# Runtime identifiers
+RUNTIME_93="com.apple.CoreSimulator.SimRuntime.iOS-9-3"
+RUNTIME_103="com.apple.CoreSimulator.SimRuntime.iOS-10-3"
+
+echo "=== RosettaSim Setup ==="
+echo ""
+
+# --- Step 1: Check prerequisites ---
+echo "Checking prerequisites..."
+
+# Xcode
+if [[ ! -d "/Applications/Xcode.app" ]]; then
+    echo "ERROR: Xcode.app not found at /Applications/Xcode.app"
+    exit 1
+fi
+echo "  Xcode: OK"
+
+# Simulator.app
+if [[ ! -f "$SIMULATOR_SRC/Contents/MacOS/Simulator" ]]; then
+    echo "ERROR: Simulator.app not found in Xcode"
+    exit 1
+fi
+echo "  Simulator.app: OK"
+
+# iOS 9.3 runtime
+HAS_93=0
+HAS_103=0
+if xcrun simctl list runtimes 2>/dev/null | grep -q "iOS 9.3"; then
+    HAS_93=1
+    echo "  iOS 9.3 runtime: OK"
+else
+    echo "  iOS 9.3 runtime: NOT INSTALLED"
+fi
+
+if xcrun simctl list runtimes 2>/dev/null | grep -q "iOS 10.3"; then
+    HAS_103=1
+    echo "  iOS 10.3 runtime: OK"
+else
+    echo "  iOS 10.3 runtime: NOT INSTALLED"
+fi
+
+if [[ "$HAS_93" -eq 0 ]] && [[ "$HAS_103" -eq 0 ]]; then
+    echo ""
+    echo "ERROR: No legacy iOS runtimes found."
+    echo "Install iOS 9.3 or 10.3 simulator runtime first."
+    echo "See: https://developer.apple.com/documentation/xcode/installing-additional-simulator-runtimes"
+    exit 1
+fi
+
+echo ""
+
+# --- Step 2: Build tools ---
+echo "Building display bridge tools..."
+cd "$TOOLS_DIR"
+make clean
+make
+echo ""
+
+# --- Step 3: Create re-signed Simulator.app ---
+echo "Creating re-signed Simulator.app..."
+
+if [[ -d "$SIMULATOR_DST" ]]; then
+    echo "  Removing existing $SIMULATOR_DST"
+    rm -rf "$SIMULATOR_DST"
+fi
+
+# Copy the full .app bundle (needed for NIBs, frameworks, Info.plist)
+cp -R "$SIMULATOR_SRC" "$SIMULATOR_DST"
+
+# Re-sign with ad-hoc signature, removing library-validation
+# This allows DYLD_INSERT_LIBRARIES to work
+codesign --force --sign - --options=0 "$SIMULATOR_DST/Contents/MacOS/Simulator" 2>/dev/null
+echo "  Created: $SIMULATOR_DST"
+echo "  Re-signed: library-validation removed"
+echo ""
+
+# --- Step 4: Create default devices ---
+echo "Creating legacy simulator devices..."
+
+create_device() {
+    local name="$1"
+    local device_type="$2"
+    local runtime="$3"
+
+    # Check if device already exists
+    if xcrun simctl list devices 2>/dev/null | grep -q "$name"; then
+        local udid
+        udid=$(xcrun simctl list devices 2>/dev/null | grep "$name" | grep -v unavailable | head -1 | sed 's/.*(\([A-F0-9-]*\)).*/\1/')
+        echo "  $name: already exists ($udid)"
+        return
+    fi
+
+    # Check if runtime is available
+    if ! xcrun simctl list runtimes 2>/dev/null | grep -q "$runtime"; then
+        echo "  $name: SKIPPED (runtime not installed)"
+        return
+    fi
+
+    local udid
+    udid=$(xcrun simctl create "$name" "$device_type" "$runtime" 2>/dev/null) || {
+        echo "  $name: FAILED to create"
+        return
+    }
+    echo "  $name: created ($udid)"
+}
+
+if [[ "$HAS_93" -eq 1 ]]; then
+    create_device "iPhone 6s" \
+        "com.apple.CoreSimulator.SimDeviceType.iPhone-6s" \
+        "$RUNTIME_93"
+    create_device "iPhone 6s Plus" \
+        "com.apple.CoreSimulator.SimDeviceType.iPhone-6s-Plus" \
+        "$RUNTIME_93"
+    create_device "iPad Air 2" \
+        "com.apple.CoreSimulator.SimDeviceType.iPad-Air-2" \
+        "$RUNTIME_93"
+    create_device "iPad Pro" \
+        "com.apple.CoreSimulator.SimDeviceType.iPad-Pro" \
+        "$RUNTIME_93"
+fi
+
+if [[ "$HAS_103" -eq 1 ]]; then
+    create_device "iPhone 6s (10.3)" \
+        "com.apple.CoreSimulator.SimDeviceType.iPhone-6s" \
+        "$RUNTIME_103"
+fi
+
+echo ""
+
+# --- Step 5: Summary ---
+echo "=== Setup Complete ==="
+echo ""
+echo "Tools built:"
+echo "  $TOOLS_DIR/purple_fb_bridge"
+echo "  $TOOLS_DIR/sim_display_inject.dylib"
+echo "  $TOOLS_DIR/sim_viewer"
+echo ""
+echo "Re-signed Simulator:"
+echo "  $SIMULATOR_DST"
+echo ""
+echo "Available legacy devices:"
+xcrun simctl list devices 2>&1 | grep -E '9\.3|10\.3' | grep -v unavailable | sed 's/^/  /'
+echo ""
+echo "To run:"
+echo "  ./scripts/run_legacy_sim.sh \"iPhone 6s\""
+echo "  ./scripts/run_legacy_sim.sh \"iPad Pro\""
+echo "  ./scripts/run_legacy_sim.sh --ios10"
+echo ""

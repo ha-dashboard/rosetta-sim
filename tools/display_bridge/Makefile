@@ -1,0 +1,64 @@
+# Makefile for legacy iOS simulator display tools
+#
+# Builds:
+#   purple_fb_bridge       — PurpleFBServer bridge (registers with sim, handles framebuffer)
+#   sim_display_inject.dylib — DYLD_INSERT injection for Simulator.app display
+#   sim_viewer             — Standalone framebuffer viewer window
+#
+# Usage:
+#   make              # build all
+#   make bridge       # build bridge only
+#   make inject       # build injection dylib only
+#   make viewer       # build viewer only
+#   make clean        # remove build artifacts
+
+# IMPORTANT: Use /usr/bin/cc, NOT cc (shell alias hangs in this environment)
+CC = /usr/bin/cc
+
+CFLAGS_COMMON = -fobjc-arc -fmodules -arch arm64e -Wall -Wextra -Wno-unused-parameter
+
+# Bridge: links IOSurface, loads CoreSimulator at runtime via dlopen
+BRIDGE_SRC    = purple_fb_bridge.m
+BRIDGE_BIN    = purple_fb_bridge
+BRIDGE_CFLAGS = $(CFLAGS_COMMON)
+BRIDGE_LDFLAGS = -framework Foundation -framework IOSurface -Wl,-undefined,dynamic_lookup
+
+# Injection dylib: loaded into Simulator.app via DYLD_INSERT_LIBRARIES
+INJECT_SRC    = sim_display_inject.m
+INJECT_BIN    = sim_display_inject.dylib
+INJECT_CFLAGS = $(CFLAGS_COMMON)
+INJECT_LDFLAGS = -dynamiclib -framework Foundation -framework AppKit \
+                 -framework IOSurface -framework QuartzCore -framework CoreGraphics
+
+# Standalone viewer: native macOS window displaying the framebuffer
+VIEWER_SRC    = sim_viewer.m
+VIEWER_BIN    = sim_viewer
+VIEWER_CFLAGS = $(CFLAGS_COMMON)
+VIEWER_LDFLAGS = -framework Foundation -framework AppKit \
+                 -framework IOSurface -framework QuartzCore -framework CoreGraphics
+
+.PHONY: all bridge inject viewer clean
+
+all: bridge inject viewer
+
+bridge: $(BRIDGE_BIN)
+
+inject: $(INJECT_BIN)
+
+viewer: $(VIEWER_BIN)
+
+$(BRIDGE_BIN): $(BRIDGE_SRC)
+	$(CC) $(BRIDGE_CFLAGS) $(BRIDGE_LDFLAGS) -o $@ $<
+	@echo "Built: $@"
+
+$(INJECT_BIN): $(INJECT_SRC)
+	$(CC) $(INJECT_CFLAGS) $(INJECT_LDFLAGS) -o $@ $<
+	@echo "Built: $@"
+
+$(VIEWER_BIN): $(VIEWER_SRC)
+	$(CC) $(VIEWER_CFLAGS) $(VIEWER_LDFLAGS) -o $@ $<
+	@echo "Built: $@"
+
+clean:
+	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN)
+	@echo "Cleaned."
