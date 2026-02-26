@@ -186,6 +186,38 @@ DYLD_INSERT_LIBRARIES=$(pwd)/sim_display_inject.dylib \
 /tmp/Simulator_nolv.app/Contents/MacOS/Simulator
 ```
 
+## RE Notes for Future Work (Agent A additions)
+
+### PurpleFB pt_width/pt_height semantics
+The reply fields at +0x40/+0x44 are **point dimensions**, not "display dimensions." PurpleDisplay::map_surface (QC9+0xf1a4a) computes a scale transform: `Transform::scale(pixel_w/point_w, pixel_h/point_h, 1.0)` stored at display+0x138. If pt_width equals pixel_width, scale=1.0 and UIKit lays out at 1x → 1/4 area bug. For @2x devices, pt_width = pixel_width/2.
+
+### IOS_FRAMEBUFFER_PREFIX env var
+PurpleDisplay::open (QC9+0xf189e) checks for `IOS_FRAMEBUFFER_PREFIX` env var and prepends it to the `"PurpleFBServer"` service name. This could be used for multi-device support — each device gets a unique service name without changing the bridge protocol.
+
+### flush_shmem blocks with infinite timeout
+PurpleDisplay::finish_update calls flush_shmem with wait_for_reply=TRUE. The send_msg function (QC9+0xf1e9e) does `mach_msg(SEND|RCV, timeout=0)` — infinite wait. If the bridge doesn't reply to every msg_id=3, backboardd hangs permanently after the first render. The reply body is ignored — just needs any mach_msg_header_t delivered to the reply port.
+
+### ROCKit architecture (for eliminating file I/O)
+The file I/O path (/tmp/sim_framebuffer.raw) could be replaced by pushing IOSurface directly through Simulator.app's display pipeline. ROCKit (the framework underlying CoreSimDeviceIO) is a transparent ObjC RPC system — you can't fake it with raw XPC messages. Two viable paths:
+- **DYLIB inject upgrade**: instead of reading from file, share IOSurface from bridge via `IOSurfaceCreateMachPort()` and set `surfaceLayer.contents = IOSurface` directly.
+- **simdeviceio plugin**: write a `.simdeviceio` bundle implementing `SimDeviceIOBundleInterface`. Entry point: `simdeviceio_get_interface()`. This gives legitimate ROCKit session access and the `didChangeIOSurface:` callback path.
+
+### Touch is free — no extra work needed
+SimDisplayView.connect(screen:inputs:.all) sets up SimDigitizerInputView overlay + SimDeviceLegacyHIDClient. Mouse clicks → IndigoHIDMessageForMouseNSEvent → IndigoHIDMessageStruct (160 bytes) → ROCKit → IndigoLegacyHIDServices plugin → mach_msg to IndigoHIDRegistrationPort. Keyboard and hardware buttons use the same path. All already wired for iOS 9.3 via profile.plist headServices.
+
+### iPhone 6 Plus is @3x
+The device dimensions table is correct but note: iPhone 6 Plus uses @3x rendering at 1242x2208 pixels downsampled to 1080x1920 physical. The PurpleFB reply should use 1242x2208 pixels with pt_width=414, pt_height=736. Downsampling is handled by the host display, not the compositor.
+
+### Key QuartzCore offsets (iOS 9.3 runtime)
+| Function | Offset |
+|----------|--------|
+| PurpleDisplay::open | +0xf189e |
+| PurpleDisplay::map_surface | +0xf1a4a |
+| PurpleDisplay::flush_shmem | +0xf20a2 |
+| PurpleDisplay::finish_update | +0xf2124 |
+| PurpleDisplay::send_msg | +0xf1e9e |
+| TimerDisplayLink::update_timer | +0x142dc0 |
+
 ## Agent Sessions (for continuity)
 - Agent A: `cmm2kr8hg5x20nq32pt5ca76g` — RE specialist
 - Agent B: `cmm2kyo475x3anq32ul3awimd` — Execution agent
@@ -201,3 +233,64 @@ DYLD_INSERT_LIBRARIES=$(pwd)/sim_display_inject.dylib \
 - `fedc11f`: Interactive iOS 9.3 with touch
 - `98780da`: Retina contentsScale fix
 - `3173489`: Full SpringBoard rendering (pt_width fix)
+
+## RE Findings (from Agent D, for future reference)
+
+### SimFramebuffer Protocol (iOS 11+, NOT used by 9.3/10.3)
+The modern SimFramebuffer protocol was fully mapped from type encodings in the sim-side
+`SimFramebuffer.framework`. Uses a tagged-union message format (`SimFramebufferMessageData`
+with magic + struct_type + union of 18 payload types). Complete struct definitions at
+`src/plugins/IndigoLegacyFramebufferServices/SimFramebufferProtocol.h`.
+Service name: `com.apple.CoreSimulator.SimFramebufferServer`.
+
+**If iOS 11+ support is needed, this is the protocol to implement** — completely different
+from PurpleFBServer. Uses IOSurface ports (not memory entries), has swapchain/present
+callbacks, display modes, and a richer display model.
+
+### SimulatorKit Display Pipeline (Swift-only barrier)
+SimulatorKit display APIs are **100% Swift vtable dispatch** — not ObjC-callable:
+- `SimDevice.screenAdapter` → Swift extension, no ObjC selector
+- `SimDeviceScreen.unmaskedSurface/maskedSurface` → Swift-only getters
+- `SimDeviceScreenAdapter.register()` → Swift-only
+- ObjC runtime only sees: `initWithDevice:screenID:`, `screenID`, `isDefault`, `isCarPlay`
+- A **Swift bridge tool** is required to use native display pipeline
+
+### CoreSimulator Plugin API (.simdeviceio)
+Every plugin exports: `BOOL simdeviceio_get_interface(id *outInterface)`.
+Mach-O bundle type. Protocol: `createDefaultPortsForDevice:error:` returns descriptors,
+`machServicesToRegister` → `[String: SimMachPort]` for Mach service registration.
+Full analysis at `src/plugins/IndigoLegacyFramebufferServices/`.
+
+### pt_width/pt_height Semantics
+PurpleFB reply +0x40/+0x44: QuartzCore's PurpleDisplay coordinate system.
+Setting pt_width=pt_height=pixel dims (750x1334) → 1:1 pixel mapping.
+Then `contentsScale=2.0` on the Mac CALayer → correct Retina display.
+
+### IOPort Enumeration for Old Runtimes (Agent C)
+`xcrun simctl io 647B6002 enumerate` shows iOS 9.3 has full IO port infrastructure:
+- DisplayAdapter (`com.apple.framebuffer.server`) with LCD 750x1334 + TVOut + CarPlay already connected
+- 2× Display ports (class 0 and class 1)
+- LegacyHID, 3× StreamProcessors (SW/Metal/OpenGL), CaptureService, GPUTools
+The ports are identical in structure to iOS 26.2's — CoreSimulator sets them up, just doesn't spawn SimRenderServer.
+
+### Re-signing Gotchas (Agent C)
+- **Private entitlements + ad-hoc signing = AMFI kill (signal 9)**. The `com.apple.private.CoreSimulator.client` entitlement cannot be used.
+- **No entitlements needed** — the re-signed Simulator connects to CoreSimulatorService anyway and creates DeviceWindows for all booted devices.
+- The binary needs `DYLD_FRAMEWORK_PATH` for both `/Applications/Xcode.app/.../PrivateFrameworks` and `/Library/Developer/PrivateFrameworks`.
+- Must kill the real Simulator first — only one instance can run (checks at launch).
+- Both DYLD_INSERT (at launch) and lldb dlopen (post-launch) work for injection.
+
+### IOSurface Direct Path (Agent C — for eliminating file I/O)
+Instead of `/tmp/sim_framebuffer.raw`, the bridge could share its IOSurface directly:
+1. Bridge creates IOSurface (already does: `g_iosurface`)
+2. `IOSurfaceCreateMachPort(g_iosurface)` → mach port
+3. Write mach port to a known location (e.g., file with IOSurfaceID)
+4. Inject dylib does `IOSurfaceLookup(surfaceID)` → gets the same IOSurface
+5. Set `surfaceLayer.contents = (__bridge id)iosurface` directly
+This eliminates the 4MB/frame file copy and gives zero-copy display.
+
+### iOS Runtime Version Detection
+- iOS 9.3 & 10.3: PurpleFBServer (confirmed via QuartzCore strings)
+- iOS 10.3 SDK has NO SimFramebuffer.framework
+- iOS 11+: SimFramebuffer replaces PurpleFB
+- `headServices` in profile.plist lists `PurpleFBServer` for legacy runtimes
