@@ -18,6 +18,7 @@
 #import <AppKit/AppKit.h>
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -57,59 +58,29 @@ static void refresh_display(NSTimer *timer) {
         return;
     }
 
-    /* Create local IOSurface once */
-    if (!g_surface) {
-        NSDictionary *props = @{
-            (id)kIOSurfaceWidth:           @(FB_WIDTH),
-            (id)kIOSurfaceHeight:          @(FB_HEIGHT),
-            (id)kIOSurfaceBytesPerElement: @4,
-            (id)kIOSurfaceBytesPerRow:     @(FB_BPR),
-            (id)kIOSurfacePixelFormat:     @(0x42475241), /* BGRA */
-            (id)kIOSurfaceAllocSize:       @(FB_SIZE),
-        };
-        g_surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-        if (!g_surface) { NSLog(@"[viewer] IOSurfaceCreate failed"); return; }
-        size_t actual_bpr = IOSurfaceGetBytesPerRow(g_surface);
-        NSLog(@"[viewer] Local IOSurface created %dx%d, requested BPR=%d actual BPR=%zu",
-              FB_WIDTH, FB_HEIGHT, FB_BPR, actual_bpr);
-    }
-
-    /* Copy pixels into IOSurface — handle stride mismatch */
-    IOSurfaceLock(g_surface, 0, NULL);
-    void *base = IOSurfaceGetBaseAddress(g_surface);
-    size_t dst_bpr = IOSurfaceGetBytesPerRow(g_surface);
-    if (dst_bpr == FB_BPR) {
-        memcpy(base, g_read_buf, FB_SIZE);
-    } else {
-        /* Row-by-row copy: source stride=FB_BPR, dest stride=dst_bpr */
-        for (int y = 0; y < FB_HEIGHT; y++) {
-            memcpy((uint8_t *)base + y * dst_bpr,
-                   g_read_buf + y * FB_BPR,
-                   FB_BPR);
+    /* Convert raw BGRA pixels to CGImage and set on layer */
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(g_read_buf, FB_WIDTH, FB_HEIGHT, 8, FB_BPR,
+        cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    if (ctx) {
+        CGImageRef img = CGBitmapContextCreateImage(ctx);
+        if (img) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            g_display_layer.contents = (__bridge id)img;
+            [CATransaction commit];
+            CGImageRelease(img);
         }
-        if (g_frame_count <= 1)
-            NSLog(@"[viewer] Stride mismatch: src=%d dst=%zu, doing row-by-row copy", FB_BPR, dst_bpr);
+        CGContextRelease(ctx);
     }
-    /* Debug: log pixel data before unlock */
+    CGColorSpaceRelease(cs);
+
     if (g_frame_count <= 5 || g_frame_count % 300 == 0) {
         uint32_t *rpx = (uint32_t *)g_read_buf;
-        uint32_t *spx = (uint32_t *)base;
-        NSLog(@"[viewer] frame %d: file px[0]=%08x [100]=%08x [1000]=%08x | surf px[0]=%08x [100]=%08x",
-              g_frame_count, rpx[0], rpx[100], rpx[1000], spx[0], spx[100]);
-    }
-    IOSurfaceUnlock(g_surface, 0, NULL);
-
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    g_display_layer.contents = (__bridge id)g_surface;
-    [CATransaction commit];
-
-    if (g_frame_count <= 5 || g_frame_count % 300 == 0) {
-        NSLog(@"[viewer] layer: contents=%p frame=%@ hidden=%d superlayer=%p",
+        NSLog(@"[viewer] frame %d: px[0]=%08x [100]=%08x [1000]=%08x layer.contents=%p frame=%@",
+              g_frame_count, rpx[0], rpx[100], rpx[1000],
               (__bridge void *)g_display_layer.contents,
-              NSStringFromRect(g_display_layer.frame),
-              g_display_layer.hidden,
-              g_display_layer.superlayer);
+              NSStringFromRect(g_display_layer.frame));
     }
 }
 
@@ -141,10 +112,13 @@ static void refresh_display(NSTimer *timer) {
     g_display_layer = [CALayer layer];
     g_display_layer.frame = contentView.bounds;
     g_display_layer.contentsGravity = kCAGravityResize;
+    g_display_layer.contentsScale = self.window.backingScaleFactor;
     g_display_layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-    /* Flip Y — framebuffer origin is top-left, CALayer origin is bottom-left */
-    g_display_layer.geometryFlipped = YES;
+    g_display_layer.magnificationFilter = kCAFilterLinear;
+    /* geometryFlipped on the PARENT layer — flips coordinate system for sublayers */
+    contentView.layer.geometryFlipped = YES;
     [contentView.layer addSublayer:g_display_layer];
+    NSLog(@"[viewer] backingScaleFactor=%.1f", self.window.backingScaleFactor);
 
     [self.window makeKeyAndOrderFront:nil];
     NSLog(@"[viewer] Window created %.0fx%.0f — waiting for framebuffer", winW, winH);

@@ -20,22 +20,21 @@
 #import <AppKit/AppKit.h>
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <fcntl.h>
 
-static IOSurfaceRef g_surface = NULL;
+#define FB_WIDTH  750
+#define FB_HEIGHT 1334
+#define FB_BPR    (FB_WIDTH * 4)
+#define FB_SIZE   (FB_BPR * FB_HEIGHT)
+
 static NSTimer *g_refresh_timer = nil;
 static CALayer *g_surface_layer = nil;
+static uint8_t *g_read_buf = NULL;
 
-/* Read IOSurface ID written by purple_fb_bridge */
-static uint32_t read_surface_id(void) {
-    FILE *f = fopen("/tmp/rosettasim_surface_id", "r");
-    if (!f) return 0;
-    uint32_t sid = 0;
-    fscanf(f, "%u", &sid);
-    fclose(f);
-    return sid;
-}
+/* No longer needed — we read the raw file directly */
 
 /* Recursively find SimDisplayRenderableView in view hierarchy */
 static NSView *find_renderable_view(NSView *root) {
@@ -84,34 +83,41 @@ static void refresh_surface(NSTimer *timer) {
     if (!g_surface_layer) return;
     g_frame_count++;
 
-    /* Re-lookup surface each frame in case bridge restarted */
-    uint32_t sid = read_surface_id();
-    if (!sid) {
-        if (g_frame_count <= 5) NSLog(@"[inject] frame %d: no surface ID file", g_frame_count);
+    /* Allocate read buffer once */
+    if (!g_read_buf) {
+        g_read_buf = malloc(FB_SIZE);
+        if (!g_read_buf) return;
+    }
+
+    /* Read raw framebuffer file */
+    int fd = open("/tmp/sim_framebuffer.raw", O_RDONLY);
+    if (fd < 0) {
+        if (g_frame_count <= 3) NSLog(@"[inject] Waiting for framebuffer file...");
         return;
     }
+    ssize_t nread = read(fd, g_read_buf, FB_SIZE);
+    close(fd);
+    if (nread < FB_SIZE) return;
 
-    if (!g_surface || IOSurfaceGetID(g_surface) != sid) {
-        if (g_surface) CFRelease(g_surface);
-        g_surface = IOSurfaceLookup(sid);
-        if (g_surface) {
-            NSLog(@"[inject] IOSurfaceLookup(%u) = %p (%ux%u)",
-                  sid, g_surface,
-                  (unsigned)IOSurfaceGetWidth(g_surface),
-                  (unsigned)IOSurfaceGetHeight(g_surface));
-        } else {
-            NSLog(@"[inject] IOSurfaceLookup(%u) FAILED", sid);
+    /* Convert to CGImage and set on layer */
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(g_read_buf, FB_WIDTH, FB_HEIGHT, 8, FB_BPR,
+        cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    if (ctx) {
+        CGImageRef img = CGBitmapContextCreateImage(ctx);
+        if (img) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            g_surface_layer.contents = (__bridge id)img;
+            [CATransaction commit];
+            CGImageRelease(img);
         }
+        CGContextRelease(ctx);
     }
+    CGColorSpaceRelease(cs);
 
-    if (g_surface) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        g_surface_layer.contents = (__bridge id)g_surface;
-        [CATransaction commit];
-        if (g_frame_count <= 3 || g_frame_count % 300 == 0)
-            NSLog(@"[inject] frame %d: set surfaceLayer.contents = IOSurface %u", g_frame_count, sid);
-    }
+    if (g_frame_count <= 3 || g_frame_count % 300 == 0)
+        NSLog(@"[inject] frame %d: set CGImage on surfaceLayer", g_frame_count);
 }
 
 static void attempt_injection(void) {
