@@ -2828,6 +2828,12 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     }
     env[ei] = NULL;
 
+    /* Write broker port to file for bfix recovery when posix_spawnattr fails */
+    {
+        FILE *fp = fopen("/tmp/rosettasim_broker_port", "w");
+        if (fp) { fprintf(fp, "%u\n", g_broker_port); fclose(fp); }
+    }
+
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);

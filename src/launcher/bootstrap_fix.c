@@ -3743,8 +3743,37 @@ static void bootstrap_fix_constructor(void) {
 
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
+
+    /* If bootstrap port is dead (0xffffffff), try to recover from broker's file */
+    if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
+        FILE *fp = fopen("/tmp/rosettasim_broker_port", "r");
+        if (fp) {
+            unsigned int file_port = 0;
+            if (fscanf(fp, "%u", &file_port) == 1 && file_port != 0) {
+                /* The port name from the file is in the BROKER's namespace.
+                 * We need to use bootstrap_look_up with the real macOS bootstrap
+                 * to find the broker. But we don't have a valid bootstrap port...
+                 * Instead, try setting the port directly — it might work if
+                 * the port name was inherited via posix_spawn. */
+                bp = (mach_port_t)file_port;
+                mach_port_type_t pt = 0;
+                kern_return_t tkr = mach_port_type(mach_task_self(), bp, &pt);
+                bfix_log("[bfix] constructor: recovered port 0x%x from file, type=0x%x kr=%d\n",
+                    bp, pt, tkr);
+                if (tkr != KERN_SUCCESS || !(pt & MACH_PORT_TYPE_SEND)) {
+                    bfix_log("[bfix] constructor: recovered port is NOT valid send right\n");
+                    bp = MACH_PORT_NULL;
+                } else {
+                    task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
+                    bfix_log("[bfix] constructor: set TASK_BOOTSTRAP_PORT = 0x%x from file\n", bp);
+                }
+            }
+            fclose(fp);
+        }
+    }
+
     g_bfix_bootstrap_port = bp; /* export for bridge recovery */
-    if (bp != MACH_PORT_NULL) {
+    if (bp != MACH_PORT_NULL && bp != (mach_port_t)-1) {
         bootstrap_port = bp;
 
         /* Patch bootstrap functions for intra-library calls.
