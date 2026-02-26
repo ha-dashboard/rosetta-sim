@@ -1829,9 +1829,18 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
                         if (od->address && od->size >= 0x30) {
                             uint8_t *shmem = (uint8_t *)od->address;
-                            void *cmd_ptr = *(void **)(shmem + 0x1c);
+                            /* Pointer at +0x20 (from SHMEM_DUMP), length at +0x28 */
+                            void *cmd_ptr = *(void **)(shmem + 0x20);
                             uint32_t cmd_len = *(uint32_t *)(shmem + 0x28);
                             uint32_t ool_size = od->size;
+
+                            /* Also log for debugging */
+                            static int _shmem_dbg = 0;
+                            if (_shmem_dbg < 3) {
+                                _shmem_dbg++;
+                                bfix_log("SHMEM_CLIENT[%d]: +0x1c=%p +0x20=%p +0x28=%u ool=%u",
+                                    _shmem_dbg, *(void **)(shmem + 0x1c), cmd_ptr, cmd_len, ool_size);
+                            }
 
                             if (cmd_ptr && cmd_len > 0 && cmd_len < 2 * 1024 * 1024 &&
                                 (uintptr_t)cmd_ptr > 0x100000) {
@@ -1842,8 +1851,8 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                     memcpy(new_buf, shmem, ool_size);
                                     memcpy(new_buf + ool_size, cmd_ptr, cmd_len);
 
-                                    /* Store OFFSET instead of absolute pointer */
-                                    *(uint64_t *)(new_buf + 0x1c) = (uint64_t)ool_size;
+                                    /* Store OFFSET at +0x20 instead of absolute pointer */
+                                    *(uint64_t *)(new_buf + 0x20) = (uint64_t)ool_size;
 
                                     od->address = new_buf;
                                     od->size = (mach_msg_size_t)new_ool_size;
@@ -2220,17 +2229,17 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                      * instead of an absolute pointer. If the value is small (< buffer size),
                      * it's an offset — translate to absolute server-side address. */
                     if (msg->msgh_id == 40003 && cmd_data && cmd_size >= 0x30) {
-                        uint64_t ptr_val = *(uint64_t *)(cmd_data + 0x1c);
-                        /* If ptr_val is a small number (< cmd_size), it's an offset from the client fix */
+                        uint64_t ptr_val = *(uint64_t *)(cmd_data + 0x20);
+                        /* If ptr_val is a small number (< cmd_size), it's an OFFSET from our client fix */
                         if (ptr_val > 0 && ptr_val < cmd_size) {
                             void *real_ptr = (void *)(cmd_data + ptr_val);
                             static int _patch_log = 0;
                             if (_patch_log < 10) {
                                 _patch_log++;
-                                bfix_log("SHMEM_PATCH[%d]: offset %llu → server ptr %p (total=%u)",
+                                bfix_log("SHMEM_PATCH[%d]: +0x20 offset %llu → server ptr %p (total=%u)",
                                     _patch_log, (unsigned long long)ptr_val, real_ptr, cmd_size);
                             }
-                            *(void **)(cmd_data + 0x1c) = real_ptr;
+                            *(void **)(cmd_data + 0x20) = real_ptr;
                         }
                     }
 
