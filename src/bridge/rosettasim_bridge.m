@@ -9135,73 +9135,70 @@ static int g_crl_total = 0;
 static int g_crl_bit3_set = 0;
 static int g_crl_bit3_clear = 0;
 
-static void replacement_copyRenderLayer(id self, SEL _cmd, void *renderLayer,
-                                         unsigned char layerFlags, void *commitFlags) {
+/* _copyRenderLayer may return a new Render::Layer via %rax.
+ * Treat return as void* to capture it. The param is old state (delta input). */
+static void *replacement_copyRenderLayer(id self, SEL _cmd, void *renderLayer,
+                                          unsigned char layerFlags, void *commitFlags) {
     g_crl_total++;
     if (layerFlags & 0x8) g_crl_bit3_set++; else g_crl_bit3_clear++;
 
-    if (g_crl_log_count < 30) {
-        g_crl_log_count++;
-        const char *cls = object_getClassName(self);
-        bridge_log("CRL[%d]: class=%s layerFlags=0x%02x bit3=%d renderLayer=%p commitFlags=%p",
-            g_crl_log_count, cls ? cls : "?", (unsigned)layerFlags,
-            (layerFlags & 0x8) ? 1 : 0, renderLayer, commitFlags);
-    }
-    /* Log summary periodically */
-    if (g_crl_total == 50 || g_crl_total == 200 || g_crl_total == 1000) {
-        bridge_log("CRL_SUMMARY: total=%d bit3_set=%d bit3_clear=%d",
-            g_crl_total, g_crl_bit3_set, g_crl_bit3_clear);
-    }
-    /* Check CALayer.backgroundColor BEFORE encoding */
+    if (g_crl_log_count < 30) g_crl_log_count++;
+
     void *preBg = ((void*(*)(id,SEL))objc_msgSend)(self, sel_registerName("backgroundColor"));
 
-    /* Check renderLayer content BEFORE original */
-    int pre_nz = 0;
-    if (renderLayer && g_crl_log_count <= 5) {
-        uint8_t *rl = (uint8_t *)renderLayer;
-        for (int i = 0; i < 256; i++) if (rl[i]) pre_nz++;
-    }
-
-    /* Call original */
-    ((void(*)(id, SEL, void*, unsigned char, void*))g_orig_copyRenderLayer)(
+    /* Call original — capture return value */
+    void *result = ((void*(*)(id, SEL, void*, unsigned char, void*))g_orig_copyRenderLayer)(
         self, _cmd, renderLayer, layerFlags, commitFlags);
 
-    /* Check renderLayer content AFTER original */
-    int post_nz = 0;
-    if (renderLayer && g_crl_log_count <= 5) {
-        uint8_t *rl = (uint8_t *)renderLayer;
-        for (int i = 0; i < 256; i++) if (rl[i]) post_nz++;
-        bridge_log("CRL_DELTA[%d]: pre_nz=%d post_nz=%d (changed=%d bytes in first 256)",
-            g_crl_log_count, pre_nz, post_nz, post_nz - pre_nz);
-    }
+    if (g_crl_log_count <= 10) {
+        bridge_log("CRL[%d]: class=%s flags=0x%02x bit3=%d param=%p result=%p cgBg=%p",
+            g_crl_log_count, object_getClassName(self), (unsigned)layerFlags,
+            (layerFlags & 0x8) ? 1 : 0, renderLayer, result, preBg);
 
-    /* AFTER encoding: dump Render::Layer to find backgroundColor */
-    if (g_crl_log_count <= 5 && renderLayer) {
-        float *bg10 = (float *)((uint8_t *)renderLayer + 0x10);
-        uint8_t opacity20 = *(uint8_t *)((uint8_t *)renderLayer + 0x20);
-        bridge_log("CRL_ENCODED[%d]: class=%s cgBg=%p RL+0x10=[%.3f,%.3f,%.3f,%.3f] op=%u",
-            g_crl_log_count, object_getClassName(self), preBg,
-            bg10[0], bg10[1], bg10[2], bg10[3], (unsigned)opacity20);
+        /* Search RETURN VALUE for float 1.0 (0x3f800000) to find color offsets */
+        if (result && (uintptr_t)result > 0x1000) {
+            uint32_t *words = (uint32_t *)result;
+            int found_any = 0;
+            for (int i = 0; i < 0x98/4; i++) {
+                if (words[i] == 0x3f800000) {
+                    bridge_log("  CRL_RESULT: float 1.0 at +0x%x context=[%.3f,%.3f,%.3f,%.3f]",
+                        i*4, *(float*)&words[i], *(float*)&words[i+1],
+                        *(float*)&words[i+2], *(float*)&words[i+3]);
+                    found_any = 1;
+                }
+            }
+            if (!found_any)
+                bridge_log("  CRL_RESULT: NO float 1.0 in first 0x98 bytes");
 
-        /* Dump full Render::Layer as floats to find color values */
-        float *fl = (float *)renderLayer;
-        bridge_log("  RL floats[0-15]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
-            fl[0],fl[1],fl[2],fl[3],fl[4],fl[5],fl[6],fl[7],
-            fl[8],fl[9],fl[10],fl[11],fl[12],fl[13],fl[14],fl[15]);
-        bridge_log("  RL floats[16-31]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
-            fl[16],fl[17],fl[18],fl[19],fl[20],fl[21],fl[22],fl[23],
-            fl[24],fl[25],fl[26],fl[27],fl[28],fl[29],fl[30],fl[31]);
-        bridge_log("  RL floats[32-47]: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
-            fl[32],fl[33],fl[34],fl[35],fl[36],fl[37],fl[38],fl[39],
-            fl[40],fl[41],fl[42],fl[43],fl[44],fl[45],fl[46],fl[47]);
-
-        /* Scan for 1.0 values (red = [1,0,0,1]) — look for consecutive 1.0 */
-        for (int fi = 0; fi < 80; fi++) {
-            if (fl[fi] > 0.9f && fl[fi] < 1.1f) {
-                bridge_log("  RL float[%d]=%.3f (@+0x%x)", fi, fl[fi], fi * 4);
+            /* Also dump first 0x98 bytes as uint32 hex */
+            if (g_crl_log_count <= 3) {
+                for (int row = 0; row < 0x98/4; row += 8) {
+                    int rem = (0x98/4) - row;
+                    if (rem > 8) rem = 8;
+                    char hex[256]; int hp = 0;
+                    hp += snprintf(hex+hp, sizeof(hex)-hp, "  +0x%02x:", row*4);
+                    for (int c = 0; c < rem; c++)
+                        hp += snprintf(hex+hp, sizeof(hex)-hp, " %08x", words[row+c]);
+                    bridge_log("%s", hex);
+                }
             }
         }
+
+        /* Also check PARAM (old state) briefly */
+        if (renderLayer && (uintptr_t)renderLayer > 0x1000) {
+            uint32_t *pw = (uint32_t *)renderLayer;
+            int param_floats = 0;
+            for (int i = 0; i < 0x98/4; i++)
+                if (pw[i] == 0x3f800000) param_floats++;
+            bridge_log("  CRL_PARAM: %d float 1.0 values in old state", param_floats);
+        }
     }
+
+    if (g_crl_total == 50 || g_crl_total == 200 || g_crl_total == 1000)
+        bridge_log("CRL_SUMMARY: total=%d bit3_set=%d bit3_clear=%d",
+            g_crl_total, g_crl_bit3_set, g_crl_bit3_clear);
+
+    return result;
 }
 
 static void install_copyRenderLayer_hook(void) {
@@ -9474,24 +9471,22 @@ static void rosettasim_bridge_init(void) {
         }
     });
 
-    /* BG_FORCE via dispatch_after on global queue, then CFRunLoopPerformBlock to main */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        bridge_log("BG_FORCE_DISPATCH: scheduling on main runloop via CFRunLoopPerformBlock");
-        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
-        @autoreleasepool {
+    /* BG_FORCE via CFRunLoopTimer — fires directly on main runloop */
+    CFRunLoopTimerRef bgTimer = CFRunLoopTimerCreateWithHandler(
+        kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + 5.0, 0, 0, 0,
+        ^(CFRunLoopTimerRef t) {
+            bridge_log("BG_FORCE_TIMER: firing on main runloop thread=%p", (void *)pthread_self());
             id app = ((id(*)(id,SEL))objc_msgSend)(
                 (id)objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
             id win = app ? ((id(*)(id,SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
             if (win) {
                 id winLayer = ((id(*)(id,SEL))objc_msgSend)(win, sel_registerName("layer"));
 
-                /* Set UIView backgroundColor */
                 id redUI = ((id(*)(id,SEL))objc_msgSend)(
                     (id)objc_getClass("UIColor"), sel_registerName("redColor"));
                 ((void(*)(id,SEL,id))objc_msgSend)(win, sel_registerName("setBackgroundColor:"), redUI);
 
-                /* Set CALayer.backgroundColor directly via CGColor */
                 typedef void *(*CGCSCreate_t)(void);
                 typedef void *(*CGCCreate_t)(void *, const float *);
                 CGCSCreate_t csCreate = (CGCSCreate_t)dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
@@ -9520,18 +9515,15 @@ static void rosettasim_bridge_init(void) {
 
                     ((void(*)(id,SEL))objc_msgSend)(
                         (id)objc_getClass("CATransaction"), sel_registerName("flush"));
-                    bridge_log("BG_FORCE_DISPATCH: RED root + GREEN %lu subs, flushed at t=5s (crl_total=%d)",
+                    bridge_log("BG_FORCE_TIMER: RED root + GREEN %lu subs, flushed (crl_total=%d)",
                         sc, g_crl_total);
-                } else {
-                    bridge_log("BG_FORCE_DISPATCH: CGColor funcs not found");
                 }
             } else {
-                bridge_log("BG_FORCE_DISPATCH: no keyWindow at t=5s");
+                bridge_log("BG_FORCE_TIMER: no keyWindow at t=5s");
             }
-        }
-        }); /* end CFRunLoopPerformBlock */
-        CFRunLoopWakeUp(CFRunLoopGetMain());
-    });
+        });
+    CFRunLoopAddTimer(CFRunLoopGetMain(), bgTimer, kCFRunLoopCommonModes);
+    CFRelease(bgTimer);
 
     bridge_log("========================================");
 }
