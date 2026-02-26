@@ -1464,6 +1464,29 @@ static void _pcr_do_render(void) {
         }
     }
 
+    /* NULL old_shape at Context+0x150 to force shape invalidation.
+     * finish_update checks dirty rect area: if 0 → flush_shmem SKIPPED.
+     * NULLing old_shape forces shape mismatch → invalidate → dirty rect
+     * has area → finish_update calls flush_shmem → pixels reach surface. */
+    {
+        void **ctx_list = *(void ***)((uint8_t *)g_pcr_rft_srv + 0x68);
+        uint64_t ctx_count = *(uint64_t *)((uint8_t *)g_pcr_rft_srv + 0x78);
+        for (uint64_t ci = 0; ci < ctx_count && ci < 20; ci++) {
+            void *ctx = *(void **)((uint8_t *)ctx_list + ci * 0x10);
+            if (!ctx) continue;
+            void **old_shape = (void **)((uint8_t *)ctx + 0x150);
+            if (*old_shape) {
+                static int _inv_log = 0;
+                if (_inv_log < 10) {
+                    _inv_log++;
+                    bfix_log("SHAPE_NULL[%d]: ctx[%llu] clearing old_shape=%p",
+                        _inv_log, (unsigned long long)ci, *old_shape);
+                }
+                *old_shape = NULL;
+            }
+        }
+    }
+
     /* === END DIRTY FLAG EXPERIMENTS === */
 
     g_pcr_render_count++;
