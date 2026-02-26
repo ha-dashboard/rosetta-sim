@@ -2010,6 +2010,55 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 /* Schedule render_for_time on the next mach_msg call */
                 g_commit_render_pending = 1;
 
+                /* CTX_PORT_MATCH: collect unique commit ports, compare with Server+0x68 */
+                {
+                    static mach_port_t commit_ports[32];
+                    static int n_commit_ports = 0;
+                    mach_port_t cp = msg->msgh_local_port;
+                    int already = 0;
+                    for (int i = 0; i < n_commit_ports; i++)
+                        if (commit_ports[i] == cp) { already = 1; break; }
+                    if (!already && n_commit_ports < 32)
+                        commit_ports[n_commit_ports++] = cp;
+
+                    static int _cpm_log = 0;
+                    if (_cpm_log < 5 && g_pcr_rft_srv) {
+                        _cpm_log++;
+                        void *srv = g_pcr_rft_srv;
+                        void **ctx_list = *(void ***)((uint8_t *)srv + 0x68);
+                        uint64_t ctx_count = *(uint64_t *)((uint8_t *)srv + 0x78);
+
+                        bfix_log("CTX_PORT_MATCH[%d]: commit_port=%u unique_ports=%d srv_ctx_count=%llu",
+                            _cpm_log, cp, n_commit_ports, (unsigned long long)ctx_count);
+
+                        for (uint64_t ci = 0; ci < ctx_count && ci < 10; ci++) {
+                            void *ctx = *(void **)((uint8_t *)ctx_list + ci * 0x10);
+                            if (!ctx) continue;
+                            /* Scan offsets 0x90-0xB0 for port values */
+                            uint32_t *c32 = (uint32_t *)ctx;
+                            uint32_t p90=c32[0x90/4], p94=c32[0x94/4], p98=c32[0x98/4];
+                            uint32_t p9c=c32[0x9c/4], pa0=c32[0xa0/4], pa4=c32[0xa4/4];
+                            uint32_t pa8=c32[0xa8/4], pac=c32[0xac/4], pb0=c32[0xb0/4];
+                            int match = 0;
+                            for (int pi = 0; pi < n_commit_ports; pi++) {
+                                if (p98 == commit_ports[pi]) match = 98;
+                                else if (pa0 == commit_ports[pi]) match = 0xa0;
+                                else if (pa8 == commit_ports[pi]) match = 0xa8;
+                            }
+                            bfix_log("  srv_ctx[%llu]=%p +98=%u +a0=%u +a8=%u %s",
+                                (unsigned long long)ci, ctx, p98, pa0, pa8,
+                                match ? "MATCH!" : "no_match");
+                        }
+                        /* Also log all unique commit ports seen so far */
+                        if (n_commit_ports <= 5) {
+                            char pbuf[256]; int pp = 0;
+                            for (int i = 0; i < n_commit_ports && pp < 200; i++)
+                                pp += snprintf(pbuf+pp, sizeof(pbuf)-pp, "%u ", commit_ports[i]);
+                            bfix_log("  commit_ports: %s", pbuf);
+                        }
+                    }
+                }
+
                 /* CORRECTED port check: use RegisterClient (40200) local_port as the
                  * known server port reference. CARenderServerGetServerPort returned 0
                  * (broken), so we capture the real port from the first 40200 message. */
