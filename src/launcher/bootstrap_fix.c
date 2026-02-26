@@ -2148,6 +2148,25 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         bfix_log("  CUMULATIVE: commits=%d bytes=%llu total_02=%llu total_03=%llu",
                             total_commits, total_bytes, total_02, total_03);
 
+                        /* FLOAT_SCAN: Search for float 1.0 (0x3f800000) — indicates color values */
+                        {
+                            uint32_t *words = (uint32_t *)cmd_data;
+                            uint32_t nwords = cmd_size / 4;
+                            int float_hits = 0;
+                            for (uint32_t fi = 0; fi + 3 < nwords; fi++) {
+                                if (words[fi] == 0x3f800000) { /* float 1.0 */
+                                    if (float_hits < 10) {
+                                        bfix_log("  FLOAT_1.0 @%u: [%.3f, %.3f, %.3f, %.3f]",
+                                            fi * 4,
+                                            *(float *)&words[fi], *(float *)&words[fi+1],
+                                            *(float *)&words[fi+2], *(float *)&words[fi+3]);
+                                    }
+                                    float_hits++;
+                                }
+                            }
+                            bfix_log("  FLOAT_SCAN: %d occurrences of 1.0f in %u bytes", float_hits, cmd_size);
+                        }
+
                         /* DECODE_TRACE: Try to parse as CA command stream.
                            CA::Render::Decoder reads commands as:
                              uint32_t cmd_word -> opcode = cmd_word & 0xFF (or & 0x3F)
