@@ -194,6 +194,10 @@ static void refresh_device(DeviceDisplay *dd) {
     CGColorSpaceRelease(cs);
 }
 
+/* Forward declarations */
+static void attempt_injection(void);
+static BOOL g_injection_done;
+
 /* --- 30fps refresh timer callback --- */
 
 static void refresh_all(NSTimer *timer) {
@@ -215,14 +219,23 @@ static void refresh_all(NSTimer *timer) {
             refresh_device(&g_single_device);
     }
 
+    /* Count active devices and re-scan if all lost */
+    int active = 0;
+    if (g_multi_device_mode) {
+        for (int i = 0; i < g_device_count; i++)
+            if (g_devices[i].active) active++;
+    } else if (g_single_device.active) {
+        active = 1;
+    }
+
+    /* Re-scan every 5s if no active devices (layer may have been released) */
+    if (active == 0 && g_frame_count % 150 == 0) {
+        NSLog(@"[inject] No active devices — re-scanning windows...");
+        g_injection_done = NO;
+        attempt_injection();
+    }
+
     if (g_frame_count <= 3 || g_frame_count % 300 == 0) {
-        int active = 0;
-        if (g_multi_device_mode) {
-            for (int i = 0; i < g_device_count; i++)
-                if (g_devices[i].active) active++;
-        } else if (g_single_device.active) {
-            active = 1;
-        }
         NSLog(@"[inject] frame %d: %d active device(s)", g_frame_count, active);
     }
 }
@@ -306,7 +319,6 @@ static void attempt_injection(void) {
 /* --- Retry injection until windows appear --- */
 
 static int g_retry_count = 0;
-static BOOL g_injection_done = NO;
 
 static void retry_injection(void) {
     g_retry_count++;

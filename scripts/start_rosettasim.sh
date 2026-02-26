@@ -101,6 +101,22 @@ if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
 fi
 echo "  Daemon running (PID $DAEMON_PID)"
 
+# --- Step 2b: Boot a default device (Simulator crashes without a booted device) ---
+echo "Booting default legacy device..."
+DEFAULT_UDID=$(xcrun simctl list devices 2>/dev/null \
+    | grep -E '9\.3|10\.3' \
+    | grep -v unavailable \
+    | head -1 \
+    | sed 's/.*(\([A-F0-9-]*\)).*/\1/')
+if [[ -n "$DEFAULT_UDID" ]]; then
+    DEFAULT_NAME=$(xcrun simctl list devices 2>/dev/null | grep "$DEFAULT_UDID" | head -1 | sed 's/ *\(.*\) (.*/\1/')
+    xcrun simctl boot "$DEFAULT_UDID" 2>/dev/null || true
+    echo "  Booted: $DEFAULT_NAME ($DEFAULT_UDID)"
+    sleep 5
+else
+    echo "  WARNING: No legacy device found to boot."
+fi
+
 # --- Step 3: Kill existing Simulator.app ---
 if pgrep -x Simulator >/dev/null 2>&1; then
     echo "Killing existing Simulator.app..."
