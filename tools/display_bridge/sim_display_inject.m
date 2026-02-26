@@ -25,16 +25,42 @@
 #import <objc/message.h>
 #include <fcntl.h>
 
-#define FB_WIDTH  750
-#define FB_HEIGHT 1334
-#define FB_BPR    (FB_WIDTH * 4)
-#define FB_SIZE   (FB_BPR * FB_HEIGHT)
+/* Dynamic dimensions — read from bridge metadata file */
+static uint32_t g_fb_width  = 750;
+static uint32_t g_fb_height = 1334;
+static uint32_t g_fb_bpr    = 3000;
+static uint32_t g_fb_size   = 4002000;
+static float    g_fb_scale  = 2.0f;
+static BOOL     g_dims_loaded = NO;
 
 static NSTimer *g_refresh_timer = nil;
 static CALayer *g_surface_layer = nil;
 static uint8_t *g_read_buf = NULL;
 
-/* No longer needed — we read the raw file directly */
+static void load_dimensions(void) {
+    if (g_dims_loaded) return;
+    /* Read metadata written by purple_fb_bridge */
+    FILE *f = fopen("/tmp/rosettasim_dimensions.json", "r");
+    if (!f) return;
+    char buf[256];
+    if (fgets(buf, sizeof(buf), f)) {
+        unsigned w = 0, h = 0, bpr = 0;
+        float scale = 0;
+        if (sscanf(buf, "{\"width\":%u,\"height\":%u,\"scale\":%f,\"bpr\":%u}", &w, &h, &scale, &bpr) >= 3) {
+            if (w > 0 && h > 0) {
+                g_fb_width  = w;
+                g_fb_height = h;
+                g_fb_bpr    = bpr > 0 ? bpr : w * 4;
+                g_fb_size   = g_fb_bpr * g_fb_height;
+                g_fb_scale  = scale > 0 ? scale : 2.0f;
+                g_dims_loaded = YES;
+                NSLog(@"[inject] Loaded dimensions: %ux%u @%.0fx bpr=%u",
+                      g_fb_width, g_fb_height, g_fb_scale, g_fb_bpr);
+            }
+        }
+    }
+    fclose(f);
+}
 
 /* Recursively find SimDisplayRenderableView in view hierarchy */
 static NSView *find_renderable_view(NSView *root) {
@@ -83,9 +109,12 @@ static void refresh_surface(NSTimer *timer) {
     if (!g_surface_layer) return;
     g_frame_count++;
 
-    /* Allocate read buffer once */
+    /* Load dimensions on first frame (or when they change) */
+    load_dimensions();
+
+    /* Allocate/reallocate read buffer */
     if (!g_read_buf) {
-        g_read_buf = malloc(FB_SIZE);
+        g_read_buf = malloc(g_fb_size);
         if (!g_read_buf) return;
     }
 
@@ -95,13 +124,13 @@ static void refresh_surface(NSTimer *timer) {
         if (g_frame_count <= 3) NSLog(@"[inject] Waiting for framebuffer file...");
         return;
     }
-    ssize_t nread = read(fd, g_read_buf, FB_SIZE);
+    ssize_t nread = read(fd, g_read_buf, g_fb_size);
     close(fd);
-    if (nread < FB_SIZE) return;
+    if (nread < (ssize_t)g_fb_size) return;
 
     /* Convert to CGImage and set on layer */
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(g_read_buf, FB_WIDTH, FB_HEIGHT, 8, FB_BPR,
+    CGContextRef ctx = CGBitmapContextCreate(g_read_buf, g_fb_width, g_fb_height, 8, g_fb_bpr,
         cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
     if (ctx) {
         CGImageRef img = CGBitmapContextCreateImage(ctx);
@@ -141,8 +170,9 @@ static void attempt_injection(void) {
                 continue;
             }
 
-            /* Set contentsScale for @2x Retina display */
-            g_surface_layer.contentsScale = 2.0;
+            /* Set contentsScale from device scale factor */
+            load_dimensions();
+            g_surface_layer.contentsScale = g_fb_scale;
             g_surface_layer.contentsGravity = kCAGravityResize;
             NSLog(@"[inject] surfaceLayer: %@ bounds=%@ contentsScale=%.1f",
                   g_surface_layer, NSStringFromRect(g_surface_layer.bounds),

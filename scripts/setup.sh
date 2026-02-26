@@ -94,6 +94,58 @@ echo "  Created: $SIMULATOR_DST"
 echo "  Re-signed: library-validation removed"
 echo ""
 
+# --- Step 3b: Check SDK stub for legacy runtimes ---
+SDK_STUB_DIR="/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs"
+
+check_sdk_stub() {
+    local version="$1"
+    local sdk_name="iPhoneSimulator${version}.sdk"
+    local sdk_path="$SDK_STUB_DIR/$sdk_name"
+
+    if [[ -d "$sdk_path" ]]; then
+        echo "  SDK stub $sdk_name: OK"
+        return
+    fi
+
+    echo "  SDK stub $sdk_name: MISSING"
+    echo ""
+    echo "  The iOS $version SDK stub is needed for CoreSimulator to detect the platform."
+    echo "  Create it with:"
+    echo ""
+    echo "    sudo mkdir -p '$sdk_path'"
+    echo "    sudo tee '$sdk_path/SDKSettings.plist' > /dev/null << 'SDKEOF'"
+    cat << SDKEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Version</key><string>${version}</string>
+    <key>CanonicalName</key><string>iphonesimulator${version}</string>
+    <key>DisplayName</key><string>Simulator - iOS ${version}</string>
+    <key>MinimalDisplayName</key><string>Simulator - ${version}</string>
+    <key>MaximumDeploymentTarget</key><string>${version}.99</string>
+    <key>DefaultDeploymentTarget</key><string>${version}</string>
+    <key>DefaultProperties</key><dict>
+        <key>PLATFORM_NAME</key><string>iphonesimulator</string>
+        <key>LLVM_TARGET_TRIPLE_SUFFIX</key><string>-simulator</string>
+    </dict>
+    <key>SupportedTargets</key><dict>
+        <key>iphonesimulator</key><dict>
+            <key>Archs</key><array><string>x86_64</string><string>i386</string></array>
+        </dict>
+    </dict>
+</dict>
+</plist>
+SDKEOF
+    echo "SDKEOF"
+    echo ""
+}
+
+echo "Checking SDK stubs..."
+[[ "$HAS_93" -eq 1 ]] && check_sdk_stub "9.3"
+[[ "$HAS_103" -eq 1 ]] && check_sdk_stub "10.3"
+echo ""
+
 # --- Step 4: Create default devices ---
 echo "Creating legacy simulator devices..."
 
