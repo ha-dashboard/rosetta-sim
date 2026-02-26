@@ -167,3 +167,17 @@ Session 25 gotcha #6 said "pt_width must equal pixel dimensions." This is a **wo
 - Agent B: `cmm2kyo475x3anq32ul3awimd` — Execution (all implementation)
 - Agent C: `cmm3jdwnz00h1nh343wc8wxtw` — Research (CDN URLs, device profiles, reproducibility)
 - Agent D: `cmm3jdykd02c3ma37ogdkilav` — Testing (daemon E2E, multi-device, pt_width validation)
+
+## Simulator.app Crash: setHardwareKeyboardEnabled on Legacy Devices
+
+**Exception**: `-[__NSArrayM userInfo]: unrecognized selector sent to instance`
+**Location**: `[SimDevice _sendBridgeRequest:] → setHardwareKeyboardEnabled:keyboardType:error:`
+**Thread**: Background dispatch queue (not our code)
+
+CoreSimulator's bridge request to legacy iOS 9.3 devices returns an NSArray where modern CoreSimulator expects an NSDictionary (with `userInfo` method). This crashes when Simulator.app configures keyboard settings for legacy devices.
+
+**Our code is not involved** — thread 0 shows the injection dylib rendering normally (refresh_device → CA::Transaction::commit). The crash is purely in Simulator.app's keyboard configuration path.
+
+**Session 27 fixes**:
+1. Swizzle `[SimDevice setHardwareKeyboardEnabled:keyboardType:error:]` in injection dylib — wrap in try/catch
+2. Or prevent Simulator.app from calling it on legacy devices
