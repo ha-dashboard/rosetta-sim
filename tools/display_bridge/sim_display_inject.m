@@ -254,6 +254,7 @@ static BOOL load_multi_device_list(void) {
         device_set_layer(&g_devices[i], nil);
         g_devices[i].active = NO;
         if (g_devices[i].persist_fd >= 0) { close(g_devices[i].persist_fd); g_devices[i].persist_fd = -1; }
+        if (g_devices[i].iosurface) { CFRelease(g_devices[i].iosurface); g_devices[i].iosurface = NULL; }
     }
     g_device_count = new_count;
 
@@ -308,7 +309,8 @@ static CALayer *rescan_window_layer(NSWindow *win) {
 
 /* Returns YES if a new frame was displayed */
 static BOOL refresh_device(DeviceDisplay *dd) {
-    if (!dd->layer_ref || !dd->read_buf || !dd->fb_path[0]) return NO;
+    if (!dd->layer_ref) return NO;
+    if (!dd->iosurface && (!dd->read_buf || !dd->fb_path[0])) return NO;
 
     /* Check layer is still in the view hierarchy — Simulator.app may have replaced it */
     CALayer *layer = DEVICE_LAYER(dd);
@@ -339,23 +341,35 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         if (!dd->layer_ref) return NO;
     }
 
-    /* Check if file changed (inode or mtime) before expensive read.
-     * Atomic rename changes inode — that's the primary signal.
-     * mtime is secondary (catches in-place writes, though daemon doesn't do those). */
+    /* --- IOSurface path (zero-copy): set surface directly on layer --- */
+    if (dd->iosurface) {
+        CALayer *layer = DEVICE_LAYER(dd);
+        /* Set IOSurface as layer contents — backboardd updates it in-place */
+        if (layer.contents != (__bridge id)dd->iosurface) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            layer.contents = (__bridge id)dd->iosurface;
+            [CATransaction commit];
+            static int s_log_count = 0;
+            if (s_log_count++ < 3)
+                NSLog(@"[inject] '%s': set IOSurface id=%u as layer.contents", dd->name, dd->surface_id);
+        }
+        /* Force layer to re-read surface contents */
+        [layer setNeedsDisplay];
+        return YES;
+    }
+
+    /* --- File fallback: read from framebuffer file (for standalone bridge compat) --- */
+    if (!dd->read_buf || !dd->fb_path[0]) return NO;
+
     struct stat st;
     if (stat(dd->fb_path, &st) != 0) return NO;
     BOOL inode_changed = (st.st_ino != dd->last_ino);
     BOOL mtime_changed = (st.st_mtimespec.tv_sec != dd->last_mtime);
     if (!inode_changed && !mtime_changed)
-        return NO; /* no change */
+        return NO;
     dd->last_mtime = st.st_mtimespec.tv_sec;
 
-    static int s_timing_count = 0;
-    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-    BOOL do_timing = (s_timing_count < 20);
-    if (do_timing) t0 = mach_absolute_time();
-
-    /* Re-open fd if inode changed (atomic rename creates new inode) or not yet open */
     if (dd->persist_fd < 0 || inode_changed) {
         if (dd->persist_fd >= 0) close(dd->persist_fd);
         dd->persist_fd = open(dd->fb_path, O_RDONLY);
@@ -363,12 +377,8 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         dd->last_ino = st.st_ino;
     }
 
-    if (do_timing) t1 = mach_absolute_time();
-
     ssize_t nread = pread(dd->persist_fd, dd->read_buf, dd->fb_size, 0);
     if (nread < (ssize_t)dd->fb_size) return NO;
-
-    if (do_timing) t2 = mach_absolute_time();
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(dd->read_buf, dd->width, dd->height,
@@ -385,20 +395,6 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         CGContextRelease(ctx);
     }
     CGColorSpaceRelease(cs);
-
-    if (do_timing) {
-        t3 = mach_absolute_time();
-        static mach_timebase_info_data_t tb = {0};
-        if (!tb.numer) mach_timebase_info(&tb);
-        double us_open = (double)(t1 - t0) * tb.numer / tb.denom / 1000.0;
-        double us_read = (double)(t2 - t1) * tb.numer / tb.denom / 1000.0;
-        double us_render = (double)(t3 - t2) * tb.numer / tb.denom / 1000.0;
-        double us_total = (double)(t3 - t0) * tb.numer / tb.denom / 1000.0;
-        s_timing_count++;
-        NSLog(@"[inject] refresh #%d '%s': open=%.0fus read=%.0fus render=%.0fus total=%.0fus (ino_chg=%d)",
-              s_timing_count, dd->name, us_open, us_read, us_render, us_total, inode_changed);
-    }
-
     return YES;
 }
 
