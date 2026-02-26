@@ -8955,11 +8955,53 @@ static void install_setClientPort_logging(void) {
     });
 }
 
+/* ── _copyRenderLayer layerFlags hook ── */
+static IMP g_orig_copyRenderLayer = NULL;
+static int g_crl_log_count = 0;
+static int g_crl_total = 0;
+static int g_crl_bit3_set = 0;
+static int g_crl_bit3_clear = 0;
+
+static void replacement_copyRenderLayer(id self, SEL _cmd, void *renderLayer,
+                                         unsigned char layerFlags, void *commitFlags) {
+    g_crl_total++;
+    if (layerFlags & 0x8) g_crl_bit3_set++; else g_crl_bit3_clear++;
+
+    if (g_crl_log_count < 30) {
+        g_crl_log_count++;
+        const char *cls = object_getClassName(self);
+        bridge_log("CRL[%d]: class=%s layerFlags=0x%02x bit3=%d renderLayer=%p commitFlags=%p",
+            g_crl_log_count, cls ? cls : "?", (unsigned)layerFlags,
+            (layerFlags & 0x8) ? 1 : 0, renderLayer, commitFlags);
+    }
+    /* Log summary periodically */
+    if (g_crl_total == 50 || g_crl_total == 200 || g_crl_total == 1000) {
+        bridge_log("CRL_SUMMARY: total=%d bit3_set=%d bit3_clear=%d",
+            g_crl_total, g_crl_bit3_set, g_crl_bit3_clear);
+    }
+    /* Call original */
+    ((void(*)(id, SEL, void*, unsigned char, void*))g_orig_copyRenderLayer)(
+        self, _cmd, renderLayer, layerFlags, commitFlags);
+}
+
+static void install_copyRenderLayer_hook(void) {
+    /* Swizzle -[CALayer _copyRenderLayer:layerFlags:commitFlags:] */
+    Class cls = objc_getClass("CALayer");
+    if (!cls) { bridge_log("CRL_HOOK: CALayer class not found"); return; }
+    SEL sel = sel_registerName("_copyRenderLayer:layerFlags:commitFlags:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { bridge_log("CRL_HOOK: method not found"); return; }
+    g_orig_copyRenderLayer = method_getImplementation(m);
+    method_setImplementation(m, (IMP)replacement_copyRenderLayer);
+    bridge_log("CRL_HOOK: installed, orig=%p", (void*)g_orig_copyRenderLayer);
+}
+
 __attribute__((constructor))
 static void rosettasim_bridge_init(void) {
     _install_crash_handler();
     bridge_log("========================================");
     bridge_log("RosettaSim Bridge loaded");
+    install_copyRenderLayer_hook();
     bridge_log("PID: %d", getpid());
     install_setClientPort_logging();
     /* Install bundle/Info.plist fallback BEFORE UIKit initialization. */
