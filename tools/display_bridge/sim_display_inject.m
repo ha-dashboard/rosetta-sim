@@ -342,21 +342,10 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         if (!dd->layer_ref) return NO;
     }
 
-    /* --- IOSurface path: zero-copy CGImage, synced to daemon flush via file mtime --- */
+    /* --- IOSurface path: zero-copy CGImage from double-buffered read surface --- */
     if (dd->iosurface) {
-        /* Use framebuffer file mtime as "flush completed" signal.
-         * The daemon writes the file AFTER backboardd finishes writing to the IOSurface,
-         * so by the time mtime changes, the surface has a complete frame. */
-        if (dd->fb_path[0]) {
-            struct stat st;
-            if (stat(dd->fb_path, &st) == 0) {
-                BOOL changed = (st.st_ino != dd->last_ino || st.st_mtimespec.tv_sec != dd->last_mtime);
-                if (!changed) return NO; /* no new flush — skip */
-                dd->last_mtime = st.st_mtimespec.tv_sec;
-                dd->last_ino = st.st_ino;
-            }
-        }
-
+        /* Surface B is a stable snapshot (daemon copies A→B after each flush).
+         * No mtime gating needed — render on every CADisplayLink tick. */
         void *base = IOSurfaceGetBaseAddress(dd->iosurface);
         size_t bpr = IOSurfaceGetBytesPerRow(dd->iosurface);
         CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bpr * dd->height, NULL);

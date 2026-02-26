@@ -32,6 +32,7 @@
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <mach/mach_time.h>
 #import <IOSurface/IOSurface.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
@@ -257,8 +258,17 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
          * The injection reads from surface B via IOSurfaceLookup, so this gives
          * it a stable snapshot while backboardd starts writing the next frame to A. */
         if (ctx->iosurface_read && ctx->surface_base) {
+            uint64_t t0 = mach_absolute_time();
             void *read_base = IOSurfaceGetBaseAddress(ctx->iosurface_read);
             memcpy(read_base, ctx->surface_base, ctx->surface_size);
+            if (ctx->flush_count <= 10) {
+                uint64_t t1 = mach_absolute_time();
+                static mach_timebase_info_data_t tb = {0};
+                if (!tb.numer) mach_timebase_info(&tb);
+                double ms = (double)(t1 - t0) * tb.numer / tb.denom / 1e6;
+                NSLog(@"[daemon] %s: flush #%d memcpy %.1fms (%u bytes)",
+                      ctx->name, ctx->flush_count, ms, ctx->surface_size);
+            }
         }
         write_framebuffer(ctx);
 
