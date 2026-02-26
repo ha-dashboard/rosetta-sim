@@ -50,8 +50,15 @@ purple_fb_bridge <UDID>           ← our ONLY custom tool
 
 | File | Purpose |
 |------|---------|
-| `src/plugins/IndigoLegacyFramebufferServices/` | PurpleFB bridge tool + plugin code |
-| `tools/view_raw_framebuffer.swift` | Live framebuffer viewer |
+| `src/plugins/IndigoLegacyFramebufferServices/` | CoreSimulator plugin code (PurpleFB + SimFramebuffer protocol) |
+| `tools/display_bridge/purple_fb_bridge.m` | PurpleFB bridge tool — IOSurface-backed, surface ID sharing |
+| `tools/display_bridge/sim_display_inject.m` | Dylib injected into Simulator.app to display our IOSurface |
+| `tools/display_bridge/sim_viewer.m` | Standalone framebuffer viewer (reads /tmp/sim_framebuffer.raw) |
+| `tools/display_bridge/rockit_bridge.m` | Phase 2 prototype — ROCKit/SimulatorKit display path exploration |
+| `tools/display_bridge/README.md` | Full documentation: architecture, protocol, build, usage |
+| `tools/view_raw_framebuffer.swift` | Swift live framebuffer viewer |
+| `tools/test_fb_port_takeover.m` | Port registration experiment tool |
+| `scripts/run_legacy_sim.sh` | One-command automation: bridge + boot + inject |
 | `.claude/context/session-25-state.md` | Mid-session state |
 | `docs/milestone_ios93_springboard.png` | SpringBoard screenshot |
 
@@ -75,18 +82,37 @@ StreamProcessor: Apple Software Renderer ✅
 Audio: Host route ✅
 ```
 
+## Phase 2 Progress: Native Display Integration
+
+### What Works
+- `sim_display_inject.dylib` — injects into Simulator.app, creates NSWindow with CALayer displaying our IOSurface
+- `sim_viewer` — standalone macOS viewer reading raw framebuffer dumps
+- `run_legacy_sim.sh` — full automation: bridge → boot → inject → display
+
+### SimulatorKit Finding
+SimulatorKit's display APIs (`SimDeviceScreen`, `SimDeviceScreenAdapter`, `SimDisplayRenderableView`) are **Swift-only** — not callable from ObjC/C. The `screenAdapter`, `unmaskedSurface`, `register(types:queue:handler:)` methods use Swift vtable dispatch only. A Swift bridge tool would be needed to use the native display pipeline.
+
+### Display Pipeline (fully mapped)
+```
+SimRenderServer (XPC) → ROCKit serialization → SimulatorKit.framework
+  → SimDeviceScreenAdapter.register() → .surfacesChanged(IOSurface?, IOSurface?)
+    → SimDeviceScreen.unmaskedSurface → SimDisplayRenderableView.surfaceLayer (CALayer)
+```
+
 ## Next Steps (Session 26)
 
 1. **Touch input** — Send IOHIDDigitizerEvents via IndigoHIDRegistrationPort
-2. **Live display** — Integrate with RosettaSimApp (RSIM format) or build dedicated viewer
+2. **Display refinement** — Fix sim_display_inject window positioning, refresh rate
 3. **App launching** — Install and launch apps via simctl
 4. **iOS 12.4 test** — Same bridge for another runtime
-5. **Packaging** — Clean up bridge tool, make it a proper CLI
+5. **Swift bridge** — Optional: native SimulatorKit integration for proper Simulator.app display
 
 ## Commits This Session
 - `215abe7`: PurpleFB bridge tool — first real pixels
 - `eaaf7e0`: Continuous rendering with flush replies
 - `d77b09f`: SpringBoard milestone screenshot + IO integration
+- `e16525d`: IOSurface + memory_entry dual surface, SFB protocol exploration
+- `6621bab`: Phase 2 display bridge — IOSurface PurpleFB + Simulator.app injection
 
 ## Agent Sessions
 - Agent A: `cmm2kr8hg5x20nq32pt5ca76g` — SimFramebuffer protocol RE, PurpleFB verification
