@@ -83,7 +83,7 @@ typedef struct DeviceContext {
     time_t          last_flush_time;
 } DeviceContext;
 
-#define MAX_DEVICES 32
+#define MAX_DEVICES 64
 static DeviceContext g_devices[MAX_DEVICES];
 static int g_device_count = 0;
 static dispatch_queue_t g_msg_queue;
@@ -454,7 +454,9 @@ static BOOL is_legacy_runtime(id device) {
         NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
                            sel_registerName("runtimeIdentifier"));
         if (!rtId) return NO;
-        if (![rtId containsString:@"iOS-9"] && ![rtId containsString:@"iOS-10"]) return NO;
+        /* iOS 12.4 has mismatched runtime ID "iOS-15-4" due to .simruntime bundle */
+        if (![rtId containsString:@"iOS-9"] && ![rtId containsString:@"iOS-10"]
+            && ![rtId containsString:@"iOS-15-4"]) return NO;
         /* Verify device has a valid device type profile */
         id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
         if (!deviceType) return NO;
