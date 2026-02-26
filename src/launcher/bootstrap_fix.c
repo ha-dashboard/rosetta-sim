@@ -1979,26 +1979,76 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 uint8_t *raw = (uint8_t *)msg;
                 if (msg->msgh_size >= 0x18) {
                     uint32_t inner_id = *(uint32_t *)(raw + 0x14);
-                    bfix_log("COMMIT_RECV: inner_id=0x%x (expect 0x9C42 or 0x9C43)", inner_id);
+                    static int _inner_log = 0;
+                    if (_inner_log < 5)
+                        bfix_log("COMMIT_RECV: inner_id=0x%x (expect 0x9C42 or 0x9C43)", inner_id);
+                    _inner_log++;
                 }
-                if (is_complex) {
-                    mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
-                    bfix_log("COMMIT_RECV: desc_count=%u", body->msgh_descriptor_count);
-                    /* Dump descriptor types */
-                    uint8_t *dp = (uint8_t *)(body + 1);
-                    for (uint32_t d = 0; d < body->msgh_descriptor_count && d < 4; d++) {
-                        uint32_t dtype = *(uint32_t *)(dp + 8) & 0xFF;
-                        if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
-                            mach_msg_port_descriptor_t *pd = (mach_msg_port_descriptor_t *)dp;
-                            bfix_log("COMMIT_RECV: desc[%u] PORT name=%u disp=%u", d, pd->name, pd->disposition);
-                            dp += sizeof(mach_msg_port_descriptor_t);
-                        } else if (dtype == MACH_MSG_OOL_DESCRIPTOR) {
-                            mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
-                            bfix_log("COMMIT_RECV: desc[%u] OOL addr=%p size=%u", d, od->address, od->size);
-                            dp += sizeof(mach_msg_ool_descriptor_t);
-                        } else {
-                            bfix_log("COMMIT_RECV: desc[%u] type=%u", d, dtype);
-                            dp += 12;
+
+                /* Dump command opcodes from commit data */
+                static int _cmd_log = 0;
+                if (_cmd_log < 20) {
+                    _cmd_log++;
+                    uint8_t *cmd_data = NULL;
+                    uint32_t cmd_size = 0;
+
+                    if (is_complex) {
+                        /* Complex message: check for OOL descriptors */
+                        mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
+                        bfix_log("COMMIT_RECV: desc_count=%u", body->msgh_descriptor_count);
+                        uint8_t *dp = (uint8_t *)(body + 1);
+                        for (uint32_t d = 0; d < body->msgh_descriptor_count && d < 4; d++) {
+                            uint32_t dtype = *(uint32_t *)(dp + 8) & 0xFF;
+                            if (dtype == MACH_MSG_OOL_DESCRIPTOR) {
+                                mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
+                                if (od->size > 16 && od->address) {
+                                    cmd_data = (uint8_t *)od->address;
+                                    cmd_size = od->size;
+                                }
+                                dp += sizeof(mach_msg_ool_descriptor_t);
+                            } else if (dtype == MACH_MSG_PORT_DESCRIPTOR) {
+                                dp += sizeof(mach_msg_port_descriptor_t);
+                            } else {
+                                dp += 12;
+                            }
+                        }
+                        /* If no OOL found, data is inline after descriptors */
+                        if (!cmd_data && msg->msgh_size > (uint32_t)((uintptr_t)dp - (uintptr_t)msg) + 16) {
+                            cmd_data = dp;
+                            cmd_size = msg->msgh_size - (uint32_t)((uintptr_t)dp - (uintptr_t)msg);
+                        }
+                    } else {
+                        /* Simple inline commit: data after header */
+                        if (msg->msgh_size > 0x20) {
+                            cmd_data = raw + 0x18;
+                            cmd_size = msg->msgh_size - 0x18;
+                        }
+                    }
+
+                    if (cmd_data && cmd_size >= 32) {
+                        /* Dump first 64 bytes of command data */
+                        bfix_log("CMD_BYTES[%d]: size=%u first64:", _cmd_log, cmd_size);
+                        bfix_log("  %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
+                                 " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                            cmd_data[0], cmd_data[1], cmd_data[2], cmd_data[3],
+                            cmd_data[4], cmd_data[5], cmd_data[6], cmd_data[7],
+                            cmd_data[8], cmd_data[9], cmd_data[10], cmd_data[11],
+                            cmd_data[12], cmd_data[13], cmd_data[14], cmd_data[15],
+                            cmd_data[16], cmd_data[17], cmd_data[18], cmd_data[19],
+                            cmd_data[20], cmd_data[21], cmd_data[22], cmd_data[23],
+                            cmd_data[24], cmd_data[25], cmd_data[26], cmd_data[27],
+                            cmd_data[28], cmd_data[29], cmd_data[30], cmd_data[31]);
+                        if (cmd_size >= 64) {
+                            bfix_log("  %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x"
+                                     " %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                                cmd_data[32], cmd_data[33], cmd_data[34], cmd_data[35],
+                                cmd_data[36], cmd_data[37], cmd_data[38], cmd_data[39],
+                                cmd_data[40], cmd_data[41], cmd_data[42], cmd_data[43],
+                                cmd_data[44], cmd_data[45], cmd_data[46], cmd_data[47],
+                                cmd_data[48], cmd_data[49], cmd_data[50], cmd_data[51],
+                                cmd_data[52], cmd_data[53], cmd_data[54], cmd_data[55],
+                                cmd_data[56], cmd_data[57], cmd_data[58], cmd_data[59],
+                                cmd_data[60], cmd_data[61], cmd_data[62], cmd_data[63]);
                         }
                     }
                 }
