@@ -37,9 +37,16 @@ VIEWER_CFLAGS = $(CFLAGS_COMMON)
 VIEWER_LDFLAGS = -framework Foundation -framework AppKit \
                  -framework IOSurface -framework QuartzCore -framework CoreGraphics
 
-.PHONY: all bridge inject viewer clean
+# Daemon: monitors all legacy devices, auto-registers PurpleFBServer on boot
+DAEMON_SRC    = rosettasim_daemon.m
+DAEMON_BIN    = rosettasim_daemon
+DAEMON_CFLAGS = $(CFLAGS_COMMON)
+DAEMON_LDFLAGS = -framework Foundation -framework IOSurface -framework CoreGraphics \
+                 -Wl,-undefined,dynamic_lookup
 
-all: bridge inject viewer
+.PHONY: all bridge inject viewer daemon clean
+
+all: bridge inject viewer daemon
 
 bridge: $(BRIDGE_BIN)
 
@@ -59,6 +66,12 @@ $(VIEWER_BIN): $(VIEWER_SRC)
 	$(CC) $(VIEWER_CFLAGS) $(VIEWER_LDFLAGS) -o $@ $<
 	@echo "Built: $@"
 
+daemon: $(DAEMON_BIN)
+
+$(DAEMON_BIN): $(DAEMON_SRC)
+	$(CC) $(DAEMON_CFLAGS) $(DAEMON_LDFLAGS) -o $@ $<
+	@echo "Built: $@"
+
 clean:
-	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN)
+	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN)
 	@echo "Cleaned."

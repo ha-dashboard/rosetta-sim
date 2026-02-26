@@ -90,7 +90,15 @@ static BOOL load_multi_device_list(void) {
     if (!data) return NO;
 
     NSError *err = nil;
-    NSArray *devices = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (!parsed) return NO;
+    /* Support both bare array [...] and wrapped {"devices":[...]} */
+    NSArray *devices = nil;
+    if ([parsed isKindOfClass:[NSArray class]]) {
+        devices = parsed;
+    } else if ([parsed isKindOfClass:[NSDictionary class]]) {
+        devices = ((NSDictionary *)parsed)[@"devices"];
+    }
     if (!devices || ![devices isKindOfClass:[NSArray class]]) return NO;
 
     g_device_count = 0;
