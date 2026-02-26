@@ -321,6 +321,12 @@ static volatile void *g_display_pixel_buffer = NULL; /* SW renderer pixel data *
 static volatile int64_t g_display_pixel_stride = 0;  /* SW renderer stride (may differ from 750*4) */
 static volatile vm_address_t g_server_surface_map = 0; /* CARenderServer's vm_map of our surface */
 
+/* Custom Mach message ID for "render now" trigger */
+#define RENDER_NOW_MSG_ID 49999
+
+/* CARenderServer send port (for sending render-now messages to self) */
+static mach_port_t g_ca_render_send_port = MACH_PORT_NULL;
+
 /* Render pump: render_for_time triggered from sync thread via CFRunLoopSource */
 static void *g_rft_srv = NULL;         /* Server C++ object */
 static uintptr_t g_rft_qc = 0;         /* QuartzCore base address */
@@ -2124,22 +2130,49 @@ static void *pfb_display_services_thread(void *arg) {
 extern double CACurrentMediaTime(void);
 
 static void *pfb_render_pump(void *arg) {
-    pfb_log("S22_RFT: render pump thread started");
+    pfb_log("RENDER_PUMP: started, sleeping 10s for backboardd startup + initial commits");
+    /* Sleep 10s — completely independent of S22/GPU_INJECT */
+    for (int w = 0; w < 100; w++) usleep(100000); /* 10s in 100ms chunks */
+    pfb_log("RENDER_PUMP: awake, looking up CARenderServer");
+    pfb_log("RENDER_PUMP: bootstrap_port=0x%x", bootstrap_port);
+
+    /* Look up CARenderServer to get a send right */
+    mach_port_t ca_port = MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.apple.CARenderServer", &ca_port);
+    if (kr != KERN_SUCCESS || ca_port == MACH_PORT_NULL) {
+        pfb_log("RENDER_PUMP: CARenderServer lookup failed: %d", kr);
+        return NULL;
+    }
+    g_ca_render_send_port = ca_port;
+    pfb_log("RENDER_PUMP: got CARenderServer send port 0x%x, g_running=%d", ca_port, g_running);
+
+    /* Send render-now messages at ~10fps */
     struct timespec interval = { 0, 100000000 }; /* 100ms = 10fps */
     int count = 0;
+    if (!g_running) {
+        pfb_log("RENDER_PUMP: WARNING g_running=0, loop won't execute!");
+    }
     while (g_running) {
-        nanosleep(&interval, NULL);
-        if (!g_rft_srv || !g_rft_qc) continue;
         count++;
 
-        typedef void (*RenderForTimeFn)(void *, double, void *, unsigned int);
-        RenderForTimeFn fn = (RenderForTimeFn)(g_rft_qc + 0x1287ea);
-        fn(g_rft_srv, CACurrentMediaTime(), NULL, 0);
+        /* Send a simple "render now" message */
+        mach_msg_header_t msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        msg.msgh_size = sizeof(msg);
+        msg.msgh_remote_port = ca_port;
+        msg.msgh_local_port = MACH_PORT_NULL;
+        msg.msgh_id = RENDER_NOW_MSG_ID;
+
+        if (count == 1) pfb_log("RENDER_PUMP: sending first msg to port 0x%x", ca_port);
+        kr = mach_msg(&msg, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0,
+                      MACH_PORT_NULL, 10, MACH_PORT_NULL);
+        if (count == 1) pfb_log("RENDER_PUMP: first msg sent, kr=%d (%s)", kr, mach_error_string(kr));
 
         if (count <= 5 || count % 100 == 0)
-            pfb_log("RENDER_FOR_TIME[%d]", count);
+            pfb_log("RENDER_PUMP[%d]: sent msg_id=%d kr=%d", count, RENDER_NOW_MSG_ID, kr);
     }
-    pfb_log("S22_RFT: render pump thread exiting");
+    pfb_log("RENDER_PUMP: exiting");
     return NULL;
 }
 
@@ -2230,6 +2263,17 @@ static void pfb_init(void) {
         pfb_log("WARNING: Cannot create sync thread");
     } else {
         pthread_detach(g_sync_thread);
+    }
+
+    /* Start the render pump thread — polls for S22 completion then sends render-now messages */
+    {
+        pthread_t rp_thread;
+        if (pthread_create(&rp_thread, NULL, pfb_render_pump, NULL) == 0) {
+            pthread_detach(rp_thread);
+            pfb_log("Render pump thread spawned (will poll for S22 completion)");
+        } else {
+            pfb_log("WARNING: Cannot create render pump thread");
+        }
     }
 
     /* Swizzle NSAssertionHandler to suppress ALL assertions during init */
@@ -3435,6 +3479,8 @@ static void pfb_init(void) {
 
         g_gpu_inject_done = 1;
         pfb_log("S22: complete, g_gpu_inject_done=1");
+
+        pfb_log("S22: render infrastructure ready, render pump should start sending soon");
     });
 
     /* ================================================================

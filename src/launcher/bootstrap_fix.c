@@ -1192,37 +1192,76 @@ static void _pcr_do_render(void) {
                     continue;
                 }
 
-                /* Bounds at layer+0x98 (float w) and +0x9C (float h) */
-                float fw = *(float *)((uint8_t *)root_layer + 0x98);
-                float fh = *(float *)((uint8_t *)root_layer + 0x9C);
+                /* Scan root layer for dimension-like doubles */
+                int found_dims = 0;
+                for (int off = 0x20; off < 0x200 && !found_dims; off += 8) {
+                    double val = *(double *)((uint8_t *)root_layer + off);
+                    if (val > 100.0 && val < 2000.0) {
+                        double val2 = *(double *)((uint8_t *)root_layer + off + 8);
+                        if (val2 > 100.0 && val2 < 2000.0) {
+                            bfix_log("  ROOT: DIMS at +0x%x: %.1f x %.1f", off, val, val2);
+                            found_dims = 1;
+                        }
+                    }
+                }
+                if (!found_dims)
+                    bfix_log("  ROOT: no dimension-like doubles found");
 
                 /* Sublayer array at +0x70 */
                 void *sub_array = *(void **)((uint8_t *)root_layer + 0x70);
                 int sub_count = sub_array ? *(int *)((uint8_t *)sub_array + 0x0C) : -1;
 
-                /* Contents at +0x60 */
-                void *contents = *(void **)((uint8_t *)root_layer + 0x60);
-
-                bfix_log("  ROOT: layer=%p %.0fx%.0f sublayers=%d contents=%p",
-                    root_layer, fw, fh, sub_count, contents);
-
-                /* Dump first 2 sublayers if present */
-                if (sub_array && sub_count > 0) {
-                    for (int s = 0; s < sub_count && s < 3; s++) {
-                        void *sub = *(void **)((uint8_t *)sub_array + 0x10 + s * 8);
-                        if (!sub) continue;
-                        float sw = *(float *)((uint8_t *)sub + 0x98);
-                        float sh = *(float *)((uint8_t *)sub + 0x9C);
-                        void *sc = *(void **)((uint8_t *)sub + 0x60);
-                        void *sub_subs = *(void **)((uint8_t *)sub + 0x70);
-                        int ss_count = sub_subs ? *(int *)((uint8_t *)sub_subs + 0x0C) : -1;
-                        bfix_log("    SUB[%d]: %.0fx%.0f contents=%p sublayers=%d",
-                            s, sw, sh, sc, ss_count);
-                    }
+                /* Dump raw first 32 uint64s of root_layer for analysis */
+                if (g_pcr_render_count <= 2) {
+                    uint64_t *raw = (uint64_t *)root_layer;
+                    bfix_log("  ROOT raw[0-7]:  %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]);
+                    bfix_log("  ROOT raw[8-15]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
+                    bfix_log("  ROOT raw[16-23]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        raw[16],raw[17],raw[18],raw[19],raw[20],raw[21],raw[22],raw[23]);
                 }
+
+                bfix_log("  ROOT: sublayers=%d", sub_count);
             }
 
-            /* Bound context check removed — struct arg passing issue */
+            /* Check DISPLAY context list — different from server context list */
+            void *display_cpp = *(void **)((uint8_t *)srv + 0x58);
+            if (display_cpp) {
+                /* Check display context list — std::vector at display+0xC0 {begin, end, capacity} */
+                void *dlist_begin = *(void **)((uint8_t *)display_cpp + 0xC0);
+                void *dlist_end   = *(void **)((uint8_t *)display_cpp + 0xC8);
+                int dcount = (dlist_begin && dlist_end && dlist_end > dlist_begin) ?
+                    (int)((uintptr_t)dlist_end - (uintptr_t)dlist_begin) / 8 : 0;
+                bfix_log("DISPLAY_CTX: begin=%p end=%p count=%d", dlist_begin, dlist_end, dcount);
+
+                /* Also scan wider range for any vector-like patterns */
+                for (int doff = 0x60; doff <= 0x100; doff += 8) {
+                    void *a = *(void **)((uint8_t *)display_cpp + doff);
+                    void *b = *(void **)((uint8_t *)display_cpp + doff + 8);
+                    if (a && b && b > a && (uintptr_t)b - (uintptr_t)a <= 0x1000 &&
+                        (uintptr_t)a > 0x100000000ULL) {
+                        int cnt = (int)((uintptr_t)b - (uintptr_t)a) / 8;
+                        if (cnt > 0 && cnt < 100) {
+                            bfix_log("DISPLAY_VEC: disp+0x%x: %p..%p count=%d", doff, a, b, cnt);
+                        }
+                    }
+                }
+                /* Also dump display raw data for analysis */
+                if (g_pcr_render_count <= 2) {
+                    uint64_t *draw = (uint64_t *)display_cpp;
+                    bfix_log("DISPLAY raw[0-7]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        draw[0],draw[1],draw[2],draw[3],draw[4],draw[5],draw[6],draw[7]);
+                    bfix_log("DISPLAY raw[8-15]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        draw[8],draw[9],draw[10],draw[11],draw[12],draw[13],draw[14],draw[15]);
+                    bfix_log("DISPLAY raw[16-23]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        draw[16],draw[17],draw[18],draw[19],draw[20],draw[21],draw[22],draw[23]);
+                    bfix_log("DISPLAY raw[24-31]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                        draw[24],draw[25],draw[26],draw[27],draw[28],draw[29],draw[30],draw[31]);
+                }
+            } else {
+                bfix_log("DISPLAY_CTX: no display at srv+0x58");
+            }
         }
     }
 }
@@ -1246,6 +1285,25 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
     }
 
     const int is_assertiond = bfix_is_assertiond_process();
+
+    /* Log ALL 40002/40003 sends from ANY process — identifies which process sends commits */
+    if ((option & MACH_SEND_MSG) && msg) {
+        if (msg->msgh_id == 40002 || msg->msgh_id == 40003) {
+            static int _app_commit_count = 0;
+            _app_commit_count++;
+            if (_app_commit_count <= 20 || _app_commit_count % 100 == 0) {
+                int is_complex = (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
+                bfix_log("APP_COMMIT[%d]: proc=%s id=%u size=%u port=%u complex=%d",
+                    _app_commit_count, getprogname(), msg->msgh_id,
+                    msg->msgh_size, msg->msgh_remote_port, is_complex);
+                if (is_complex) {
+                    mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
+                    bfix_log("APP_COMMIT[%d]: desc_count=%u", _app_commit_count,
+                        body->msgh_descriptor_count);
+                }
+            }
+        }
+    }
 
     /* Fire post-commit render if a commit was received on the previous call.
      * This runs AFTER MIG processed the commit, so the scene graph is updated.
@@ -1458,6 +1516,248 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                             msg->msgh_local_port, _cached_srv_port,
                             (msg->msgh_local_port == _cached_srv_port)
                                 ? "ON_SERVER(ctx=NULL!)" : "ON_CONTEXT(ok)");
+                    }
+                }
+
+                /* Port-to-context mapping + display binding fix */
+                static int _port_map_done = 0;
+                if (!_port_map_done && g_pcr_rft_srv) {
+                    _port_map_done = 1;
+                    static int _display_fix_attempted = 0;
+                    void *_srv = g_pcr_rft_srv;
+                    void **_cl = *(void ***)((uint8_t *)_srv + 0x68);
+                    uint64_t _cc = *(uint64_t *)((uint8_t *)_srv + 0x78);
+
+                    /* Scan all contexts for port at +0xa0 */
+                    bfix_log("PORT_MAP_SCAN: looking for local_port=%u among %llu contexts",
+                        msg->msgh_local_port, (unsigned long long)_cc);
+                    for (uint64_t ci = 0; ci < _cc && ci < 20; ci++) {
+                        void *ctx = *(void **)((uint8_t *)_cl + ci * 0x10);
+                        if (!ctx) continue;
+                        uint32_t cid = *(uint32_t *)((uint8_t *)ctx + 0x0C);
+                        /* Try port at multiple offsets */
+                        for (int poff = 0x90; poff <= 0xB0; poff += 4) {
+                            uint32_t pval = *(uint32_t *)((uint8_t *)ctx + poff);
+                            if (pval > 0 && pval < 100000) {
+                                mach_port_type_t pt = 0;
+                                if (mach_port_type(mach_task_self(), pval, &pt) == KERN_SUCCESS &&
+                                    (pt & MACH_PORT_TYPE_RECEIVE)) {
+                                    bfix_log("PORT_MAP: CTX[%llu] id=%u +0x%x=port %u (RECV)",
+                                        (unsigned long long)ci, cid, poff, pval);
+                                }
+                            }
+                        }
+                    }
+
+                    /* Check BOTH display context list locations and attempt binding fix */
+                    void *_disp = *(void **)((uint8_t *)_srv + 0x58);
+                    if (_disp) {
+                        /* Check display+0x68 (render_display's context array, stride 0x10) */
+                        void *ctx_arr_68 = *(void **)((uint8_t *)_disp + 0x68);
+                        int ctx_cnt_78 = *(int *)((uint8_t *)_disp + 0x78);
+                        bfix_log("DISP_68: array=%p count=%d", ctx_arr_68, ctx_cnt_78);
+                        if (ctx_arr_68 && ctx_cnt_78 > 0) {
+                            for (int di = 0; di < ctx_cnt_78 && di < 5; di++) {
+                                void *e = *(void **)((uint8_t *)ctx_arr_68 + di * 0x10);
+                                bfix_log("DISP_68[%d]: %p", di, e);
+                            }
+                        }
+
+                        /* Check display+0xC0 (std::vector) */
+                        void **db = *(void ***)((uint8_t *)_disp + 0xC0);
+                        void **de = *(void ***)((uint8_t *)_disp + 0xC8);
+                        int dc = (db && de && de > db) ? (int)((uintptr_t)de - (uintptr_t)db) / 8 : 0;
+                        bfix_log("DISP_C0: begin=%p end=%p count=%d", db, de, dc);
+                        if (db && dc > 0)
+                            bfix_log("DISP_C0[0]: raw=%p", db[0]);
+
+                        /* Find the commit-receiving context (the one whose port matches) */
+                        void *commit_ctx = NULL;
+                        uint32_t commit_ctx_id = 0;
+                        for (uint64_t ci3 = 0; ci3 < _cc && ci3 < 20; ci3++) {
+                            void *ctx3 = *(void **)((uint8_t *)_cl + ci3 * 0x10);
+                            if (!ctx3) continue;
+                            uint32_t p3 = *(uint32_t *)((uint8_t *)ctx3 + 0xa0);
+                            if (p3 == msg->msgh_local_port) {
+                                commit_ctx = ctx3;
+                                commit_ctx_id = *(uint32_t *)((uint8_t *)ctx3 + 0x0C);
+                                break;
+                            }
+                        }
+
+                        /* ATTEMPT FIX: Set displayable flag + call attach_contexts */
+                        if (commit_ctx && !_display_fix_attempted) {
+                            _display_fix_attempted = 1;
+
+                            /* Check and set displayable flag (bit 22 = 0x400000) on ALL contexts */
+                            for (uint64_t ci5 = 0; ci5 < _cc && ci5 < 20; ci5++) {
+                                void *ctx5 = *(void **)((uint8_t *)_cl + ci5 * 0x10);
+                                if (!ctx5) continue;
+                                uint32_t flags5 = *(uint32_t *)((uint8_t *)ctx5 + 0x08);
+                                int displayable = (flags5 & 0x400000) != 0;
+                                uint32_t cid5 = *(uint32_t *)((uint8_t *)ctx5 + 0x0C);
+                                void *opts5 = *(void **)((uint8_t *)ctx5 + 0x10);
+                                bfix_log("CTX_FLAGS[%llu]: id=%u flags=0x%x displayable=%d opts=%p",
+                                    (unsigned long long)ci5, cid5, flags5, displayable, opts5);
+
+                                /* Clear bit 0x20000 (blocks context_created early return)
+                                 * and ensure bit 0x400000 (displayable) is set */
+                                uint32_t new_flags = (flags5 & ~0x20000) | 0x400000;
+                                if (new_flags != flags5) {
+                                    *(uint32_t *)((uint8_t *)ctx5 + 0x08) = new_flags;
+                                    bfix_log("CTX_FLAGS[%llu]: flags 0x%x → 0x%x (cleared 0x20000, set displayable)",
+                                        (unsigned long long)ci5, flags5, new_flags);
+                                }
+                            }
+
+                            /* Dump opts dicts to check display ID */
+                            for (uint64_t ci6 = 0; ci6 < _cc && ci6 < 5; ci6++) {
+                                void *ctx6 = *(void **)((uint8_t *)_cl + ci6 * 0x10);
+                                if (!ctx6) continue;
+                                void *opts6 = *(void **)((uint8_t *)ctx6 + 0x10);
+                                if (opts6 && (uintptr_t)opts6 > 0x100000000ULL) {
+                                    @try {
+                                        id desc = ((id(*)(id,SEL))objc_msgSend)((id)opts6,
+                                            sel_registerName("description"));
+                                        if (desc) {
+                                            const char *str = ((const char*(*)(id,SEL))objc_msgSend)(
+                                                desc, sel_registerName("UTF8String"));
+                                            bfix_log("CTX[%llu] opts: %s",
+                                                (unsigned long long)ci6, str ? str : "nil");
+                                        }
+                                    } @catch (id ex) {
+                                        bfix_log("CTX[%llu] opts: exception (not NSDictionary?)",
+                                            (unsigned long long)ci6);
+                                    }
+                                }
+                            }
+
+                            /* Check display ID */
+                            uint32_t disp_id_10 = *(uint32_t *)((uint8_t *)_disp + 0x10);
+                            bfix_log("DISPLAY: +0x10(display_id?) = %u", disp_id_10);
+
+                            /* Fix: set display_id on each context via set_display_info,
+                             * then call attach_contexts to bind them to the display.
+                             * set_display_info writes display_id to context+0x170 and
+                             * sets flag 0x100000 at context+0x08. */
+                            void *qc_sym = dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+                            if (qc_sym) {
+                                Dl_info adi;
+                                if (dladdr(qc_sym, &adi) && adi.dli_fbase) {
+                                    uintptr_t qc_base = (uintptr_t)adi.dli_fbase;
+
+                                    /* Step 1: set display_id=1 on ALL contexts with root layers */
+                                    typedef void (*SetDispInfoFn)(void *, unsigned int);
+                                    SetDispInfoFn set_disp = (SetDispInfoFn)(qc_base + 0x5e2c2);
+
+                                    for (uint64_t ci7 = 0; ci7 < _cc && ci7 < 20; ci7++) {
+                                        void *ctx7 = *(void **)((uint8_t *)_cl + ci7 * 0x10);
+                                        if (!ctx7) continue;
+                                        void *h7 = *(void **)((uint8_t *)ctx7 + 0xB8);
+                                        if (!h7) continue;
+                                        uint32_t cid7 = *(uint32_t *)((uint8_t *)ctx7 + 0x0C);
+                                        uint32_t old_disp = *(uint32_t *)((uint8_t *)ctx7 + 0x170);
+                                        bfix_log("DISPLAY_BIND: ctx id=%u old_disp@0x170=%u, calling set_display_info(1)",
+                                            cid7, old_disp);
+                                        set_disp(ctx7, 1);
+                                        uint32_t new_disp = *(uint32_t *)((uint8_t *)ctx7 + 0x170);
+                                        uint32_t new_flags = *(uint32_t *)((uint8_t *)ctx7 + 0x08);
+                                        bfix_log("DISPLAY_BIND: ctx id=%u new_disp=%u flags=0x%x",
+                                            cid7, new_disp, new_flags);
+                                    }
+
+                                    /* Step 2: Also populate opts dict with displayId=1 */
+                                    for (uint64_t ci8 = 0; ci8 < _cc && ci8 < 20; ci8++) {
+                                        void *ctx8 = *(void **)((uint8_t *)_cl + ci8 * 0x10);
+                                        if (!ctx8) continue;
+                                        void *h8 = *(void **)((uint8_t *)ctx8 + 0xB8);
+                                        if (!h8) continue;
+                                        @try {
+                                            id newOpts = ((id(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("NSMutableDictionary"),
+                                                sel_registerName("dictionary"));
+                                            id num1 = ((id(*)(id, SEL, int))objc_msgSend)(
+                                                (id)objc_getClass("NSNumber"),
+                                                sel_registerName("numberWithInt:"), 1);
+                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                                                newOpts, sel_registerName("setObject:forKey:"),
+                                                num1, @"displayId");
+                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                                                newOpts, sel_registerName("setObject:forKey:"),
+                                                @YES, @"displayable");
+                                            *(void **)((uint8_t *)ctx8 + 0x10) = (__bridge void *)newOpts;
+                                            uint32_t cid8 = *(uint32_t *)((uint8_t *)ctx8 + 0x0C);
+                                            bfix_log("DISPLAY_BIND: set opts {displayId=1} on ctx id=%u", cid8);
+                                        } @catch (id ex) {
+                                            bfix_log("DISPLAY_BIND: opts exception");
+                                        }
+                                    }
+
+                                    /* Step 3: Call context_created directly for each context */
+                                    typedef void (*CtxCreatedFn)(void *, void *, void *);
+                                    CtxCreatedFn ctx_created = (CtxCreatedFn)(qc_base + 0x126158);
+
+                                    for (uint64_t ci9 = 0; ci9 < _cc && ci9 < 20; ci9++) {
+                                        void *ctx9 = *(void **)((uint8_t *)_cl + ci9 * 0x10);
+                                        if (!ctx9) continue;
+                                        void *h9 = *(void **)((uint8_t *)ctx9 + 0xB8);
+                                        if (!h9) continue;
+                                        uint32_t cid9 = *(uint32_t *)((uint8_t *)ctx9 + 0x0C);
+                                        bfix_log("DISPLAY_BIND: calling context_created(ctx id=%u, srv, NULL)", cid9);
+                                        ctx_created(ctx9, _srv, NULL);
+                                        bfix_log("DISPLAY_BIND: context_created returned for id=%u", cid9);
+                                    }
+
+                                    /* Check display+0x68 after */
+                                    void *post_arr = *(void **)((uint8_t *)_disp + 0x68);
+                                    int post_cnt = *(int *)((uint8_t *)_disp + 0x78);
+                                    bfix_log("DISPLAY_BIND: after: disp+0x68=%p count=%d",
+                                        post_arr, post_cnt);
+                                }
+                            }
+
+                            bfix_log("DISPLAY_BIND: attempting to bind CTX id=%u to display",
+                                commit_ctx_id);
+
+                            /* Try writing to +0xC0 vector */
+                            if (db && dc > 0) {
+                                bfix_log("DISPLAY_BIND: overwriting C0[0] from %p to %p",
+                                    db[0], commit_ctx);
+                                db[0] = commit_ctx;
+                            }
+
+                            /* Also try writing to +0x68 array if it exists */
+                            if (ctx_arr_68 && ctx_cnt_78 > 0) {
+                                bfix_log("DISPLAY_BIND: overwriting 68[0] from %p to %p",
+                                    *(void **)ctx_arr_68, commit_ctx);
+                                *(void **)ctx_arr_68 = commit_ctx;
+                            } else if (!ctx_arr_68 || ctx_cnt_78 == 0) {
+                                bfix_log("DISPLAY_BIND: 68 array empty — allocating stride 0x10");
+                                /* Stride 0x10: {context_ptr, transform_data} per entry */
+                                void *new_arr = calloc(16, 0x10);
+                                if (new_arr) {
+                                    /* Write ALL known contexts with root layers */
+                                    int written = 0;
+                                    for (uint64_t ci4 = 0; ci4 < _cc && ci4 < 16; ci4++) {
+                                        void *ctx4 = *(void **)((uint8_t *)_cl + ci4 * 0x10);
+                                        if (!ctx4) continue;
+                                        void *h4 = *(void **)((uint8_t *)ctx4 + 0xB8);
+                                        if (!h4) continue; /* skip contexts without root layers */
+                                        *(void **)((uint8_t *)new_arr + written * 0x10) = ctx4;
+                                        *(uint64_t *)((uint8_t *)new_arr + written * 0x10 + 0x08) = 0;
+                                        uint32_t cid4 = *(uint32_t *)((uint8_t *)ctx4 + 0x0C);
+                                        bfix_log("DISPLAY_BIND: 68[%d] = ctx=%p id=%u (has root)",
+                                            written, ctx4, cid4);
+                                        written++;
+                                    }
+                                    *(void **)((uint8_t *)_disp + 0x68) = new_arr;
+                                    *(int *)((uint8_t *)_disp + 0x78) = written;
+                                    bfix_log("DISPLAY_BIND: wrote %d contexts to disp+0x68", written);
+                                }
+                            }
+
+                            bfix_log("DISPLAY_BIND: done — next render should see the context");
+                        }
                     }
                 }
 
@@ -2947,6 +3247,20 @@ static void bootstrap_fix_constructor(void) {
                         unsigned int cid = ((unsigned int(*)(id, SEL))objc_msgSend)(
                             ctx, sel_registerName("contextId"));
                         bfix_log("[bfix] constructor: remote context id=%u\n", cid);
+
+                        /* Dump impl fields */
+                        Ivar implI = class_getInstanceVariable(object_getClass(ctx), "_impl");
+                        if (implI) {
+                            void *imp = *(void **)((uint8_t *)ctx + ivar_getOffset(implI));
+                            if (imp) {
+                                bfix_log("[bfix] constructor: impl=%p", imp);
+                                for (int off = 0; off < 0xB0; off += 8) {
+                                    uint64_t val = *(uint64_t *)((uint8_t *)imp + off);
+                                    if (val != 0)
+                                        bfix_log("  IMPL+0x%02x = 0x%016llx", off, (unsigned long long)val);
+                                }
+                            }
+                        }
                     } else {
                         bfix_log("[bfix] constructor: remoteContextWithOptions returned nil\n");
                     }

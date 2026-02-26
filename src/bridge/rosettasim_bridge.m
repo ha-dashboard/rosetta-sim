@@ -6917,9 +6917,80 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                     /* Set the window's layer as the context's layer */
                                                     SEL setLayerSel = sel_registerName("setLayer:");
                                                     if ([(id)remoteCtx respondsToSelector:setLayerSel]) {
-                                                        ((void(*)(id, SEL, id))objc_msgSend)(
-                                                            remoteCtx, setLayerSel, rootLayer);
-                                                        bridge_log("Display Pipeline: Set context layer = rootLayer");
+                                                        /* FRESH LAYER TEST: Create entirely new layers
+                                                         * directly on the bridge's context to avoid
+                                                         * UIKit context ownership issues. New layers
+                                                         * are automatically dirty on the context they're
+                                                         * added to via setLayer:. */
+                                                        @try {
+                                                            Class layerCls = objc_getClass("CALayer");
+                                                            SEL layerSel = sel_registerName("layer");
+
+                                                            /* Create fresh root — red background, full screen */
+                                                            id freshRoot = ((id(*)(id, SEL))objc_msgSend)(
+                                                                (id)layerCls, layerSel);
+
+                                                            id redColor = ((id(*)(id, SEL))objc_msgSend)(
+                                                                (id)objc_getClass("UIColor"), sel_registerName("redColor"));
+                                                            void *redCG = ((void*(*)(id, SEL))objc_msgSend)(
+                                                                redColor, sel_registerName("CGColor"));
+                                                            ((void(*)(id, SEL, void*))objc_msgSend)(
+                                                                freshRoot, sel_registerName("setBackgroundColor:"), redCG);
+                                                            ((void(*)(id, SEL, BOOL))objc_msgSend)(
+                                                                freshRoot, sel_registerName("setOpaque:"), YES);
+
+                                                            bridge_log("FRESH_LAYER: created red root layer");
+
+                                                            /* Create green child sublayer */
+                                                            id greenChild = ((id(*)(id, SEL))objc_msgSend)(
+                                                                (id)layerCls, layerSel);
+                                                            id greenColor = ((id(*)(id, SEL))objc_msgSend)(
+                                                                (id)objc_getClass("UIColor"), sel_registerName("greenColor"));
+                                                            void *greenCG = ((void*(*)(id, SEL))objc_msgSend)(
+                                                                greenColor, sel_registerName("CGColor"));
+                                                            ((void(*)(id, SEL, void*))objc_msgSend)(
+                                                                greenChild, sel_registerName("setBackgroundColor:"), greenCG);
+                                                            ((void(*)(id, SEL, BOOL))objc_msgSend)(
+                                                                greenChild, sel_registerName("setOpaque:"), YES);
+                                                            ((void(*)(id, SEL, id))objc_msgSend)(
+                                                                freshRoot, sel_registerName("addSublayer:"), greenChild);
+
+                                                            bridge_log("FRESH_LAYER: added green child sublayer");
+
+                                                            /* Set the FRESH root on the bridge's context */
+                                                            ((void(*)(id, SEL, id))objc_msgSend)(
+                                                                remoteCtx, setLayerSel, freshRoot);
+                                                            bridge_log("FRESH_LAYER: set freshRoot on bridge context");
+
+                                                            /* Flush to commit */
+                                                            ((void(*)(id, SEL))objc_msgSend)(
+                                                                (id)objc_getClass("CATransaction"),
+                                                                sel_registerName("flush"));
+
+                                                            /* Read commit count after flush */
+                                                            Ivar cImplI = class_getInstanceVariable(
+                                                                object_getClass(remoteCtx), "_impl");
+                                                            if (cImplI) {
+                                                                void *cImpl = *(void **)((uint8_t *)remoteCtx
+                                                                    + ivar_getOffset(cImplI));
+                                                                if (cImpl) {
+                                                                    /* commits field — try a few offsets */
+                                                                    for (int coff = 0x18; coff <= 0x28; coff += 4) {
+                                                                        uint32_t cv = *(uint32_t *)((uint8_t *)cImpl + coff);
+                                                                        if (cv > 0 && cv < 1000)
+                                                                            bridge_log("FRESH_LAYER: impl+0x%x = %u (commit count?)", coff, cv);
+                                                                    }
+                                                                    uint32_t port98 = *(uint32_t *)((uint8_t *)cImpl + 0x98);
+                                                                    void *enc_a0 = *(void **)((uint8_t *)cImpl + 0xa0);
+                                                                    bridge_log("FRESH_LAYER: port@0x98=%u encoder@0xa0=%p",
+                                                                               port98, enc_a0);
+                                                                }
+                                                            }
+
+                                                            bridge_log("FRESH_LAYER: flushed — test complete");
+                                                        } @catch (id ex) {
+                                                            bridge_log("FRESH_LAYER: exception during test");
+                                                        }
                                                     }
 
                                                     SEL ctxIdSel = sel_registerName("contextId");
@@ -7028,6 +7099,20 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                             bridge_log("Display Pipeline [delayed]: renderContext=%p (%s)",
                                                                        rc, rc ? "REMOTE" : "LOCAL");
                                                         }
+
+                                                        /* Full impl dump for diagnosis */
+                                                        Ivar implI2 = class_getInstanceVariable(object_getClass(lc), "_impl");
+                                                        if (implI2) {
+                                                            void *imp2 = *(void **)((uint8_t *)lc + ivar_getOffset(implI2));
+                                                            if (imp2) {
+                                                                for (int off = 0; off < 0xB0; off += 8) {
+                                                                    uint64_t val = *(uint64_t *)((uint8_t *)imp2 + off);
+                                                                    if (val != 0) {
+                                                                        bridge_log("  IMPL+0x%02x = 0x%016llx", off, (unsigned long long)val);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -7101,22 +7186,13 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
                                                         bridge_log("Display Pipeline [delayed]: POST-FLUSH commits=%u flags=0x%x server_port=%u",
                                                                    cc, fl, sp);
 
-                                                        /* Session 21: Fix server_port mismatch.
-                                                         * Context+0x98 may have a per-client port from RegisterClient.
-                                                         * Override with the correct CARenderServer port so commits
-                                                         * actually reach the server's MIG handler. */
-                                                        mach_port_t correct_port = g_ca_server_port;
-                                                        if (correct_port && sp != correct_port) {
-                                                            *(uint32_t *)((uint8_t *)impl3 + 0x98) = correct_port;
-                                                            bridge_log("Display Pipeline [delayed]: FIXED server_port: %u → %u",
-                                                                       sp, correct_port);
-
-                                                            /* Re-flush to send commits to the correct port */
-                                                            ((void(*)(id, SEL))objc_msgSend)(
-                                                                (id)objc_getClass("CATransaction"),
-                                                                sel_registerName("flush"));
-                                                            bridge_log("Display Pipeline [delayed]: Re-flushed after port fix");
-                                                        }
+                                                        /* Session 21 port override REMOVED (Session 23).
+                                                         * The per-client port from RegisterClient IS correct.
+                                                         * It routes commits to the context-specific port in the server,
+                                                         * which maps to the right CA::Render::Context via context_by_server_port.
+                                                         * Overwriting with the CARenderServer service port caused ALL commits
+                                                         * to go to the server's main port → context=NULL → commands discarded. */
+                                                        bridge_log("Display Pipeline [delayed]: per-client port=%u (preserved)", sp);
                                                     }
                                                 }
                                             }
