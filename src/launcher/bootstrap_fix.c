@@ -1600,22 +1600,70 @@ static void _pcr_do_render(void) {
 
                 if (!root_handle) continue;
 
-                /* Root layer at handle+0x18 (from static analysis) */
-                void *root_layer = *(void **)((uint8_t *)root_handle + 0x18);
+                /* Track root_handle and root_layer pointers across renders */
+                static void *prev_handle[10] = {0};
+                static void *prev_layer[10] = {0};
+                static float prev_bg[10][4] = {{0}};
+
+                /* Root layer: try multiple handle offsets.
+                 * handle+0x18 was from static analysis but might be wrong.
+                 * Try handle+0x00, +0x08, +0x10, +0x18 to find the actual layer. */
+                void *root_layer = NULL;
+                int rl_offset = -1;
+                for (int ho = 0; ho <= 0x20; ho += 8) {
+                    void *candidate = *(void **)((uint8_t *)root_handle + ho);
+                    if (candidate && (uintptr_t)candidate > 0x100000 &&
+                        (uintptr_t)candidate < 0x800000000000ULL) {
+                        /* Check if this looks like a Render::Layer (vtable at +0x00) */
+                        void *vtable = *(void **)candidate;
+                        if (vtable && (uintptr_t)vtable > 0x100000000ULL &&
+                            (uintptr_t)vtable < 0x200000000ULL) {
+                            /* Code pointer range — likely vtable */
+                            float *maybe_bg = (float *)((uint8_t *)candidate + 0x10);
+                            if (maybe_bg[0] >= 0.0f && maybe_bg[0] <= 1.0f &&
+                                maybe_bg[3] >= 0.0f && maybe_bg[3] <= 1.0f) {
+                                root_layer = candidate;
+                                rl_offset = ho;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!root_layer) {
+                    /* Fallback to +0x18 */
+                    root_layer = *(void **)((uint8_t *)root_handle + 0x18);
+                    rl_offset = 0x18;
+                }
                 if (!root_layer) {
                     bfix_log("  ROOT: handle=%p but layer=NULL", root_handle);
                     continue;
                 }
 
-                /* Read Render::Layer visual properties (Agent A layout) */
+                /* Read Render::Layer visual properties */
                 {
                     float *bg = (float *)((uint8_t *)root_layer + 0x10);
                     uint8_t opacity = *(uint8_t *)((uint8_t *)root_layer + 0x20);
                     void *contents = *(void **)((uint8_t *)root_layer + 0x60);
                     void *sublayers = *(void **)((uint8_t *)root_layer + 0x70);
-                    bfix_log("  RENDER_LAYER[%llu]: bg=[%.3f,%.3f,%.3f,%.3f] opacity=%u contents=%p sublayers=%p",
+
+                    int handle_changed = (ci < 10 && prev_handle[ci] != root_handle);
+                    int layer_changed = (ci < 10 && prev_layer[ci] != root_layer);
+                    int bg_changed = (ci < 10 && (prev_bg[ci][0] != bg[0] || prev_bg[ci][1] != bg[1] ||
+                                                   prev_bg[ci][2] != bg[2] || prev_bg[ci][3] != bg[3]));
+
+                    bfix_log("  RENDER_LAYER[%llu]: bg=[%.3f,%.3f,%.3f,%.3f] opacity=%u contents=%p sublayers=%p handle_off=+0x%x %s%s%s",
                         (unsigned long long)ci, bg[0], bg[1], bg[2], bg[3],
-                        (unsigned)opacity, contents, sublayers);
+                        (unsigned)opacity, contents, sublayers, rl_offset,
+                        handle_changed ? "HANDLE_CHANGED " : "",
+                        layer_changed ? "LAYER_CHANGED " : "",
+                        bg_changed ? "BG_CHANGED " : "");
+
+                    if (ci < 10) {
+                        prev_handle[ci] = root_handle;
+                        prev_layer[ci] = root_layer;
+                        prev_bg[ci][0] = bg[0]; prev_bg[ci][1] = bg[1];
+                        prev_bg[ci][2] = bg[2]; prev_bg[ci][3] = bg[3];
+                    }
                 }
 
                 /* Scan root layer for dimension-like doubles */
