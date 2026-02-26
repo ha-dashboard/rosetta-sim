@@ -2109,6 +2109,30 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         total_commits++;
                         bfix_log("  CUMULATIVE: commits=%d bytes=%llu total_02=%llu total_03=%llu",
                             total_commits, total_bytes, total_02, total_03);
+
+                        /* DECODE_TRACE: Try to parse as CA command stream.
+                           CA::Render::Decoder reads commands as:
+                             uint32_t cmd_word -> opcode = cmd_word & 0xFF (or & 0x3F)
+                           Walk buffer interpreting uint32_t values as potential opcodes.
+                           Log unique uint32 values seen at positions where we'd expect opcodes. */
+                        if (_cmd_log <= 5 && cmd_size >= 8) {
+                            bfix_log("  DECODE_TRACE: first 128 bytes as uint32 words:");
+                            uint32_t *words = (uint32_t *)cmd_data;
+                            uint32_t nwords = cmd_size / 4;
+                            uint32_t limit = nwords < 32 ? nwords : 32;
+                            for (uint32_t w = 0; w < limit; w++) {
+                                bfix_log("    word[%u] = 0x%08x (lo8=0x%02x)", w, words[w], words[w] & 0xFF);
+                            }
+                            /* Also dump unique low-byte values from ALL words */
+                            uint32_t lo_hist[256] = {0};
+                            for (uint32_t w = 0; w < nwords; w++)
+                                lo_hist[words[w] & 0xFF]++;
+                            bfix_log("  WORD_LO8_HIST (all %u words):", nwords);
+                            for (int h = 0; h < 256; h++) {
+                                if (lo_hist[h] > 0)
+                                    bfix_log("    lo8=0x%02x count=%u", h, lo_hist[h]);
+                            }
+                        }
                     }
                 }
             }
