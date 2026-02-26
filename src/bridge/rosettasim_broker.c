@@ -2835,20 +2835,27 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     }
 
     posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);
-
-    char *argv[] = { exec_path, NULL };
-    pid_t pid;
-    int result = posix_spawn(&pid, exec_path, NULL, &attr, argv, env);
-    posix_spawnattr_destroy(&attr);
-
-    if (result != 0) {
-        broker_log("[broker] app spawn failed: %s\n", strerror(result));
+    /* Use fork+exec instead of posix_spawn for the app.
+     * This lets us set TASK_BOOTSTRAP_PORT in the child BEFORE exec,
+     * which survives Rosetta 2 translation. posix_spawnattr doesn't. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child — set bootstrap port before exec */
+        kern_return_t skr = task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, g_broker_port);
+        /* Also set the libSystem global */
+        bootstrap_port = g_broker_port;
+        if (skr != KERN_SUCCESS) {
+            fprintf(stderr, "[broker-child] task_set_special_port failed: %d\n", skr);
+        }
+        execve(exec_path, (char *[]){ exec_path, NULL }, env);
+        _exit(127);
+    }
+    if (pid < 0) {
+        broker_log("[broker] fork failed: %s\n", strerror(errno));
         return -1;
     }
 
-    broker_log("[broker] app spawned with pid %d\n", pid);
+    broker_log("[broker] app spawned via fork+exec with pid %d\n", pid);
 
     /* FIX: posix_spawnattr_setspecialport_np doesn't work reliably under Rosetta 2.
      * Retry task_for_pid + task_set_special_port in a loop — the child may not be

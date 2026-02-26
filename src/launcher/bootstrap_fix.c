@@ -2164,24 +2164,41 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         }
                     }
 
-                    /* SHMEM_PTR_CHECK: For 40003 (OOL commits), check if Shmem header
-                     * contains an untranslated client-side pointer at +0x1c */
-                    if (msg->msgh_id == 40003 && cmd_data && cmd_size >= 0x30) {
-                        uint32_t magic = *(uint32_t *)(cmd_data + 0x14);
-                        void *cmd_ptr = *(void **)(cmd_data + 0x1c);
-                        uint32_t cmd_len = *(uint32_t *)(cmd_data + 0x28);
-                        int in_range = ((uintptr_t)cmd_ptr >= (uintptr_t)cmd_data &&
-                                        (uintptr_t)cmd_ptr < (uintptr_t)cmd_data + cmd_size);
-                        bfix_log("SHMEM_PTR: magic=0x%x cmd_ptr=%p cmd_len=%u base=%p end=%p in_range=%d",
-                            magic, cmd_ptr, cmd_len, cmd_data, cmd_data + cmd_size, in_range);
-                        if (!in_range && cmd_ptr != NULL) {
-                            bfix_log("SHMEM_PTR: *** CLIENT-SIDE POINTER DETECTED! cmd_ptr=%p is NOT in OOL [%p..%p] ***",
-                                cmd_ptr, cmd_data, cmd_data + cmd_size);
-                            /* Dump first 0x30 bytes of Shmem header */
-                            uint64_t *hw = (uint64_t *)cmd_data;
-                            bfix_log("SHMEM_HDR: +00=%016llx +08=%016llx +10=%016llx +18=%016llx +20=%016llx +28=%016llx",
-                                hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
+                    /* SHMEM_PTR_CHECK: For 40003 (OOL commits), dump full header
+                     * and scan for client-side pointers */
+                    static int _shmem_log = 0;
+                    if (msg->msgh_id == 40003 && cmd_data && cmd_size >= 0x40 && _shmem_log < 5) {
+                        _shmem_log++;
+                        bfix_log("SHMEM_DUMP[%d]: OOL base=%p size=%u", _shmem_log, cmd_data, cmd_size);
+                        /* Dump first 0x80 bytes as uint64 */
+                        uint64_t *hw = (uint64_t *)cmd_data;
+                        int nw = (cmd_size >= 0x80) ? 16 : cmd_size / 8;
+                        for (int wi = 0; wi < nw; wi += 2) {
+                            bfix_log("  +0x%02x: %016llx %016llx", wi*8, hw[wi],
+                                (wi+1 < nw) ? hw[wi+1] : 0);
                         }
+                        /* Scan ALL uint64 values for heap-like pointers (client-side) */
+                        int ptr_count = 0;
+                        for (uint32_t pi = 0; pi < cmd_size / 8 && pi < 16; pi++) {
+                            uint64_t val = hw[pi];
+                            if (val > 0x100000000ULL && val < 0x800000000000ULL) {
+                                int in_range = (val >= (uintptr_t)cmd_data &&
+                                                val < (uintptr_t)cmd_data + cmd_size);
+                                bfix_log("  PTR @+0x%02x: 0x%016llx %s",
+                                    pi*8, val, in_range ? "IN_RANGE" : "*** CLIENT_PTR ***");
+                                ptr_count++;
+                            }
+                        }
+                        /* Also search for the float 1.0 pattern in the OOL data */
+                        uint32_t *w32 = (uint32_t *)cmd_data;
+                        int red_in_ool = 0;
+                        for (uint32_t fi = 0; fi + 3 < cmd_size / 4; fi++) {
+                            if (w32[fi] == 0x3f800000 && w32[fi+1] == 0 && w32[fi+2] == 0 && w32[fi+3] == 0x3f800000) {
+                                bfix_log("  RED_IN_OOL @%u: [1.0, 0.0, 0.0, 1.0]", fi*4);
+                                red_in_ool++;
+                            }
+                        }
+                        bfix_log("  SHMEM_SUMMARY: ptrs=%d red=%d size=%u", ptr_count, red_in_ool, cmd_size);
                     }
 
                     if (cmd_data && cmd_size >= 16) {
