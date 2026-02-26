@@ -2835,48 +2835,20 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     }
 
     posix_spawnattr_t attr;
-    /* Use fork+exec instead of posix_spawn for the app.
-     * This lets us set TASK_BOOTSTRAP_PORT in the child BEFORE exec,
-     * which survives Rosetta 2 translation. posix_spawnattr doesn't. */
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child — set bootstrap port before exec */
-        kern_return_t skr = task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, g_broker_port);
-        /* Also set the libSystem global */
-        bootstrap_port = g_broker_port;
-        if (skr != KERN_SUCCESS) {
-            fprintf(stderr, "[broker-child] task_set_special_port failed: %d\n", skr);
-        }
-        execve(exec_path, (char *[]){ exec_path, NULL }, env);
-        _exit(127);
-    }
-    if (pid < 0) {
-        broker_log("[broker] fork failed: %s\n", strerror(errno));
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setspecialport_np(&attr, g_broker_port, TASK_BOOTSTRAP_PORT);
+
+    char *argv[] = { exec_path, NULL };
+    pid_t pid;
+    int result = posix_spawn(&pid, exec_path, NULL, &attr, argv, env);
+    posix_spawnattr_destroy(&attr);
+
+    if (result != 0) {
+        broker_log("[broker] app spawn failed: %s\n", strerror(result));
         return -1;
     }
 
-    broker_log("[broker] app spawned via fork+exec with pid %d\n", pid);
-
-    /* FIX: posix_spawnattr_setspecialport_np doesn't work reliably under Rosetta 2.
-     * Retry task_for_pid + task_set_special_port in a loop — the child may not be
-     * ready immediately after posix_spawn returns. */
-    {
-        mach_port_t child_task = MACH_PORT_NULL;
-        int set_ok = 0;
-        for (int retry = 0; retry < 50 && !set_ok; retry++) {
-            kern_return_t tkr = task_for_pid(mach_task_self(), pid, &child_task);
-            if (tkr == KERN_SUCCESS && child_task != MACH_PORT_NULL) {
-                kern_return_t skr = task_set_special_port(child_task, TASK_BOOTSTRAP_PORT, g_broker_port);
-                broker_log("[broker] task_set_special_port on app pid=%d: kr=%d retry=%d\n", pid, skr, retry);
-                mach_port_deallocate(mach_task_self(), child_task);
-                if (skr == KERN_SUCCESS) set_ok = 1;
-            }
-            if (!set_ok) usleep(10000); /* 10ms */
-        }
-        if (!set_ok) {
-            broker_log("[broker] WARNING: could not set bootstrap port on app pid=%d after 50 retries\n", pid);
-        }
-    }
+    broker_log("[broker] app spawned with pid %d\n", pid);
 
     /* Write PID + bundle-id for SpringBoard-side lifecycle shims.
      * In strict mode, SpringBoard may fail bootstrap early if it cannot
@@ -2968,13 +2940,6 @@ int main(int argc, char *argv[]) {
     }
 
     broker_log("[broker] broker port created: 0x%x\n", g_broker_port);
-
-    /* Register broker port with REAL macOS bootstrap so children can find it
-     * even when posix_spawnattr_setspecialport_np fails under Rosetta 2. */
-    {
-        kern_return_t bkr = bootstrap_register(bootstrap_port, "com.rosettasim.broker", g_broker_port);
-        broker_log("[broker] bootstrap_register(com.rosettasim.broker) = %d\n", bkr);
-    }
 
     /* Write PID file */
     write_pid_file();
