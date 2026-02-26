@@ -6793,9 +6793,14 @@ static void replacement_runWithMainScene(id self, SEL _cmd,
      * before g_ca_server_connected flips, which would otherwise push us into CPU
      * renderInContext() on a remote context (hang/deadlock). */
     if (!_force_cpu_mode() && !g_ca_server_connected) {
-        mach_port_t p = replacement_CARenderServerGetServerPort();
-        if (p != MACH_PORT_NULL && g_ca_server_connected) {
-            bridge_log("Display Pipeline: CARenderServer probe succeeded (port=%u)", p);
+        /* Retry CARenderServer lookup — backboardd may not have registered yet */
+        for (int retry = 0; retry < 20 && !g_ca_server_connected; retry++) {
+            mach_port_t p = replacement_CARenderServerGetServerPort();
+            if (p != MACH_PORT_NULL && g_ca_server_connected) {
+                bridge_log("Display Pipeline: CARenderServer probe succeeded (port=%u, retry=%d)", p, retry);
+                break;
+            }
+            usleep(100000); /* 100ms */
         }
     }
 
