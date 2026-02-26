@@ -47,6 +47,7 @@ typedef struct {
     int      persist_fd;  /* persistent fd for pread (-1 = not open) */
     uint32_t      surface_id;   /* IOSurface ID from daemon (0 = not set) */
     IOSurfaceRef  iosurface;    /* looked up IOSurface (NULL = not resolved) */
+    uint32_t      last_seed;    /* IOSurface seed for change detection */
 } DeviceDisplay;
 
 #define DEVICE_LAYER(dd) ((__bridge CALayer *)(dd)->layer_ref)
@@ -341,27 +342,30 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         if (!dd->layer_ref) return NO;
     }
 
-    /* --- IOSurface path: CGImage from shared IOSurface (no file I/O) --- */
+    /* --- IOSurface path: zero-copy CGImage wrapping shared surface memory --- */
     if (dd->iosurface) {
-        IOSurfaceLock(dd->iosurface, kIOSurfaceLockReadOnly, NULL);
+        /* Skip if surface hasn't changed (seed increments on lock/unlock cycles) */
+        uint32_t seed = IOSurfaceGetSeed(dd->iosurface);
+        if (seed == dd->last_seed) return NO;
+        dd->last_seed = seed;
+
         void *base = IOSurfaceGetBaseAddress(dd->iosurface);
         size_t bpr = IOSurfaceGetBytesPerRow(dd->iosurface);
+        /* CGDataProvider wraps the pointer — no copy */
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bpr * dd->height, NULL);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef ctx = CGBitmapContextCreate(base, dd->width, dd->height,
-            8, bpr, cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-        if (ctx) {
-            CGImageRef img = CGBitmapContextCreateImage(ctx);
-            if (img) {
-                [CATransaction begin];
-                [CATransaction setDisableActions:YES];
-                DEVICE_LAYER(dd).contents = (__bridge id)img;
-                [CATransaction commit];
-                CGImageRelease(img);
-            }
-            CGContextRelease(ctx);
+        CGImageRef img = CGImageCreate(dd->width, dd->height, 8, 32, bpr, cs,
+            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+            provider, NULL, false, kCGRenderingIntentDefault);
+        if (img) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            DEVICE_LAYER(dd).contents = (__bridge id)img;
+            [CATransaction commit];
+            CGImageRelease(img);
         }
+        CGDataProviderRelease(provider);
         CGColorSpaceRelease(cs);
-        IOSurfaceUnlock(dd->iosurface, kIOSurfaceLockReadOnly, NULL);
         return YES;
     }
 
