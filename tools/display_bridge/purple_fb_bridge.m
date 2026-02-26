@@ -110,10 +110,14 @@ static void handle_msg(mach_port_t port) {
         r.port_desc.type = MACH_MSG_PORT_DESCRIPTOR;
         r.mem_size = PFB_SURFACE_ALLOC;
         r.stride = PFB_BYTES_PER_ROW;
+        /* width/height = pixel dimensions of the framebuffer */
         r.width = PFB_PIXEL_WIDTH;
         r.height = PFB_PIXEL_HEIGHT;
-        r.pt_width = PFB_PIXEL_WIDTH / 2;
-        r.pt_height = PFB_PIXEL_HEIGHT / 2;
+        /* pt_width/pt_height = point dimensions for layout.
+         * Set equal to pixel dims so compositor uses full buffer at 1x.
+         * (Previously 375x667 caused 1/4 size rendering) */
+        r.pt_width = PFB_PIXEL_WIDTH;
+        r.pt_height = PFB_PIXEL_HEIGHT;
 
         kr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         NSLog(@">>> map_surface reply sent: kr=%d (%ux%u stride=%u)", kr, PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, PFB_BYTES_PER_ROW);
