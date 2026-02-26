@@ -1816,10 +1816,10 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                 }
             }
 
-            /* SHMEM_INLINE_FIX: For 40003 OOL commits, check if the Shmem buffer
-             * has a client-side pointer at +0x20. If so, COPY the command data from
-             * our own address space into the OOL buffer so the server can access it.
-             * This works because we're in the CLIENT process — the pointer is OURS. */
+            /* SHMEM_INLINE_FIX (CLIENT SIDE): For 40003 OOL commits, the Shmem
+             * header at +0x1c has a pointer to command data in OUR address space.
+             * Copy the data into the OOL buffer and store an OFFSET at +0x1c
+             * so the server can translate it after kernel OOL transfer. */
             if (msg->msgh_id == 40003 && (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX)) {
                 mach_msg_body_t *body = (mach_msg_body_t *)(msg + 1);
                 uint8_t *dp = (uint8_t *)(body + 1);
@@ -1829,64 +1829,31 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         mach_msg_ool_descriptor_t *od = (mach_msg_ool_descriptor_t *)dp;
                         if (od->address && od->size >= 0x30) {
                             uint8_t *shmem = (uint8_t *)od->address;
-                            uint64_t *hw = (uint64_t *)shmem;
+                            void *cmd_ptr = *(void **)(shmem + 0x1c);
+                            uint32_t cmd_len = *(uint32_t *)(shmem + 0x28);
+                            uint32_t ool_size = od->size;
 
-                            /* Check +0x20 for a client-side pointer */
-                            uint64_t ptr_val = hw[4]; /* +0x20 */
-                            if (ptr_val > 0x100000000ULL && ptr_val < 0x800000000000ULL) {
-                                /* This is a pointer in OUR address space — we can read it! */
-                                void *cmd_ptr = (void *)(uintptr_t)ptr_val;
+                            if (cmd_ptr && cmd_len > 0 && cmd_len < 2 * 1024 * 1024 &&
+                                (uintptr_t)cmd_ptr > 0x100000) {
+                                /* cmd_ptr is in OUR address space — we can read it */
+                                size_t new_ool_size = ool_size + cmd_len;
+                                uint8_t *new_buf = (uint8_t *)malloc(new_ool_size);
+                                if (new_buf) {
+                                    memcpy(new_buf, shmem, ool_size);
+                                    memcpy(new_buf + ool_size, cmd_ptr, cmd_len);
 
-                                /* Estimate command data size: use the OOL size as a rough guide,
-                                 * or try to find cmd_len in the header. The data at +0x28 might be length. */
-                                uint32_t header_size = od->size;
+                                    /* Store OFFSET instead of absolute pointer */
+                                    *(uint64_t *)(new_buf + 0x1c) = (uint64_t)ool_size;
 
-                                /* Try vm_region to find the actual size of the mapping at cmd_ptr */
-                                vm_address_t region_addr = (vm_address_t)cmd_ptr;
-                                vm_size_t region_size = 0;
-                                natural_t depth = 0;
-                                struct vm_region_submap_info_64 info;
-                                mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-                                kern_return_t rkr = vm_region_recurse_64(mach_task_self(),
-                                    &region_addr, &region_size, &depth,
-                                    (vm_region_info_64_t)&info, &cnt);
+                                    od->address = new_buf;
+                                    od->size = (mach_msg_size_t)new_ool_size;
+                                    od->deallocate = 1; /* kernel frees after send */
 
-                                uint32_t cmd_len = 0;
-                                if (rkr == KERN_SUCCESS && region_addr <= (vm_address_t)cmd_ptr) {
-                                    cmd_len = (uint32_t)((region_addr + region_size) - (vm_address_t)cmd_ptr);
-                                    if (cmd_len > 512 * 1024) cmd_len = 512 * 1024; /* cap at 512KB */
-                                }
-
-                                if (cmd_len > 0) {
-                                    /* Allocate new buffer: original header + command data */
-                                    uint32_t new_size = header_size + cmd_len;
-                                    uint8_t *new_buf = (uint8_t *)malloc(new_size);
-                                    if (new_buf) {
-                                        memcpy(new_buf, shmem, header_size);
-                                        memcpy(new_buf + header_size, cmd_ptr, cmd_len);
-
-                                        /* Patch the pointer to point to the inlined data.
-                                         * Use a MARKER value so the server knows to translate. */
-                                        *(uint64_t *)(new_buf + 0x20) = (uint64_t)(uintptr_t)(new_buf + header_size);
-
-                                        /* Replace the OOL descriptor */
-                                        od->address = new_buf;
-                                        od->size = new_size;
-                                        od->deallocate = 0; /* don't deallocate original */
-
-                                        static int _fix_count = 0;
-                                        if (_fix_count < 5) {
-                                            _fix_count++;
-                                            bfix_log("SHMEM_INLINE[%d]: expanded OOL %u → %u bytes (cmd_ptr=%p cmd_len=%u)",
-                                                _fix_count, header_size, new_size, cmd_ptr, cmd_len);
-                                        }
-                                    }
-                                } else {
-                                    static int _err_count = 0;
-                                    if (_err_count < 3) {
-                                        _err_count++;
-                                        bfix_log("SHMEM_INLINE: cmd_ptr=%p but can't determine size (region kr=%d)",
-                                            cmd_ptr, rkr);
+                                    static int _fix_count = 0;
+                                    if (_fix_count < 10) {
+                                        _fix_count++;
+                                        bfix_log("SHMEM_INLINE[%d]: %u → %zu bytes (cmd=%p len=%u)",
+                                            _fix_count, ool_size, new_ool_size, cmd_ptr, cmd_len);
                                     }
                                 }
                             }
@@ -2249,38 +2216,21 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                         }
                     }
 
-                    /* SHMEM_PTR_FIX (SERVER SIDE): For 40003 OOL commits, if the client
-                     * inlined the command data (SHMEM_INLINE_FIX on client), the OOL buffer
-                     * is now header + cmd_data. The pointer at +0x20 still points to the
-                     * CLIENT's malloc'd buffer, which is invalid here. Patch it to point
-                     * to the data within this OOL buffer.
-                     *
-                     * Detection: if +0x20 contains a pointer that IS within the OOL range,
-                     * it's already been set by the client-side fix (pointing to malloc'd buf).
-                     * After kernel OOL transfer, the buffer is at a new address — so the pointer
-                     * is stale. We need to recalculate it.
-                     *
-                     * The original OOL size was ~24KB. If the buffer is now larger (e.g. 160KB),
-                     * the extra data is the inlined command data starting at the original header size.
-                     * We estimate the header size from the original known Shmem header (~24KB). */
-                    if (msg->msgh_id == 40003 && cmd_data && cmd_size > 30000) {
-                        /* Buffer > 30KB means client inlined the command data */
-                        uint64_t *hw = (uint64_t *)cmd_data;
-                        uint64_t ptr_val = hw[4]; /* +0x20 */
-                        /* The pointer at +0x20 is stale (client address). Patch it to point
-                         * to the command data within this buffer.
-                         * The original header was ~24KB (23993 bytes). The command data follows. */
-                        uint32_t hdr_size = 23993; /* known from SHMEM_DUMP[1] */
-                        if (cmd_size > hdr_size + 100) {
-                            void *new_cmd_ptr = (void *)(cmd_data + hdr_size);
+                    /* SHMEM_PTR_FIX (SERVER SIDE): The client stored an OFFSET at +0x1c
+                     * instead of an absolute pointer. If the value is small (< buffer size),
+                     * it's an offset — translate to absolute server-side address. */
+                    if (msg->msgh_id == 40003 && cmd_data && cmd_size >= 0x30) {
+                        uint64_t ptr_val = *(uint64_t *)(cmd_data + 0x1c);
+                        /* If ptr_val is a small number (< cmd_size), it's an offset from the client fix */
+                        if (ptr_val > 0 && ptr_val < cmd_size) {
+                            void *real_ptr = (void *)(cmd_data + ptr_val);
                             static int _patch_log = 0;
-                            if (_patch_log < 5) {
+                            if (_patch_log < 10) {
                                 _patch_log++;
-                                bfix_log("SHMEM_SERVER_FIX[%d]: patching +0x20: %p → %p (hdr=%u total=%u cmd=%u)",
-                                    _patch_log, (void *)(uintptr_t)ptr_val, new_cmd_ptr,
-                                    hdr_size, cmd_size, cmd_size - hdr_size);
+                                bfix_log("SHMEM_PATCH[%d]: offset %llu → server ptr %p (total=%u)",
+                                    _patch_log, (unsigned long long)ptr_val, real_ptr, cmd_size);
                             }
-                            hw[4] = (uint64_t)(uintptr_t)new_cmd_ptr;
+                            *(void **)(cmd_data + 0x1c) = real_ptr;
                         }
                     }
 
