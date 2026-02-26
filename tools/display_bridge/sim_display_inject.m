@@ -42,6 +42,8 @@ typedef struct {
     uint8_t  *read_buf;
     BOOL     active;
     time_t   last_mtime;  /* last seen modification time of fb file */
+    ino_t    last_ino;    /* inode of currently open fd */
+    int      persist_fd;  /* persistent fd for pread (-1 = not open) */
 } DeviceDisplay;
 
 #define DEVICE_LAYER(dd) ((__bridge CALayer *)(dd)->layer_ref)
@@ -59,7 +61,7 @@ static int g_frame_count = 0;
 static BOOL g_multi_device_mode = NO;
 
 /* --- Single-device fallback state (backwards compat) --- */
-static DeviceDisplay g_single_device = {0};
+static DeviceDisplay g_single_device = { .persist_fd = -1 };
 static BOOL g_single_loaded = NO;
 
 /* --- Helper: find SimDisplayRenderableView in view hierarchy --- */
@@ -182,8 +184,11 @@ static BOOL load_multi_device_list(void) {
 
     int count = (int)[devices count];
     if (count > g_device_capacity) {
+        int old_cap = g_device_capacity;
         g_devices = realloc(g_devices, count * sizeof(DeviceDisplay));
-        memset(g_devices + g_device_capacity, 0, (count - g_device_capacity) * sizeof(DeviceDisplay));
+        memset(g_devices + old_cap, 0, (count - old_cap) * sizeof(DeviceDisplay));
+        for (int i = old_cap; i < count; i++)
+            g_devices[i].persist_fd = -1;
         g_device_capacity = count;
     }
 
@@ -217,6 +222,8 @@ static BOOL load_multi_device_list(void) {
             /* New device or no layer yet — reset */
             device_set_layer(dd, nil);
             dd->active = NO;
+            if (dd->persist_fd >= 0) { close(dd->persist_fd); dd->persist_fd = -1; }
+            dd->last_ino = 0;
         }
         /* else: keep existing layer_ref and active state */
 
@@ -230,6 +237,7 @@ static BOOL load_multi_device_list(void) {
     for (int i = new_count; i < g_device_count; i++) {
         device_set_layer(&g_devices[i], nil);
         g_devices[i].active = NO;
+        if (g_devices[i].persist_fd >= 0) { close(g_devices[i].persist_fd); g_devices[i].persist_fd = -1; }
     }
     g_device_count = new_count;
 
@@ -305,6 +313,7 @@ static BOOL refresh_device(DeviceDisplay *dd) {
                 } else if (!newLayer) {
                     device_set_layer(dd, nil);
                     dd->active = NO;
+                    if (dd->persist_fd >= 0) { close(dd->persist_fd); dd->persist_fd = -1; }
                     NSLog(@"[inject] No renderable view found for '%s'", dd->name);
                     return NO;
                 }
@@ -321,10 +330,15 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         return NO; /* no change */
     dd->last_mtime = st.st_mtimespec.tv_sec;
 
-    int fd = open(dd->fb_path, O_RDONLY);
-    if (fd < 0) return NO;
-    ssize_t nread = read(fd, dd->read_buf, dd->fb_size);
-    close(fd);
+    /* Re-open fd if inode changed (atomic rename creates new inode) or not yet open */
+    if (dd->persist_fd < 0 || st.st_ino != dd->last_ino) {
+        if (dd->persist_fd >= 0) close(dd->persist_fd);
+        dd->persist_fd = open(dd->fb_path, O_RDONLY);
+        if (dd->persist_fd < 0) return NO;
+        dd->last_ino = st.st_ino;
+    }
+
+    ssize_t nread = pread(dd->persist_fd, dd->read_buf, dd->fb_size, 0);
     if (nread < (ssize_t)dd->fb_size) return NO;
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
