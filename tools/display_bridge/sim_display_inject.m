@@ -1,19 +1,20 @@
 /*
  * sim_display_inject.m — DYLD_INSERT dylib for Simulator.app
  *
- * Injects iOS 9.3/10.3 framebuffer pixels into Simulator.app's display view.
- * Reads IOSurface ID from /tmp/rosettasim_surface_id (written by purple_fb_bridge).
- * Finds SimDisplayRenderableView's surfaceLayer and sets .contents = IOSurface.
+ * Injects legacy iOS framebuffer pixels into Simulator.app's display views.
+ * Supports multiple devices simultaneously. Each device window gets its own
+ * framebuffer file and dimensions.
+ *
+ * Data sources (checked in order):
+ *   1. /tmp/rosettasim_active_devices.json — multi-device daemon
+ *   2. /tmp/rosettasim_dimensions.json — single-device standalone bridge
  *
  * Build:
- *   cc -dynamiclib -o sim_display_inject.dylib sim_display_inject.m \
- *      -framework Foundation -framework AppKit -framework IOSurface -framework QuartzCore \
- *      -fobjc-arc
+ *   make inject   (from tools/display_bridge/)
  *
  * Usage:
- *   cp .../Simulator.app/.../Simulator /tmp/Simulator_nolv
- *   codesign --force --sign - --options=0 /tmp/Simulator_nolv
- *   DYLD_INSERT_LIBRARIES=sim_display_inject.dylib /tmp/Simulator_nolv
+ *   codesign --force --sign - --options=0 /tmp/Simulator_nolv.app/Contents/MacOS/Simulator
+ *   DYLD_INSERT_LIBRARIES=sim_display_inject.dylib /tmp/Simulator_nolv.app/Contents/MacOS/Simulator
  */
 
 #import <Foundation/Foundation.h>
@@ -25,50 +26,39 @@
 #import <objc/message.h>
 #include <fcntl.h>
 
-/* Dynamic dimensions — read from bridge metadata file */
-static uint32_t g_fb_width  = 750;
-static uint32_t g_fb_height = 1334;
-static uint32_t g_fb_bpr    = 3000;
-static uint32_t g_fb_size   = 4002000;
-static float    g_fb_scale  = 2.0f;
-static BOOL     g_dims_loaded = NO;
+/* --- Per-device display state --- */
 
+typedef struct {
+    char     udid[64];
+    char     name[128];
+    char     fb_path[256];    /* path to raw framebuffer file */
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpr;
+    uint32_t fb_size;
+    float    scale;
+    CALayer  *__unsafe_unretained layer;  /* surfaceLayer for this device */
+    uint8_t  *read_buf;
+    BOOL     active;
+} DeviceDisplay;
+
+#define MAX_DEVICES 8
+static DeviceDisplay g_devices[MAX_DEVICES];
+static int g_device_count = 0;
 static NSTimer *g_refresh_timer = nil;
-static CALayer *g_surface_layer = nil;
-static uint8_t *g_read_buf = NULL;
+static int g_frame_count = 0;
+static BOOL g_multi_device_mode = NO;
 
-static void load_dimensions(void) {
-    if (g_dims_loaded) return;
-    /* Read metadata written by purple_fb_bridge */
-    FILE *f = fopen("/tmp/rosettasim_dimensions.json", "r");
-    if (!f) return;
-    char buf[256];
-    if (fgets(buf, sizeof(buf), f)) {
-        unsigned w = 0, h = 0, bpr = 0;
-        float scale = 0;
-        if (sscanf(buf, "{\"width\":%u,\"height\":%u,\"scale\":%f,\"bpr\":%u}", &w, &h, &scale, &bpr) >= 3) {
-            if (w > 0 && h > 0) {
-                g_fb_width  = w;
-                g_fb_height = h;
-                g_fb_bpr    = bpr > 0 ? bpr : w * 4;
-                g_fb_size   = g_fb_bpr * g_fb_height;
-                g_fb_scale  = scale > 0 ? scale : 2.0f;
-                g_dims_loaded = YES;
-                NSLog(@"[inject] Loaded dimensions: %ux%u @%.0fx bpr=%u",
-                      g_fb_width, g_fb_height, g_fb_scale, g_fb_bpr);
-            }
-        }
-    }
-    fclose(f);
-}
+/* --- Single-device fallback state (backwards compat) --- */
+static DeviceDisplay g_single_device = {0};
+static BOOL g_single_loaded = NO;
 
-/* Recursively find SimDisplayRenderableView in view hierarchy */
+/* --- Helper: find SimDisplayRenderableView in view hierarchy --- */
+
 static NSView *find_renderable_view(NSView *root) {
     const char *cls = object_getClassName(root);
-    /* Swift-mangled class name contains "SimDisplayRenderableView" */
-    if (cls && strstr(cls, "SimDisplayRenderableView")) {
+    if (cls && strstr(cls, "SimDisplayRenderableView"))
         return root;
-    }
     for (NSView *sub in root.subviews) {
         NSView *found = find_renderable_view(sub);
         if (found) return found;
@@ -76,137 +66,243 @@ static NSView *find_renderable_view(NSView *root) {
     return nil;
 }
 
-/* Get the surfaceLayer ivar from SimDisplayRenderableView */
+/* --- Helper: get surfaceLayer ivar from SimDisplayRenderableView --- */
+
 static CALayer *get_surface_layer(NSView *renderableView) {
-    /* Try ivar first — the ivar name from nm is "surfaceLayer" */
     Ivar ivar = class_getInstanceVariable(object_getClass(renderableView), "surfaceLayer");
     if (ivar) {
         id val = object_getIvar(renderableView, ivar);
-        if ([val isKindOfClass:[CALayer class]]) {
-            NSLog(@"[inject] Found surfaceLayer via ivar: %@", val);
+        if ([val isKindOfClass:[CALayer class]])
             return (CALayer *)val;
-        }
     }
-
-    /* Try KVC — property might have different ivar name */
     @try {
         id val = [renderableView valueForKey:@"surfaceLayer"];
-        if ([val isKindOfClass:[CALayer class]]) {
-            NSLog(@"[inject] Found surfaceLayer via KVC: %@", val);
+        if ([val isKindOfClass:[CALayer class]])
             return (CALayer *)val;
-        }
-    } @catch (id e) {
-        NSLog(@"[inject] surfaceLayer KVC failed: %@", e);
-    }
-
-    /* Fallback: use the view's own layer */
-    NSLog(@"[inject] Using view.layer as fallback");
+    } @catch (id e) { /* ignore */ }
     return renderableView.layer;
 }
 
-static int g_frame_count = 0;
-static void refresh_surface(NSTimer *timer) {
-    if (!g_surface_layer) return;
-    g_frame_count++;
+/* --- Load device list from daemon or single bridge --- */
 
-    /* Load dimensions on first frame (or when they change) */
-    load_dimensions();
+static BOOL load_multi_device_list(void) {
+    NSData *data = [NSData dataWithContentsOfFile:@"/tmp/rosettasim_active_devices.json"];
+    if (!data) return NO;
 
-    /* Allocate/reallocate read buffer */
-    if (!g_read_buf) {
-        g_read_buf = malloc(g_fb_size);
-        if (!g_read_buf) return;
+    NSError *err = nil;
+    NSArray *devices = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (!devices || ![devices isKindOfClass:[NSArray class]]) return NO;
+
+    g_device_count = 0;
+    for (NSDictionary *dev in devices) {
+        if (g_device_count >= MAX_DEVICES) break;
+        NSString *udid = dev[@"udid"];
+        NSString *name = dev[@"name"];
+        NSNumber *w = dev[@"width"];
+        NSNumber *h = dev[@"height"];
+        NSNumber *s = dev[@"scale"];
+        if (!udid || !name || !w || !h) continue;
+
+        DeviceDisplay *dd = &g_devices[g_device_count];
+        strlcpy(dd->udid, udid.UTF8String, sizeof(dd->udid));
+        strlcpy(dd->name, name.UTF8String, sizeof(dd->name));
+        snprintf(dd->fb_path, sizeof(dd->fb_path), "/tmp/rosettasim_fb_%s.raw", dd->udid);
+        dd->width   = w.unsignedIntValue;
+        dd->height  = h.unsignedIntValue;
+        dd->scale   = s ? s.floatValue : 2.0f;
+        dd->bpr     = dd->width * 4;
+        dd->fb_size = dd->bpr * dd->height;
+        dd->layer   = nil;
+        dd->active  = NO;
+        if (!dd->read_buf || dd->fb_size > dd->bpr * dd->height) {
+            free(dd->read_buf);
+            dd->read_buf = malloc(dd->fb_size);
+        }
+        g_device_count++;
     }
 
-    /* Read raw framebuffer file */
-    int fd = open("/tmp/sim_framebuffer.raw", O_RDONLY);
-    if (fd < 0) {
-        if (g_frame_count <= 3) NSLog(@"[inject] Waiting for framebuffer file...");
-        return;
+    if (g_device_count > 0) {
+        NSLog(@"[inject] Loaded %d devices from daemon", g_device_count);
+        g_multi_device_mode = YES;
+        return YES;
     }
-    ssize_t nread = read(fd, g_read_buf, g_fb_size);
+    return NO;
+}
+
+static void load_single_device(void) {
+    if (g_single_loaded) return;
+    FILE *f = fopen("/tmp/rosettasim_dimensions.json", "r");
+    if (!f) return;
+    char buf[256];
+    if (fgets(buf, sizeof(buf), f)) {
+        unsigned w = 0, h = 0, bpr = 0;
+        float scale = 0;
+        if (sscanf(buf, "{\"width\":%u,\"height\":%u,\"scale\":%f,\"bpr\":%u}",
+                   &w, &h, &scale, &bpr) >= 3 && w > 0 && h > 0) {
+            g_single_device.width   = w;
+            g_single_device.height  = h;
+            g_single_device.bpr     = bpr > 0 ? bpr : w * 4;
+            g_single_device.fb_size = g_single_device.bpr * h;
+            g_single_device.scale   = scale > 0 ? scale : 2.0f;
+            strlcpy(g_single_device.fb_path, "/tmp/sim_framebuffer.raw",
+                    sizeof(g_single_device.fb_path));
+            g_single_device.active = YES;
+            if (!g_single_device.read_buf) {
+                g_single_device.read_buf = malloc(g_single_device.fb_size);
+            }
+            g_single_loaded = YES;
+            NSLog(@"[inject] Single-device mode: %ux%u @%.0fx",
+                  w, h, g_single_device.scale);
+        }
+    }
+    fclose(f);
+}
+
+/* --- Refresh a single device display --- */
+
+static void refresh_device(DeviceDisplay *dd) {
+    if (!dd->layer || !dd->read_buf || !dd->fb_path[0]) return;
+
+    int fd = open(dd->fb_path, O_RDONLY);
+    if (fd < 0) return;
+    ssize_t nread = read(fd, dd->read_buf, dd->fb_size);
     close(fd);
-    if (nread < (ssize_t)g_fb_size) return;
+    if (nread < (ssize_t)dd->fb_size) return;
 
-    /* Convert to CGImage and set on layer */
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(g_read_buf, g_fb_width, g_fb_height, 8, g_fb_bpr,
-        cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGContextRef ctx = CGBitmapContextCreate(dd->read_buf, dd->width, dd->height,
+        8, dd->bpr, cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
     if (ctx) {
         CGImageRef img = CGBitmapContextCreateImage(ctx);
         if (img) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            g_surface_layer.contents = (__bridge id)img;
+            dd->layer.contents = (__bridge id)img;
             [CATransaction commit];
             CGImageRelease(img);
         }
         CGContextRelease(ctx);
     }
     CGColorSpaceRelease(cs);
-
-    if (g_frame_count <= 3 || g_frame_count % 300 == 0)
-        NSLog(@"[inject] frame %d: set CGImage on surfaceLayer", g_frame_count);
 }
+
+/* --- 30fps refresh timer callback --- */
+
+static void refresh_all(NSTimer *timer) {
+    g_frame_count++;
+
+    if (g_multi_device_mode) {
+        /* Periodically reload device list (every 5s) */
+        if (g_frame_count % 150 == 0)
+            load_multi_device_list();
+
+        for (int i = 0; i < g_device_count; i++) {
+            if (g_devices[i].active)
+                refresh_device(&g_devices[i]);
+        }
+    } else {
+        /* Single-device fallback */
+        load_single_device();
+        if (g_single_device.active)
+            refresh_device(&g_single_device);
+    }
+
+    if (g_frame_count <= 3 || g_frame_count % 300 == 0) {
+        int active = 0;
+        if (g_multi_device_mode) {
+            for (int i = 0; i < g_device_count; i++)
+                if (g_devices[i].active) active++;
+        } else if (g_single_device.active) {
+            active = 1;
+        }
+        NSLog(@"[inject] frame %d: %d active device(s)", g_frame_count, active);
+    }
+}
+
+/* --- Match windows to devices and set up layers --- */
 
 static void attempt_injection(void) {
     NSLog(@"[inject] Scanning Simulator.app windows...");
 
+    /* Try multi-device mode first */
+    if (!g_multi_device_mode)
+        load_multi_device_list();
+
     NSArray *windows = [NSApp windows];
     NSLog(@"[inject] Found %lu windows", (unsigned long)windows.count);
 
+    int connected = 0;
+
     for (NSWindow *win in windows) {
-        NSLog(@"[inject] Window: '%@' class=%s frame=%@",
-              win.title, object_getClassName(win), NSStringFromRect(win.frame));
-
         NSView *renderable = find_renderable_view(win.contentView);
-        if (renderable) {
-            NSLog(@"[inject] FOUND SimDisplayRenderableView in window '%@': %@ class=%s",
-                  win.title, renderable, object_getClassName(renderable));
+        if (!renderable) continue;
 
-            g_surface_layer = get_surface_layer(renderable);
-            if (!g_surface_layer) {
-                NSLog(@"[inject] ERROR: no surfaceLayer found");
-                continue;
+        CALayer *layer = get_surface_layer(renderable);
+        if (!layer) continue;
+
+        NSString *title = win.title;
+        NSLog(@"[inject] Window '%@' has SimDisplayRenderableView, layer bounds=%@",
+              title, NSStringFromRect(layer.bounds));
+
+        if (g_multi_device_mode) {
+            /* Match window title to device name */
+            BOOL matched = NO;
+            for (int i = 0; i < g_device_count; i++) {
+                DeviceDisplay *dd = &g_devices[i];
+                if ([title containsString:[NSString stringWithUTF8String:dd->name]]) {
+                    dd->layer = layer;
+                    dd->active = YES;
+                    layer.contentsScale = dd->scale;
+                    layer.contentsGravity = kCAGravityResize;
+                    NSLog(@"[inject] Matched '%s' → window '%@' (%ux%u @%.0fx)",
+                          dd->name, title, dd->width, dd->height, dd->scale);
+                    connected++;
+                    matched = YES;
+                    break;
+                }
             }
-
-            /* Set contentsScale from device scale factor */
-            load_dimensions();
-            g_surface_layer.contentsScale = g_fb_scale;
-            g_surface_layer.contentsGravity = kCAGravityResize;
-            NSLog(@"[inject] surfaceLayer: %@ bounds=%@ contentsScale=%.1f",
-                  g_surface_layer, NSStringFromRect(g_surface_layer.bounds),
-                  g_surface_layer.contentsScale);
-
-            /* Do first refresh immediately */
-            refresh_surface(nil);
-
-            /* Set up 30fps refresh timer */
-            g_refresh_timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0
-                                                              target:[NSBlockOperation blockOperationWithBlock:^{}]
-                                                            selector:@selector(main)
-                                                            userInfo:nil
-                                                             repeats:YES];
-            /* Use a proper timer with block */
-            [g_refresh_timer invalidate];
-            g_refresh_timer = [NSTimer timerWithTimeInterval:1.0/30.0 repeats:YES block:^(NSTimer *t) {
-                refresh_surface(t);
-            }];
-            [[NSRunLoop mainRunLoop] addTimer:g_refresh_timer forMode:NSRunLoopCommonModes];
-
-            NSLog(@"[inject] Display injection ACTIVE — 30fps refresh on surfaceLayer");
-            return;
+            if (!matched) {
+                NSLog(@"[inject] Window '%@' — no matching device in daemon list", title);
+            }
+        } else {
+            /* Single-device: use first window with a renderable view */
+            load_single_device();
+            g_single_device.layer = layer;
+            g_single_device.active = YES;
+            layer.contentsScale = g_single_device.scale;
+            layer.contentsGravity = kCAGravityResize;
+            NSLog(@"[inject] Single-device mode: connected to '%@' (%ux%u @%.0fx)",
+                  title, g_single_device.width, g_single_device.height,
+                  g_single_device.scale);
+            connected++;
+            break; /* only one in single mode */
         }
     }
 
-    NSLog(@"[inject] SimDisplayRenderableView not found yet — will retry...");
+    if (connected > 0) {
+        NSLog(@"[inject] Connected %d device(s). Starting 30fps refresh.", connected);
+
+        if (g_refresh_timer) {
+            [g_refresh_timer invalidate];
+            g_refresh_timer = nil;
+        }
+        g_refresh_timer = [NSTimer timerWithTimeInterval:1.0/30.0 repeats:YES
+                                                   block:^(NSTimer *t) { refresh_all(t); }];
+        [[NSRunLoop mainRunLoop] addTimer:g_refresh_timer forMode:NSRunLoopCommonModes];
+
+        /* First frame immediately */
+        refresh_all(nil);
+    }
 }
 
-/* Retry injection periodically until we find the view */
+/* --- Retry injection until windows appear --- */
+
 static int g_retry_count = 0;
+static BOOL g_injection_done = NO;
+
 static void retry_injection(void) {
     g_retry_count++;
-    if (g_surface_layer) return; /* already connected */
+    if (g_injection_done) return;
     if (g_retry_count > 60) {
         NSLog(@"[inject] Gave up after 60 retries");
         return;
@@ -214,8 +310,18 @@ static void retry_injection(void) {
 
     attempt_injection();
 
-    if (!g_surface_layer) {
-        /* Retry in 2 seconds */
+    /* Check if we connected at least one device */
+    BOOL any_active = NO;
+    if (g_multi_device_mode) {
+        for (int i = 0; i < g_device_count; i++)
+            if (g_devices[i].active) { any_active = YES; break; }
+    } else {
+        any_active = g_single_device.active;
+    }
+
+    if (any_active) {
+        g_injection_done = YES;
+    } else {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{ retry_injection(); });
     }
