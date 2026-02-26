@@ -1153,7 +1153,8 @@ static void _pcr_do_render(void) {
         bfix_log("POST_COMMIT_RENDER[%d]: render_for_time on thread='%s'",
             g_pcr_render_count, tname[0] ? tname : "(unnamed)");
 
-        if (g_pcr_render_count <= 5 || g_pcr_render_count == 100 || g_pcr_render_count == 500) {
+        if (g_pcr_render_count <= 5 || g_pcr_render_count == 100 || g_pcr_render_count == 500 || g_pcr_render_count == 1000) {
+            /* Check SWContext pixel buffer (FRESH read after render) */
             void *swctx = *(void **)((uint8_t *)g_pcr_rft_srv + 0xb8);
             if (swctx) {
                 void *pixbuf = *(void **)((uint8_t *)swctx + 0x668);
@@ -1162,8 +1163,35 @@ static void _pcr_do_render(void) {
                     int nz = 0;
                     for (int i = 0; i < 2000; i++)
                         if (pp[i*4]||pp[i*4+1]||pp[i*4+2]) nz++;
-                    bfix_log("POST_COMMIT_RENDER[%d]: %d/2000 nz RGB",
-                        g_pcr_render_count, nz);
+                    bfix_log("PIXELS[%d]: SWCTX %d/2000 nz RGB pixbuf=%p px[0]=(%u,%u,%u,%u)",
+                        g_pcr_render_count, nz, pixbuf, pp[0], pp[1], pp[2], pp[3]);
+                } else {
+                    bfix_log("PIXELS[%d]: SWCTX pixbuf=%p (invalid)", g_pcr_render_count, pixbuf);
+                }
+            } else {
+                bfix_log("PIXELS[%d]: no SWContext", g_pcr_render_count);
+            }
+
+            /* Check display surface (the FINAL rendered output) */
+            void *disp = *(void **)((uint8_t *)g_pcr_rft_srv + 0x58);
+            if (disp) {
+                void *surface = *(void **)((uint8_t *)disp + 0x138);
+                if (surface) {
+                    void *surf_data = *(void **)((uint8_t *)surface + 0x40);
+                    int64_t surf_stride = *(int64_t *)((uint8_t *)surface + 0x48);
+                    if (surf_data && (uint64_t)surf_data > 0x100000) {
+                        uint8_t *sp = (uint8_t *)surf_data;
+                        int snz = 0;
+                        for (int i = 0; i < 2000; i++)
+                            if (sp[i*4]||sp[i*4+1]||sp[i*4+2]) snz++;
+                        bfix_log("PIXELS[%d]: SURFACE %d/2000 nz RGB data=%p stride=%lld px[0]=(%u,%u,%u,%u)",
+                            g_pcr_render_count, snz, surf_data, (long long)surf_stride,
+                            sp[0], sp[1], sp[2], sp[3]);
+                    } else {
+                        bfix_log("PIXELS[%d]: SURFACE data=%p (invalid)", g_pcr_render_count, surf_data);
+                    }
+                } else {
+                    bfix_log("PIXELS[%d]: no surface at display+0x138", g_pcr_render_count);
                 }
             }
 
