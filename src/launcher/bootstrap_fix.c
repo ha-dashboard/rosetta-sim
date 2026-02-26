@@ -1693,66 +1693,61 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                         }
                                     }
 
-                                    /* Step 3: Call context_created directly for each context */
-                                    typedef void (*CtxCreatedFn)(void *, void *, void *);
-                                    CtxCreatedFn ctx_created = (CtxCreatedFn)(qc_base + 0x126158);
-
-                                    for (uint64_t ci9 = 0; ci9 < _cc && ci9 < 20; ci9++) {
-                                        void *ctx9 = *(void **)((uint8_t *)_cl + ci9 * 0x10);
-                                        if (!ctx9) continue;
-                                        void *h9 = *(void **)((uint8_t *)ctx9 + 0xB8);
-                                        if (!h9) continue;
-                                        uint32_t cid9 = *(uint32_t *)((uint8_t *)ctx9 + 0x0C);
-                                        bfix_log("DISPLAY_BIND: calling context_created(ctx id=%u, srv, NULL)", cid9);
-                                        ctx_created(ctx9, _srv, NULL);
-                                        bfix_log("DISPLAY_BIND: context_created returned for id=%u", cid9);
+                                    /* Step 3a: ONE BYTE FIX — set default display flag
+                                     * display+0xF9 bit 6 (0x40) makes context_created bind
+                                     * ANY displayable context to this display */
+                                    {
+                                        uint8_t *dflag = (uint8_t *)_disp + 0xF9;
+                                        bfix_log("DEFAULT_DISP: +0xF9 before=0x%02x", *dflag);
+                                        *dflag |= 0x40;
+                                        bfix_log("DEFAULT_DISP: +0xF9 after=0x%02x", *dflag);
                                     }
 
-                                    /* Check display+0x68 after */
-                                    void *post_arr = *(void **)((uint8_t *)_disp + 0x68);
-                                    int post_cnt = *(int *)((uint8_t *)_disp + 0x78);
-                                    bfix_log("DISPLAY_BIND: after: disp+0x68=%p count=%d",
-                                        post_arr, post_cnt);
-                                }
-                            }
+                                    /* Step 3b: Set opts + display_info on commit_ctx, then call context_created */
+                                    if (commit_ctx) {
+                                        /* Ensure commit_ctx has opts with displayId=1 */
+                                        @try {
+                                            id cOpts = ((id(*)(id, SEL))objc_msgSend)(
+                                                (id)objc_getClass("NSMutableDictionary"),
+                                                sel_registerName("dictionary"));
+                                            id n1 = ((id(*)(id, SEL, int))objc_msgSend)(
+                                                (id)objc_getClass("NSNumber"),
+                                                sel_registerName("numberWithInt:"), 1);
+                                            /* Use the REAL kCAContextDisplayId constant */
+                                            void *kdid_ptr = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
+                                            id kdid_key = kdid_ptr ? *(id *)kdid_ptr : @"displayId";
+                                            bfix_log("DISPLAY_BIND: kCAContextDisplayId key=%p ('%s')",
+                                                kdid_key, kdid_key ? ((const char *(*)(id,SEL))objc_msgSend)(
+                                                    kdid_key, sel_registerName("UTF8String")) : "nil");
+                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                                                cOpts, sel_registerName("setObject:forKey:"),
+                                                n1, kdid_key);
+                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
+                                                cOpts, sel_registerName("setObject:forKey:"),
+                                                @YES, @"displayable");
+                                            *(void **)((uint8_t *)commit_ctx + 0x10) = (__bridge void *)cOpts;
+                                            bfix_log("DISPLAY_BIND: set opts {displayId=1} on commit_ctx id=%u", commit_ctx_id);
+                                        } @catch (id ex) {}
 
-                            bfix_log("DISPLAY_BIND: attempting to bind CTX id=%u to display",
-                                commit_ctx_id);
+                                        /* Set display_info */
+                                        SetDispInfoFn set_disp2 = (SetDispInfoFn)(qc_base + 0x5e2c2);
+                                        set_disp2(commit_ctx, 1);
 
-                            /* Try writing to +0xC0 vector */
-                            if (db && dc > 0) {
-                                bfix_log("DISPLAY_BIND: overwriting C0[0] from %p to %p",
-                                    db[0], commit_ctx);
-                                db[0] = commit_ctx;
-                            }
+                                        typedef void (*CtxCreatedFn)(void *, void *, void *);
+                                        CtxCreatedFn ctx_created = (CtxCreatedFn)(qc_base + 0x126158);
 
-                            /* Also try writing to +0x68 array if it exists */
-                            if (ctx_arr_68 && ctx_cnt_78 > 0) {
-                                bfix_log("DISPLAY_BIND: overwriting 68[0] from %p to %p",
-                                    *(void **)ctx_arr_68, commit_ctx);
-                                *(void **)ctx_arr_68 = commit_ctx;
-                            } else if (!ctx_arr_68 || ctx_cnt_78 == 0) {
-                                bfix_log("DISPLAY_BIND: 68 array empty — allocating stride 0x10");
-                                /* Stride 0x10: {context_ptr, transform_data} per entry */
-                                void *new_arr = calloc(16, 0x10);
-                                if (new_arr) {
-                                    /* Write ALL known contexts with root layers */
-                                    int written = 0;
-                                    for (uint64_t ci4 = 0; ci4 < _cc && ci4 < 16; ci4++) {
-                                        void *ctx4 = *(void **)((uint8_t *)_cl + ci4 * 0x10);
-                                        if (!ctx4) continue;
-                                        void *h4 = *(void **)((uint8_t *)ctx4 + 0xB8);
-                                        if (!h4) continue; /* skip contexts without root layers */
-                                        *(void **)((uint8_t *)new_arr + written * 0x10) = ctx4;
-                                        *(uint64_t *)((uint8_t *)new_arr + written * 0x10 + 0x08) = 0;
-                                        uint32_t cid4 = *(uint32_t *)((uint8_t *)ctx4 + 0x0C);
-                                        bfix_log("DISPLAY_BIND: 68[%d] = ctx=%p id=%u (has root)",
-                                            written, ctx4, cid4);
-                                        written++;
+                                        /* Clear 0x20000 right before call */
+                                        uint32_t fc = *(uint32_t *)((uint8_t *)commit_ctx + 0x08);
+                                        *(uint32_t *)((uint8_t *)commit_ctx + 0x08) = (fc & ~0x20000) | 0x400000;
+                                        bfix_log("DISPLAY_BIND: context_created(ctx id=%u, flags=0x%x)",
+                                            commit_ctx_id, *(uint32_t *)((uint8_t *)commit_ctx + 0x08));
+                                        ctx_created(commit_ctx, _srv, NULL);
+
+                                        void *post_arr = *(void **)((uint8_t *)_disp + 0x68);
+                                        int post_cnt = *(int *)((uint8_t *)_disp + 0x78);
+                                        bfix_log("DISPLAY_BIND: after: disp+0x68=%p count=%d",
+                                            post_arr, post_cnt);
                                     }
-                                    *(void **)((uint8_t *)_disp + 0x68) = new_arr;
-                                    *(int *)((uint8_t *)_disp + 0x78) = written;
-                                    bfix_log("DISPLAY_BIND: wrote %d contexts to disp+0x68", written);
                                 }
                             }
 
