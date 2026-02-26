@@ -26,6 +26,7 @@
 #import <objc/message.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <mach/mach_time.h>
 
 /* --- Per-device display state --- */
 
@@ -323,23 +324,36 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         if (!dd->layer_ref) return NO;
     }
 
-    /* Check if file changed (mtime) before expensive read */
+    /* Check if file changed (inode or mtime) before expensive read.
+     * Atomic rename changes inode — that's the primary signal.
+     * mtime is secondary (catches in-place writes, though daemon doesn't do those). */
     struct stat st;
     if (stat(dd->fb_path, &st) != 0) return NO;
-    if (st.st_mtimespec.tv_sec == dd->last_mtime && st.st_size == (off_t)dd->fb_size)
+    BOOL inode_changed = (st.st_ino != dd->last_ino);
+    BOOL mtime_changed = (st.st_mtimespec.tv_sec != dd->last_mtime);
+    if (!inode_changed && !mtime_changed)
         return NO; /* no change */
     dd->last_mtime = st.st_mtimespec.tv_sec;
 
+    static int s_timing_count = 0;
+    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    BOOL do_timing = (s_timing_count < 20);
+    if (do_timing) t0 = mach_absolute_time();
+
     /* Re-open fd if inode changed (atomic rename creates new inode) or not yet open */
-    if (dd->persist_fd < 0 || st.st_ino != dd->last_ino) {
+    if (dd->persist_fd < 0 || inode_changed) {
         if (dd->persist_fd >= 0) close(dd->persist_fd);
         dd->persist_fd = open(dd->fb_path, O_RDONLY);
         if (dd->persist_fd < 0) return NO;
         dd->last_ino = st.st_ino;
     }
 
+    if (do_timing) t1 = mach_absolute_time();
+
     ssize_t nread = pread(dd->persist_fd, dd->read_buf, dd->fb_size, 0);
     if (nread < (ssize_t)dd->fb_size) return NO;
+
+    if (do_timing) t2 = mach_absolute_time();
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(dd->read_buf, dd->width, dd->height,
@@ -356,6 +370,20 @@ static BOOL refresh_device(DeviceDisplay *dd) {
         CGContextRelease(ctx);
     }
     CGColorSpaceRelease(cs);
+
+    if (do_timing) {
+        t3 = mach_absolute_time();
+        static mach_timebase_info_data_t tb = {0};
+        if (!tb.numer) mach_timebase_info(&tb);
+        double us_open = (double)(t1 - t0) * tb.numer / tb.denom / 1000.0;
+        double us_read = (double)(t2 - t1) * tb.numer / tb.denom / 1000.0;
+        double us_render = (double)(t3 - t2) * tb.numer / tb.denom / 1000.0;
+        double us_total = (double)(t3 - t0) * tb.numer / tb.denom / 1000.0;
+        s_timing_count++;
+        NSLog(@"[inject] refresh #%d '%s': open=%.0fus read=%.0fus render=%.0fus total=%.0fus (ino_chg=%d)",
+              s_timing_count, dd->name, us_open, us_read, us_render, us_total, inode_changed);
+    }
+
     return YES;
 }
 
