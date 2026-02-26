@@ -80,9 +80,13 @@ static void create_surface(void) {
         VM_PROT_READ|VM_PROT_WRITE, &g_mem_entry, MACH_PORT_NULL);
     if (kr) { NSLog(@"memory_entry: %s", mach_error_string(kr)); }
 
+    uint32_t sid = IOSurfaceGetID(g_iosurface);
     NSLog(@"IOSurface %ux%u id=%u base=%p mem_entry=0x%x",
-          PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT,
-          IOSurfaceGetID(g_iosurface), g_surface_base, g_mem_entry);
+          PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, sid, g_surface_base, g_mem_entry);
+
+    /* Write surface ID to file for display injection dylib */
+    FILE *idf = fopen("/tmp/rosettasim_surface_id", "w");
+    if (idf) { fprintf(idf, "%u\n", sid); fclose(idf); }
 }
 
 static void handle_msg(mach_port_t port) {
@@ -125,7 +129,13 @@ static void handle_msg(mach_port_t port) {
             reply.msgh_id = msg->msgh_id;
             mach_msg(&reply, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         }
-        /* Check pixels in shared buffer */
+        /* Write raw pixels to file for viewer (every frame, atomic rename) */
+        if (g_surface_base) {
+            FILE *f = fopen("/tmp/sim_framebuffer.raw.tmp", "wb");
+            if (f) { fwrite(g_surface_base, 1, PFB_SURFACE_SIZE, f); fclose(f);
+                rename("/tmp/sim_framebuffer.raw.tmp", "/tmp/sim_framebuffer.raw"); }
+        }
+        /* Log pixel stats periodically */
         if (g_surface_base && (g_flush_count <= 10 || g_flush_count % 50 == 0)) {
             uint32_t *px = (uint32_t *)g_surface_base;
             int nz = 0;
@@ -138,12 +148,6 @@ static void handle_msg(mach_port_t port) {
             uint32_t center = px[PFB_PIXEL_WIDTH * (PFB_PIXEL_HEIGHT/2) + PFB_PIXEL_WIDTH/2];
             NSLog(@"flush #%d: %d/%d non-zero RGB, center=0x%08x, px[0]=0x%08x",
                   g_flush_count, nz, PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT, center, px[0]);
-            /* Write raw pixels to file for inspection */
-            if (g_flush_count <= 10 || g_flush_count % 50 == 0) {
-                FILE *f = fopen("/tmp/sim_framebuffer.raw", "wb");
-                if (f) { fwrite(g_surface_base, 1, PFB_SURFACE_SIZE, f); fclose(f);
-                    NSLog(@"Wrote %u bytes to /tmp/sim_framebuffer.raw", PFB_SURFACE_SIZE); }
-            }
         }
         if (g_flush_count <= 5 || g_flush_count % 100 == 0)
             NSLog(@"flush #%d total", g_flush_count);
