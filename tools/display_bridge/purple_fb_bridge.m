@@ -14,6 +14,7 @@
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <IOSurface/IOSurface.h>
 #import <dlfcn.h>
 
 #define PFB_PIXEL_WIDTH    750
@@ -22,10 +23,6 @@
 #define PFB_SURFACE_SIZE   (PFB_BYTES_PER_ROW * PFB_PIXEL_HEIGHT)
 #define PFB_PAGE_SIZE      4096
 #define PFB_SURFACE_ALLOC  (((PFB_SURFACE_SIZE + PFB_PAGE_SIZE - 1) / PFB_PAGE_SIZE) * PFB_PAGE_SIZE)
-
-extern kern_return_t mach_make_memory_entry_64(
-    vm_map_t, memory_object_size_t *, memory_object_offset_t,
-    vm_prot_t, mach_port_t *, mem_entry_name_port_t);
 
 /* PurpleFB reply — 72 bytes, matches Agent A's verified offsets */
 #pragma pack(4)
@@ -44,23 +41,48 @@ typedef struct {
 } PFBReply;
 #pragma pack()
 
-static mach_port_t g_mem_entry = MACH_PORT_NULL;
-static vm_address_t g_surface = 0;
+extern kern_return_t mach_make_memory_entry_64(
+    vm_map_t, memory_object_size_t *, memory_object_offset_t,
+    vm_prot_t, mach_port_t *, mem_entry_name_port_t);
+
+static IOSurfaceRef g_iosurface = NULL;
+static mach_port_t g_mem_entry = MACH_PORT_NULL; /* for PurpleFB reply */
+static void *g_surface_base = NULL;
 static int g_flush_count = 0;
 
 static void create_surface(void) {
-    kern_return_t kr = vm_allocate(mach_task_self(), &g_surface, PFB_SURFACE_ALLOC, VM_FLAGS_ANYWHERE);
-    if (kr) { NSLog(@"vm_allocate: %s", mach_error_string(kr)); return; }
-    /* Opaque black */
-    uint8_t *px = (uint8_t *)g_surface;
-    memset(px, 0, PFB_SURFACE_ALLOC);
-    for (uint32_t i = 0; i < PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT; i++) px[i*4+3] = 0xFF;
+    /* Create IOSurface — shared with Simulator.app display path */
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:           @(PFB_PIXEL_WIDTH),
+        (id)kIOSurfaceHeight:          @(PFB_PIXEL_HEIGHT),
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfaceBytesPerRow:     @(PFB_BYTES_PER_ROW),
+        (id)kIOSurfacePixelFormat:     @(0x42475241), /* 'BGRA' */
+        (id)kIOSurfaceAllocSize:       @(PFB_SURFACE_ALLOC),
+    };
+    g_iosurface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!g_iosurface) { NSLog(@"IOSurfaceCreate failed"); return; }
 
+    g_surface_base = IOSurfaceGetBaseAddress(g_iosurface);
+
+    /* Fill with opaque black */
+    IOSurfaceLock(g_iosurface, 0, NULL);
+    uint8_t *px = (uint8_t *)g_surface_base;
+    memset(px, 0, PFB_SURFACE_SIZE);
+    for (uint32_t i = 0; i < PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT; i++) px[i*4+3] = 0xFF;
+    IOSurfaceUnlock(g_iosurface, 0, NULL);
+
+    /* Create memory_entry from the IOSurface's backing — for PurpleFB reply.
+     * backboardd vm_maps this, NOT the IOSurface port. */
     memory_object_size_t sz = PFB_SURFACE_ALLOC;
-    kr = mach_make_memory_entry_64(mach_task_self(), &sz, (memory_object_offset_t)g_surface,
-                                    VM_PROT_READ|VM_PROT_WRITE, &g_mem_entry, MACH_PORT_NULL);
-    if (kr) { NSLog(@"memory_entry: %s", mach_error_string(kr)); return; }
-    NSLog(@"Surface %ux%u (%u bytes) mem_entry=0x%x", PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT, PFB_SURFACE_ALLOC, g_mem_entry);
+    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &sz,
+        (memory_object_offset_t)(uintptr_t)g_surface_base,
+        VM_PROT_READ|VM_PROT_WRITE, &g_mem_entry, MACH_PORT_NULL);
+    if (kr) { NSLog(@"memory_entry: %s", mach_error_string(kr)); }
+
+    NSLog(@"IOSurface %ux%u id=%u base=%p mem_entry=0x%x",
+          PFB_PIXEL_WIDTH, PFB_PIXEL_HEIGHT,
+          IOSurfaceGetID(g_iosurface), g_surface_base, g_mem_entry);
 }
 
 static void handle_msg(mach_port_t port) {
@@ -104,8 +126,8 @@ static void handle_msg(mach_port_t port) {
             mach_msg(&reply, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         }
         /* Check pixels in shared buffer */
-        if (g_surface && (g_flush_count <= 10 || g_flush_count % 50 == 0)) {
-            uint32_t *px = (uint32_t *)g_surface;
+        if (g_surface_base && (g_flush_count <= 10 || g_flush_count % 50 == 0)) {
+            uint32_t *px = (uint32_t *)g_surface_base;
             int nz = 0;
             for (int i = 0; i < PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT; i++) {
                 uint8_t r = (px[i] >> 16) & 0xFF;
@@ -119,7 +141,7 @@ static void handle_msg(mach_port_t port) {
             /* Write raw pixels to file for inspection */
             if (g_flush_count <= 10 || g_flush_count % 50 == 0) {
                 FILE *f = fopen("/tmp/sim_framebuffer.raw", "wb");
-                if (f) { fwrite((void*)g_surface, 1, PFB_SURFACE_SIZE, f); fclose(f);
+                if (f) { fwrite(g_surface_base, 1, PFB_SURFACE_SIZE, f); fclose(f);
                     NSLog(@"Wrote %u bytes to /tmp/sim_framebuffer.raw", PFB_SURFACE_SIZE); }
             }
         }
@@ -140,9 +162,9 @@ static void handle_msg(mach_port_t port) {
             NSLog(@"  replied to 1011");
         }
         /* Also dump latest frame */
-        if (g_surface) {
+        if (g_surface_base) {
             FILE *f = fopen("/tmp/sim_framebuffer.raw", "wb");
-            if (f) { fwrite((void*)g_surface, 1, PFB_SURFACE_SIZE, f); fclose(f); }
+            if (f) { fwrite(g_surface_base, 1, PFB_SURFACE_SIZE, f); fclose(f); }
         }
     } else {
         NSLog(@"unknown msg_id=%u size=%u reply=0x%x", msg->msgh_id, msg->msgh_size, msg->msgh_remote_port);
@@ -179,8 +201,34 @@ int main(int argc, const char *argv[]) {
         if (!device) { NSLog(@"ERROR: device not found"); return 1; }
         NSLog(@"Device: %@", ((id(*)(id,SEL))objc_msgSend)(device, sel_registerName("name")));
 
+        /* Load SimulatorKit for display APIs */
+        dlopen("/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks/SimulatorKit.framework/SimulatorKit", RTLD_NOW);
+
+        /* Explore SimDeviceIO display methods */
+        {
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(object_getClass(device), &mcount);
+            for (unsigned int i = 0; i < mcount; i++) {
+                NSString *name = NSStringFromSelector(method_getName(methods[i]));
+                if ([name containsString:@"screen"] || [name containsString:@"Screen"] ||
+                    [name containsString:@"display"] || [name containsString:@"Display"] ||
+                    [name containsString:@"surface"] || [name containsString:@"Surface"] ||
+                    [name containsString:@"ioServer"] || [name containsString:@"IOServer"] ||
+                    [name containsString:@"deviceIO"]) {
+                    NSLog(@"  device method: %@", name);
+                }
+            }
+            free(methods);
+
+            /* Check for _ioServer or deviceIO */
+            @try {
+                id ioServer = ((id(*)(id,SEL))objc_msgSend)(device, sel_registerName("_ioServer"));
+                NSLog(@"_ioServer: %@ class=%s", ioServer, object_getClassName(ioServer));
+            } @catch (id e) { NSLog(@"_ioServer: threw %@", e); }
+        }
+
         create_surface();
-        if (!g_mem_entry) { NSLog(@"ERROR: no surface"); return 1; }
+        if (!g_iosurface || !g_mem_entry) { NSLog(@"ERROR: no surface/mem_entry"); return 1; }
 
         mach_port_t port;
         mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
