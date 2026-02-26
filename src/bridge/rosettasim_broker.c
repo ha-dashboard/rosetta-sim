@@ -2851,17 +2851,23 @@ static int spawn_app(const char *app_path, const char *sdk_path, const char *bri
     broker_log("[broker] app spawned with pid %d\n", pid);
 
     /* FIX: posix_spawnattr_setspecialport_np doesn't work reliably under Rosetta 2.
-     * Explicitly set the child's bootstrap port via task_set_special_port. */
+     * Retry task_for_pid + task_set_special_port in a loop — the child may not be
+     * ready immediately after posix_spawn returns. */
     {
         mach_port_t child_task = MACH_PORT_NULL;
-        kern_return_t tkr = task_for_pid(mach_task_self(), pid, &child_task);
-        if (tkr == KERN_SUCCESS && child_task != MACH_PORT_NULL) {
-            kern_return_t skr = task_set_special_port(child_task, TASK_BOOTSTRAP_PORT, g_broker_port);
-            broker_log("[broker] task_set_special_port on app pid=%d: kr=%d (child_task=0x%x)\n",
-                pid, skr, child_task);
-            mach_port_deallocate(mach_task_self(), child_task);
-        } else {
-            broker_log("[broker] task_for_pid(%d) failed: kr=%d — bootstrap port not set!\n", pid, tkr);
+        int set_ok = 0;
+        for (int retry = 0; retry < 50 && !set_ok; retry++) {
+            kern_return_t tkr = task_for_pid(mach_task_self(), pid, &child_task);
+            if (tkr == KERN_SUCCESS && child_task != MACH_PORT_NULL) {
+                kern_return_t skr = task_set_special_port(child_task, TASK_BOOTSTRAP_PORT, g_broker_port);
+                broker_log("[broker] task_set_special_port on app pid=%d: kr=%d retry=%d\n", pid, skr, retry);
+                mach_port_deallocate(mach_task_self(), child_task);
+                if (skr == KERN_SUCCESS) set_ok = 1;
+            }
+            if (!set_ok) usleep(10000); /* 10ms */
+        }
+        if (!set_ok) {
+            broker_log("[broker] WARNING: could not set bootstrap port on app pid=%d after 50 retries\n", pid);
         }
     }
 

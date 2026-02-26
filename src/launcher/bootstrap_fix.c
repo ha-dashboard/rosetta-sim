@@ -3855,53 +3855,26 @@ static void bootstrap_fix_constructor(void) {
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
 
-    /* If bootstrap port is dead, recover via macOS bootstrap lookup.
-     * The broker registers "com.rosettasim.broker" with the REAL macOS bootstrap.
-     * Even when posix_spawnattr fails, the child can find it via the host bootstrap. */
+    /* If bootstrap port is dead, WAIT for the broker to set it via task_set_special_port.
+     * The broker retries task_for_pid + task_set_special_port in a loop after spawn. */
     if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-        /* Get the REAL macOS bootstrap port (not the sim's) */
-        mach_port_t host_bp = MACH_PORT_NULL;
-        /* The real bootstrap is available via the host special port or
-         * by reading the bootstrap_port global BEFORE we overwrite it.
-         * Since bootstrap_port is already 0xffffffff, try host_get_special_port. */
-        extern kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
-
-        /* Try all possible bootstrap ports: the global, the special port, and port 0x80b (common macOS bootstrap) */
-        mach_port_t try_ports[] = { bootstrap_port, MACH_PORT_NULL };
-        task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &try_ports[1]);
-
-        for (int ti = 0; ti < 2; ti++) {
-            if (try_ports[ti] == MACH_PORT_NULL || try_ports[ti] == (mach_port_t)-1) continue;
-            mach_port_t broker = MACH_PORT_NULL;
-            kern_return_t lkr = bootstrap_look_up(try_ports[ti], "com.rosettasim.broker", &broker);
-            bfix_log("[bfix] constructor: broker lookup via port 0x%x: kr=%d broker=0x%x\n",
-                try_ports[ti], lkr, broker);
-            if (lkr == KERN_SUCCESS && broker != MACH_PORT_NULL) {
-                bp = broker;
-                task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
-                bfix_log("[bfix] constructor: RECOVERED broker port 0x%x via macOS bootstrap!\n", bp);
-                break;
-            }
-        }
-
-        /* Also try reading from file as last resort */
-        if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
-            FILE *fp = fopen("/tmp/rosettasim_broker_port", "r");
-            if (fp) {
-                unsigned int file_port = 0;
-                if (fscanf(fp, "%u", &file_port) == 1 && file_port != 0) {
-                    bp = (mach_port_t)file_port;
-                    mach_port_type_t pt = 0;
-                    kern_return_t tkr = mach_port_type(mach_task_self(), bp, &pt);
-                    if (tkr == KERN_SUCCESS && (pt & MACH_PORT_TYPE_SEND)) {
-                        task_set_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, bp);
-                        bfix_log("[bfix] constructor: recovered port 0x%x from file\n", bp);
-                    } else {
-                        bp = MACH_PORT_NULL;
-                    }
+        bfix_log("[bfix] constructor: bootstrap port invalid (0x%x), waiting for broker...\n", bp);
+        for (int retry = 0; retry < 100; retry++) {
+            usleep(20000); /* 20ms */
+            task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bp);
+            if (bp != MACH_PORT_NULL && bp != (mach_port_t)-1) {
+                mach_port_type_t pt = 0;
+                mach_port_type(mach_task_self(), bp, &pt);
+                if (pt & MACH_PORT_TYPE_SEND) {
+                    bfix_log("[bfix] constructor: bootstrap port recovered: 0x%x after %dms\n",
+                        bp, (retry + 1) * 20);
+                    break;
                 }
-                fclose(fp);
             }
+            bp = MACH_PORT_NULL; /* reset for next iteration */
+        }
+        if (bp == MACH_PORT_NULL || bp == (mach_port_t)-1) {
+            bfix_log("[bfix] constructor: bootstrap port NOT recovered after 2s!\n");
         }
     }
 
