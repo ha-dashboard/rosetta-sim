@@ -1636,6 +1636,24 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                             uint32_t disp_id_10 = *(uint32_t *)((uint8_t *)_disp + 0x10);
                             bfix_log("DISPLAY: +0x10(display_id?) = %u", disp_id_10);
 
+                            /* CHECK: Server+0x60 display name (render_display compares this) */
+                            {
+                                void *srv_name = *(void **)((uint8_t *)_srv + 0x60);
+                                bfix_log("SERVER_NAME: +0x60 = %p", srv_name);
+                                if (srv_name) {
+                                    if (CFGetTypeID((CFTypeRef)srv_name) == CFStringGetTypeID()) {
+                                        char nbuf[256] = {0};
+                                        CFStringGetCString((CFStringRef)srv_name, nbuf, sizeof(nbuf), kCFStringEncodingUTF8);
+                                        bfix_log("SERVER_NAME: '%s'", nbuf);
+                                    } else {
+                                        bfix_log("SERVER_NAME: not CFString (typeID=%lu)",
+                                            (unsigned long)CFGetTypeID((CFTypeRef)srv_name));
+                                    }
+                                } else {
+                                    bfix_log("SERVER_NAME: NULL! (render_display will skip all contexts)");
+                                }
+                            }
+
                             /* Fix: set display_id on each context via set_display_info,
                              * then call attach_contexts to bind them to the display.
                              * set_display_info writes display_id to context+0x170 and
@@ -1703,67 +1721,59 @@ kern_return_t replacement_mach_msg(mach_msg_header_t *msg,
                                         bfix_log("DEFAULT_DISP: +0xF9 after=0x%02x", *dflag);
                                     }
 
-                                    /* Step 3b: Set opts + display_info on commit_ctx, then call context_created */
-                                    if (commit_ctx) {
-                                        /* Ensure commit_ctx has opts with displayId=1 */
-                                        @try {
-                                            id cOpts = ((id(*)(id, SEL))objc_msgSend)(
-                                                (id)objc_getClass("NSMutableDictionary"),
-                                                sel_registerName("dictionary"));
-                                            id n1 = ((id(*)(id, SEL, int))objc_msgSend)(
-                                                (id)objc_getClass("NSNumber"),
-                                                sel_registerName("numberWithInt:"), 1);
-                                            /* Use the REAL kCAContextDisplayId constant */
-                                            void *kdid_ptr = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
-                                            id kdid_key = kdid_ptr ? *(id *)kdid_ptr : @"displayId";
-                                            bfix_log("DISPLAY_BIND: kCAContextDisplayId key=%p ('%s')",
-                                                kdid_key, kdid_key ? ((const char *(*)(id,SEL))objc_msgSend)(
-                                                    kdid_key, sel_registerName("UTF8String")) : "nil");
-                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
-                                                cOpts, sel_registerName("setObject:forKey:"),
-                                                n1, kdid_key);
-                                            ((void(*)(id, SEL, id, id))objc_msgSend)(
-                                                cOpts, sel_registerName("setObject:forKey:"),
-                                                @YES, @"displayable");
-                                            *(void **)((uint8_t *)commit_ctx + 0x10) = (__bridge void *)cOpts;
-                                            bfix_log("DISPLAY_BIND: set opts {displayId=1} on commit_ctx id=%u", commit_ctx_id);
-                                        } @catch (id ex) {}
-
-                                        /* Verify CA_CFDictionaryGetInt returns 1 */
-                                        {
-                                            typedef int (*GetIntFn)(void *, void *);
-                                            GetIntFn getInt = (GetIntFn)(qc_base + 0x136156);
-                                            void *stored_opts = *(void **)((uint8_t *)commit_ctx + 0x10);
-                                            void *kp = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
-                                            void *kdid_cf = kp ? *(void **)kp : NULL;
-                                            int got_id = kdid_cf ? getInt(stored_opts, kdid_cf) : -1;
-                                            bfix_log("DISPLAY_BIND: CA_CFDictionaryGetInt(opts, displayId) = %d", got_id);
-
-                                            /* Also check what server+0x58 points to */
-                                            void *srv58 = *(void **)((uint8_t *)_srv + 0x58);
-                                            uint32_t disp_at_10 = *(uint32_t *)((uint8_t *)srv58 + 0x10);
-                                            bfix_log("DISPLAY_BIND: srv+0x58=%p disp+0x10=%u (should match %d)",
-                                                srv58, disp_at_10, got_id);
-                                        }
-
-                                        /* Set display_info */
-                                        SetDispInfoFn set_disp2 = (SetDispInfoFn)(qc_base + 0x5e2c2);
-                                        set_disp2(commit_ctx, 1);
-
+                                    /* Step 3b: Snapshot + iterate ALL contexts through context_created */
+                                    {
                                         typedef void (*CtxCreatedFn)(void *, void *, void *);
                                         CtxCreatedFn ctx_created = (CtxCreatedFn)(qc_base + 0x126158);
 
-                                        /* Clear 0x20000 right before call */
-                                        uint32_t fc = *(uint32_t *)((uint8_t *)commit_ctx + 0x08);
-                                        *(uint32_t *)((uint8_t *)commit_ctx + 0x08) = (fc & ~0x20000) | 0x400000;
-                                        bfix_log("DISPLAY_BIND: context_created(ctx id=%u, flags=0x%x)",
-                                            commit_ctx_id, *(uint32_t *)((uint8_t *)commit_ctx + 0x08));
-                                        ctx_created(commit_ctx, _srv, NULL);
+                                        /* Snapshot context ptrs before iterating */
+                                        void *ctx_snap[20] = {0};
+                                        uint64_t sn = _cc < 20 ? _cc : 20;
+                                        for (uint64_t s = 0; s < sn; s++)
+                                            ctx_snap[s] = *(void **)((uint8_t *)_cl + s * 0x10);
 
-                                        void *post_arr = *(void **)((uint8_t *)_disp + 0x68);
-                                        int post_cnt = *(int *)((uint8_t *)_disp + 0x78);
-                                        bfix_log("DISPLAY_BIND: after: disp+0x68=%p count=%d",
-                                            post_arr, post_cnt);
+                                        for (uint64_t ci9 = 0; ci9 < sn; ci9++) {
+                                            void *ctx9 = ctx_snap[ci9];
+                                            if (!ctx9) continue;
+                                            uint32_t cid9 = *(uint32_t *)((uint8_t *)ctx9 + 0x0C);
+
+                                            /* Set opts + flags on this context */
+                                            @try {
+                                                id o = ((id(*)(id,SEL))objc_msgSend)(
+                                                    (id)objc_getClass("NSMutableDictionary"),
+                                                    sel_registerName("dictionary"));
+                                                id n = ((id(*)(id,SEL,int))objc_msgSend)(
+                                                    (id)objc_getClass("NSNumber"),
+                                                    sel_registerName("numberWithInt:"), 1);
+                                                void *kp = dlsym(RTLD_DEFAULT, "kCAContextDisplayId");
+                                                id kk = kp ? *(id *)kp : @"displayId";
+                                                ((void(*)(id,SEL,id,id))objc_msgSend)(
+                                                    o, sel_registerName("setObject:forKey:"), n, kk);
+                                                ((void(*)(id,SEL,id,id))objc_msgSend)(
+                                                    o, sel_registerName("setObject:forKey:"),
+                                                    @YES, @"displayable");
+                                                *(void **)((uint8_t *)ctx9 + 0x10) = (__bridge void *)o;
+                                            } @catch (id ex) {}
+
+                                            SetDispInfoFn sdi = (SetDispInfoFn)(qc_base + 0x5e2c2);
+                                            sdi(ctx9, 1);
+                                            uint32_t f9 = *(uint32_t *)((uint8_t *)ctx9 + 0x08);
+                                            *(uint32_t *)((uint8_t *)ctx9 + 0x08) = (f9 & ~0x20000) | 0x400000;
+
+                                            bfix_log("BIND[%llu]: ctx id=%u flags=0x%x",
+                                                (unsigned long long)ci9, cid9,
+                                                *(uint32_t *)((uint8_t *)ctx9 + 0x08));
+                                            ctx_created(ctx9, _srv, NULL);
+
+                                            void *pa = *(void **)((uint8_t *)_disp + 0x68);
+                                            int pc = *(int *)((uint8_t *)_disp + 0x78);
+                                            bfix_log("BIND[%llu]: disp+0x68=%p count=%d",
+                                                (unsigned long long)ci9, pa, pc);
+                                            if (pc > 0) {
+                                                bfix_log("*** DISPLAY BOUND! count=%d ***", pc);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
