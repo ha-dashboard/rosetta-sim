@@ -117,7 +117,7 @@ static void handle_msg(mach_port_t port) {
             NSLog(@"flush #%d: %d/%d non-zero RGB, center=0x%08x, px[0]=0x%08x",
                   g_flush_count, nz, PFB_PIXEL_WIDTH * PFB_PIXEL_HEIGHT, center, px[0]);
             /* Write raw pixels to file for inspection */
-            if (g_flush_count == 5 || (nz > 0 && g_flush_count <= 10)) {
+            if (g_flush_count <= 10 || g_flush_count % 50 == 0) {
                 FILE *f = fopen("/tmp/sim_framebuffer.raw", "wb");
                 if (f) { fwrite((void*)g_surface, 1, PFB_SURFACE_SIZE, f); fclose(f);
                     NSLog(@"Wrote %u bytes to /tmp/sim_framebuffer.raw", PFB_SURFACE_SIZE); }
@@ -125,8 +125,37 @@ static void handle_msg(mach_port_t port) {
         }
         if (g_flush_count <= 5 || g_flush_count % 100 == 0)
             NSLog(@"flush #%d total", g_flush_count);
+    } else if (msg->msgh_id == 1011) {
+        /* Display state change — reply if reply port present */
+        NSLog(@"msg_id=1011 (display state) size=%u bits=0x%x reply=0x%x",
+              msg->msgh_size, msg->msgh_bits, msg->msgh_remote_port);
+        if (msg->msgh_remote_port) {
+            mach_msg_header_t reply;
+            memset(&reply, 0, sizeof(reply));
+            reply.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply.msgh_size = sizeof(reply);
+            reply.msgh_remote_port = msg->msgh_remote_port;
+            reply.msgh_id = msg->msgh_id;
+            mach_msg(&reply, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            NSLog(@"  replied to 1011");
+        }
+        /* Also dump latest frame */
+        if (g_surface) {
+            FILE *f = fopen("/tmp/sim_framebuffer.raw", "wb");
+            if (f) { fwrite((void*)g_surface, 1, PFB_SURFACE_SIZE, f); fclose(f); }
+        }
     } else {
-        NSLog(@"unknown msg_id=%u", msg->msgh_id);
+        NSLog(@"unknown msg_id=%u size=%u reply=0x%x", msg->msgh_id, msg->msgh_size, msg->msgh_remote_port);
+        /* Reply to any unknown message with reply port */
+        if (msg->msgh_remote_port) {
+            mach_msg_header_t reply;
+            memset(&reply, 0, sizeof(reply));
+            reply.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+            reply.msgh_size = sizeof(reply);
+            reply.msgh_remote_port = msg->msgh_remote_port;
+            reply.msgh_id = msg->msgh_id;
+            mach_msg(&reply, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        }
     }
 }
 
