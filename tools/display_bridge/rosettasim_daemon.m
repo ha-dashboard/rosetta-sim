@@ -72,8 +72,9 @@ typedef struct DeviceContext {
     uint32_t        bytes_per_row;
     uint32_t        surface_size;
     uint32_t        surface_alloc;
-    IOSurfaceRef    iosurface;
-    uint32_t        surface_id;
+    IOSurfaceRef    iosurface;       /* surface A: mapped to backboardd via memory_entry */
+    IOSurfaceRef    iosurface_read;  /* surface B: stable copy for injection to read */
+    uint32_t        surface_id;      /* ID of surface B (the read surface) */
     void           *surface_base;
     mach_port_t     mem_entry;
     mach_port_t     service_port;
@@ -81,11 +82,12 @@ typedef struct DeviceContext {
     int             flush_count;
     int             active;
     time_t          last_flush_time;
+    long            last_state;     /* for state change deduplication */
 } DeviceContext;
 
-#define MAX_DEVICES 64
-static DeviceContext g_devices[MAX_DEVICES];
+static DeviceContext *g_devices = NULL;
 static int g_device_count = 0;
+static int g_device_capacity = 0;
 static dispatch_queue_t g_msg_queue;
 
 /* ================================================================
@@ -103,9 +105,11 @@ static DeviceContext *find_context(const char *udid) {
 static DeviceContext *alloc_context(const char *udid, const char *name) {
     DeviceContext *ctx = find_context(udid);
     if (ctx) return ctx;
-    if (g_device_count >= MAX_DEVICES) {
-        NSLog(@"[daemon] MAX_DEVICES reached");
-        return NULL;
+    if (g_device_count >= g_device_capacity) {
+        int new_cap = g_device_capacity ? g_device_capacity * 2 : 8;
+        g_devices = realloc(g_devices, new_cap * sizeof(DeviceContext));
+        memset((void *)(g_devices + g_device_capacity), 0, (new_cap - g_device_capacity) * sizeof(DeviceContext));
+        g_device_capacity = new_cap;
     }
     ctx = &g_devices[g_device_count++];
     memset((void *)ctx, 0, sizeof(*ctx));
@@ -249,6 +253,13 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
             mach_msg(&reply, MACH_SEND_MSG, sizeof(reply),
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         }
+        /* Double-buffer: copy surface A (write) → surface B (read) after flush.
+         * The injection reads from surface B via IOSurfaceLookup, so this gives
+         * it a stable snapshot while backboardd starts writing the next frame to A. */
+        if (ctx->iosurface_read && ctx->surface_base) {
+            void *read_base = IOSurfaceGetBaseAddress(ctx->iosurface_read);
+            memcpy(read_base, ctx->surface_base, ctx->surface_size);
+        }
         write_framebuffer(ctx);
 
         /* Also write to legacy shared path for backward compat */
@@ -339,7 +350,7 @@ static void activate_device(DeviceContext *ctx, id device) {
 
     NSLog(@"[daemon] %s: %ux%u @%.0fx", ctx->name, ctx->pixel_width, ctx->pixel_height, ctx->scale);
 
-    /* Create IOSurface */
+    /* Create IOSurface A (write surface — mapped to backboardd via memory_entry) */
     NSDictionary *props = @{
         (id)kIOSurfaceWidth:           @(ctx->pixel_width),
         (id)kIOSurfaceHeight:          @(ctx->pixel_height),
@@ -356,12 +367,23 @@ static void activate_device(DeviceContext *ctx, id device) {
     }
     ctx->surface_base = IOSurfaceGetBaseAddress(ctx->iosurface);
 
-    /* Fill with opaque black */
+    /* Create IOSurface B (read surface — stable copy for injection) */
+    ctx->iosurface_read = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!ctx->iosurface_read) {
+        NSLog(@"[daemon] ERROR: IOSurfaceCreate (read) failed for %s", ctx->name);
+        CFRelease(ctx->iosurface); ctx->iosurface = NULL;
+        return;
+    }
+
+    /* Fill both with opaque black */
     IOSurfaceLock(ctx->iosurface, 0, NULL);
     uint8_t *px = (uint8_t *)ctx->surface_base;
     memset(px, 0, ctx->surface_size);
     for (uint32_t i = 0; i < ctx->pixel_width * ctx->pixel_height; i++) px[i * 4 + 3] = 0xFF;
     IOSurfaceUnlock(ctx->iosurface, 0, NULL);
+    IOSurfaceLock(ctx->iosurface_read, 0, NULL);
+    memcpy(IOSurfaceGetBaseAddress(ctx->iosurface_read), ctx->surface_base, ctx->surface_size);
+    IOSurfaceUnlock(ctx->iosurface_read, 0, NULL);
 
     /* Create memory entry */
     memory_object_size_t sz = ctx->surface_alloc;
@@ -404,8 +426,8 @@ static void activate_device(DeviceContext *ctx, id device) {
     });
     dispatch_activate(ctx->recv_source);
 
-    /* Write metadata */
-    ctx->surface_id = IOSurfaceGetID(ctx->iosurface);
+    /* Write metadata — expose the READ surface ID (surface B) for injection */
+    ctx->surface_id = IOSurfaceGetID(ctx->iosurface_read);
     FILE *idf = fopen("/tmp/rosettasim_surface_id", "w");
     if (idf) { fprintf(idf, "%u\n", ctx->surface_id); fclose(idf); }
 
@@ -430,6 +452,10 @@ static void deactivate_device(DeviceContext *ctx) {
         CFRelease(ctx->iosurface);
         ctx->iosurface = NULL;
     }
+    if (ctx->iosurface_read) {
+        CFRelease(ctx->iosurface_read);
+        ctx->iosurface_read = NULL;
+    }
     if (ctx->mem_entry != MACH_PORT_NULL) {
         mach_port_deallocate(mach_task_self(), ctx->mem_entry);
         ctx->mem_entry = MACH_PORT_NULL;
@@ -451,16 +477,39 @@ static void deactivate_device(DeviceContext *ctx) {
 
 static BOOL is_legacy_runtime(id device) {
     @try {
-        NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
-                           sel_registerName("runtimeIdentifier"));
-        if (!rtId) return NO;
-        /* iOS 12.4 has mismatched runtime ID "iOS-15-4" due to .simruntime bundle */
-        if (![rtId containsString:@"iOS-9"] && ![rtId containsString:@"iOS-10"]
-            && ![rtId containsString:@"iOS-15-4"]) return NO;
+        /* Get runtime object and check its profile.plist for PurpleFBServer in headServices */
+        id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
+        if (!runtime) return NO;
+
         /* Verify device has a valid device type profile */
         id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
         if (!deviceType) return NO;
-        return YES;
+
+        /* Try to get the runtime's bundle path and read profile.plist */
+        id bundleURL = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("bundleURL"));
+        if (bundleURL) {
+            NSString *bundlePath = ((id(*)(id, SEL))objc_msgSend)(bundleURL, sel_registerName("path"));
+            if (bundlePath) {
+                NSString *profilePath = [bundlePath stringByAppendingPathComponent:@"Contents/Resources/profile.plist"];
+                NSDictionary *profile = [NSDictionary dictionaryWithContentsOfFile:profilePath];
+                if (profile) {
+                    NSArray *headServices = profile[@"headServices"];
+                    if ([headServices isKindOfClass:[NSArray class]] &&
+                        [headServices containsObject:@"PurpleFBServer"]) {
+                        return YES;
+                    }
+                    return NO; /* profile exists but no PurpleFBServer */
+                }
+            }
+        }
+
+        /* Fallback: match known runtime IDs if profile.plist couldn't be read */
+        NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
+                           sel_registerName("runtimeIdentifier"));
+        if (!rtId) return NO;
+        if ([rtId containsString:@"iOS-9"] || [rtId containsString:@"iOS-10"]
+            || [rtId containsString:@"iOS-15-4"]) return YES;
+        return NO;
     } @catch (id e) {
         return NO;
     }
@@ -588,10 +637,8 @@ int main(int argc, const char *argv[]) {
                         capturedDevice, sel_registerName("state"));
 
                     /* Deduplicate: only log/act on actual state transitions */
-                    static long lastState[MAX_DEVICES];
-                    int idx = (int)(capturedCtx - g_devices);
-                    if (idx >= 0 && idx < MAX_DEVICES && lastState[idx] == newState) return;
-                    if (idx >= 0 && idx < MAX_DEVICES) lastState[idx] = newState;
+                    if (capturedCtx->last_state == newState) return;
+                    capturedCtx->last_state = newState;
 
                     NSLog(@"[daemon] %s: state → %ld", capturedCtx->name, newState);
 
