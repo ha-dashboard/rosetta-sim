@@ -3399,6 +3399,28 @@ static void patch_bootstrap_functions(void) {
 /* Also set the global for any code that reads it directly */
 __attribute__((constructor))
 static void bootstrap_fix_constructor(void) {
+    /* Force backing stores to be encoded inline in commits.
+     * Without this, CAEncodeBackingStores=0 (default) means pixel data
+     * is NOT sent in commits. The server expects to access pixels via
+     * mach_vm_remap using the client's task port — which doesn't work
+     * in our Rosetta 2 setup. Setting to 1 makes commits include the
+     * actual CGImage pixel data inline. */
+    uint8_t *bs_flag = (uint8_t *)dlsym(RTLD_DEFAULT, "CAEncodeBackingStores");
+    if (bs_flag) {
+        uint8_t old_val = *bs_flag;
+        *bs_flag = 1;
+        bfix_log("[bfix] FORCE: CAEncodeBackingStores = 1 (was %u, ptr=%p)", old_val, bs_flag);
+    } else {
+        bfix_log("[bfix] WARNING: CAEncodeBackingStores not found via dlsym");
+    }
+    /* Also try as int* in case it's a 4-byte global */
+    int *bs_int = (int *)dlsym(RTLD_DEFAULT, "CAEncodeBackingStores");
+    if (bs_int) {
+        int old = *bs_int;
+        *bs_int = 1;
+        bfix_log("[bfix] FORCE: CAEncodeBackingStores(int) = 1 (was %d)", old);
+    }
+
     mach_port_t bp = get_bootstrap_port();
     bfix_log("[bfix] constructor: setting bootstrap_port = 0x%x (was 0x%x)\n", bp, bootstrap_port);
     if (bp != MACH_PORT_NULL) {
