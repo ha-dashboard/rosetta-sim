@@ -45,6 +45,8 @@ typedef struct {
     time_t   last_mtime;  /* last seen modification time of fb file */
     ino_t    last_ino;    /* inode of currently open fd */
     int      persist_fd;  /* persistent fd for pread (-1 = not open) */
+    uint32_t      surface_id;   /* IOSurface ID from daemon (0 = not set) */
+    IOSurfaceRef  iosurface;    /* looked up IOSurface (NULL = not resolved) */
 } DeviceDisplay;
 
 #define DEVICE_LAYER(dd) ((__bridge CALayer *)(dd)->layer_ref)
@@ -201,6 +203,7 @@ static BOOL load_multi_device_list(void) {
         NSNumber *w = dev[@"width"];
         NSNumber *h = dev[@"height"];
         NSNumber *s = dev[@"scale"];
+        NSNumber *sid = dev[@"surface_id"];
         if (!udid || !name || !w || !h) continue;
 
         DeviceDisplay *dd = &g_devices[new_count];
@@ -218,6 +221,18 @@ static BOOL load_multi_device_list(void) {
         dd->scale   = s ? s.floatValue : 2.0f;
         dd->bpr     = dd->width * 4;
         dd->fb_size = dd->bpr * dd->height;
+
+        /* Resolve IOSurface if ID changed or not yet looked up */
+        uint32_t new_sid = sid ? sid.unsignedIntValue : 0;
+        if (new_sid > 0 && new_sid != dd->surface_id) {
+            if (dd->iosurface) { CFRelease(dd->iosurface); dd->iosurface = NULL; }
+            dd->iosurface = IOSurfaceLookup(new_sid);
+            dd->surface_id = new_sid;
+            if (dd->iosurface)
+                NSLog(@"[inject] IOSurface lookup OK for '%s': id=%u", name.UTF8String, new_sid);
+            else
+                NSLog(@"[inject] IOSurface lookup FAILED for '%s': id=%u", name.UTF8String, new_sid);
+        }
 
         if (!preserve) {
             /* New device or no layer yet — reset */
@@ -636,10 +651,11 @@ static void retry_injection(void) {
 
 static IMP g_orig_setHardwareKeyboard = NULL;
 
-static BOOL swizzled_setHardwareKeyboardEnabled(id self, SEL _cmd, BOOL enabled, id keyboardType, NSError **error) {
+static BOOL swizzled_setHardwareKeyboardEnabled(id self, SEL _cmd, BOOL enabled, void *keyboardType, NSError **error) {
     /* Never call original — legacy device bridge returns garbage that causes
      * SIGSEGV in objc_storeStrong (ARC retains corrupt pointer before any
-     * ObjC exception). Safe to skip: keyboard config is non-critical. */
+     * ObjC exception). Using void* prevents ARC from retaining the garbage
+     * pointer on function entry. Safe to skip: keyboard config is non-critical. */
     (void)self; (void)_cmd; (void)enabled; (void)keyboardType; (void)error;
     return YES;
 }
