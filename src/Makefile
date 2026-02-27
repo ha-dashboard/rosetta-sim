@@ -49,15 +49,19 @@ SCALE_BIN     = $(BUILD)/sim_scale_fix.dylib
 SCREENSHOT_SRC = screenshot/fb_to_png.m
 SCREENSHOT_BIN = $(BUILD)/fb_to_png
 
+# rosettasim-ctl: simctl replacement for legacy devices
+CTL_SRC       = tools/rosettasim_ctl.m
+CTL_BIN       = $(BUILD)/rosettasim-ctl
+
 # Screenshot plugin: simdeviceio companion
 PLUGIN_SRC    = screenshot/rosettasim_screenshot_plugin.m
 PLUGIN_BIN    = $(BUILD)/RosettaSimScreenshot.simdeviceio/Contents/MacOS/RosettaSimScreenshot
 
 IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
 
-.PHONY: all daemon inject bridge viewer scale_fix screenshot screenshot_plugin clean
+.PHONY: all daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl clean
 
-all: daemon inject bridge viewer scale_fix screenshot screenshot_plugin
+all: daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -121,6 +125,14 @@ $(PLUGIN_BIN): $(PLUGIN_SRC) | $(BUILD)
 		$(BUILD)/RosettaSimScreenshot.simdeviceio/Contents/Info.plist 2>/dev/null || true
 	codesign --force --sign - $(BUILD)/RosettaSimScreenshot.simdeviceio
 	@echo "Built: $(BUILD)/RosettaSimScreenshot.simdeviceio"
+
+ctl: $(CTL_BIN)
+
+$(CTL_BIN): $(CTL_SRC) | $(BUILD)
+	$(CC) $(CFLAGS_COMMON) -framework Foundation -framework IOSurface -framework CoreGraphics \
+		-framework ImageIO -framework UniformTypeIdentifiers \
+		-Wl,-undefined,dynamic_lookup -o $@ $<
+	@echo "Built: $@"
 
 clean:
 	rm -rf $(BUILD)
