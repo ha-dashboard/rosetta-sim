@@ -23,6 +23,42 @@
 #include <spawn.h>
 #include <sys/wait.h>
 
+/* ── Forward declarations ── */
+static int run_with_timeout(NSArray<NSString *> *args, int timeout_secs);
+static id get_device_set(void);
+static id find_device(id deviceSet, NSString *udid);
+static NSString *get_runtime_id(id device);
+static long get_device_state(id device);
+static BOOL is_legacy_runtime(NSString *runtimeID);
+
+/* ── Passthrough: forward any command to real simctl ── */
+
+static int passthrough_to_simctl(int argc, const char *argv[]) {
+    NSMutableArray *args = [@[@"xcrun", @"simctl"] mutableCopy];
+    for (int i = 1; i < argc; i++)
+        [args addObject:[NSString stringWithUTF8String:argv[i]]];
+    return run_with_timeout(args, 60);
+}
+
+/* ── Resolve "booted" to a UDID ── */
+
+static NSString *resolve_device_arg(const char *arg) {
+    if (strcmp(arg, "booted") == 0) {
+        /* Find first booted device, preferring legacy */
+        id deviceSet = get_device_set();
+        if (!deviceSet) return nil;
+        NSDictionary *devices = ((id(*)(id, SEL))objc_msgSend)(deviceSet, sel_registerName("devicesByUDID"));
+        for (NSUUID *uuid in devices) {
+            id dev = devices[uuid];
+            if (get_device_state(dev) == 3) {
+                return uuid.UUIDString;
+            }
+        }
+        return @"booted"; /* let simctl handle it */
+    }
+    return [NSString stringWithUTF8String:arg];
+}
+
 /* ── Legacy runtime detection ── */
 
 static BOOL is_legacy_runtime(NSString *runtimeID) {
@@ -168,36 +204,6 @@ static NSString *state_string(long state) {
 }
 
 /* ── Command: list ── */
-
-static int cmd_list(void) {
-    id deviceSet = get_device_set();
-    if (!deviceSet) return 1;
-
-    NSDictionary *devices = ((id(*)(id, SEL))objc_msgSend)(deviceSet, sel_registerName("devicesByUDID"));
-    /* Group by runtime */
-    NSMutableDictionary<NSString *, NSMutableArray *> *byRuntime = [NSMutableDictionary new];
-    for (NSUUID *uuid in devices) {
-        id dev = devices[uuid];
-        NSString *rtID = get_runtime_id(dev);
-        if (!rtID) rtID = @"Unknown";
-        if (!byRuntime[rtID]) byRuntime[rtID] = [NSMutableArray new];
-        [byRuntime[rtID] addObject:dev];
-    }
-
-    for (NSString *rtID in [[byRuntime allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-        BOOL legacy = is_legacy_runtime(rtID);
-        printf("-- %s%s --\n", rtID.UTF8String, legacy ? " [legacy]" : "");
-        for (id dev in byRuntime[rtID]) {
-            NSString *name = get_device_name(dev);
-            NSUUID *udid = ((id(*)(id, SEL))objc_msgSend)(dev, sel_registerName("UDID"));
-            long state = get_device_state(dev);
-            printf("    %s (%s) (%s)\n",
-                   name.UTF8String, udid.UUIDString.UTF8String,
-                   state_string(state).UTF8String);
-        }
-    }
-    return 0;
-}
 
 /* ── Command: boot ── */
 
@@ -979,27 +985,40 @@ static int cmd_logverbose(NSString *udid, NSString *enabled) {
 /* ── Usage ── */
 
 static void usage(void) {
+    /* Match simctl's help format for drop-in compatibility */
     fprintf(stderr,
-        "Usage: rosettasim-ctl <command> [arguments]\n"
+        "usage: simctl [--set <path>] [--profiles <path>] <subcommand> ...\n"
+        "       simctl help [subcommand]\n"
+        "Command line utility to control the Simulator\n"
         "\n"
-        "Commands:\n"
-        "  list                              List all devices with status\n"
-        "  boot <UDID>                       Boot device\n"
-        "  shutdown <UDID|all>               Shutdown device(s)\n"
-        "  install <UDID> <app-path>         Install .app on device\n"
-        "  uninstall <UDID> <bundle-id>      Uninstall app\n"
-        "  launch <UDID> <bundle-id>         Launch app by bundle ID\n"
-        "  openurl <UDID> <url>              Open URL on device\n"
-        "  spawn <UDID> <binary> [args]      Spawn process in device\n"
-        "  screenshot <UDID> <output>        Take screenshot\n"
-        "  listapps <UDID>                   List installed apps\n"
-        "  get_app_container <UDID> <bid> [type]  Get app container path\n"
-        "  erase <UDID>                      Erase device content\n"
-        "  logverbose <UDID> <on|off>        Toggle verbose logging\n"
-        "  status <UDID>                     Show device status\n"
+        "For subcommands that require a <device> argument, you may specify a device UDID\n"
+        "or the special \"booted\" string which will cause simctl to pick a booted device.\n"
+        "If multiple devices are booted when the \"booted\" device is selected, simctl\n"
+        "will choose one of them.\n"
         "\n"
-        "Legacy runtimes (iOS 7-14.x) are handled directly.\n"
-        "Native runtimes delegate to xcrun simctl.\n"
+        "Subcommands:\n"
+        "\tboot                Boot a device or device pair.\n"
+        "\tcreate              Create a new device.\n"
+        "\tdelete              Delete specified devices, unavailable devices, or all devices.\n"
+        "\terase               Erase a device's contents and settings.\n"
+        "\tget_app_container   Print the path of the installed app's container\n"
+        "\tgetenv              Print an environment variable from a running device.\n"
+        "\thelp                Prints the usage for a given subcommand.\n"
+        "\tinstall             Install an app on a device.\n"
+        "\tio                  Set up a device IO operation.\n"
+        "\tlaunch              Launch an application by identifier on a device.\n"
+        "\tlist                List available devices, device types, runtimes, or device pairs.\n"
+        "\tlistapps            Show the installed applications.\n"
+        "\tlogverbose          enable or disable verbose logging for a device\n"
+        "\topenurl             Open a URL in a device.\n"
+        "\tshutdown            Shutdown a device.\n"
+        "\tspawn               Spawn a process by executing a given executable on a device.\n"
+        "\tstatus              Show device status (rosettasim extension).\n"
+        "\tterminate           Terminate an application by identifier on a device.\n"
+        "\tuninstall           Uninstall an app from a device.\n"
+        "\n"
+        "rosettasim-ctl: drop-in simctl replacement with legacy device support.\n"
+        "Unknown commands are forwarded to xcrun simctl.\n"
     );
 }
 
@@ -1015,7 +1034,10 @@ int main(int argc, const char *argv[]) {
         NSString *cmd = [NSString stringWithUTF8String:argv[1]];
 
         if ([cmd isEqualToString:@"list"]) {
-            return cmd_list();
+            /* Pass through to simctl — it handles all list formats correctly.
+             * Our legacy devices appear in simctl list since they're registered
+             * with CoreSimulatorService. No override needed. */
+            return passthrough_to_simctl(argc, argv);
         }
         else if ([cmd isEqualToString:@"boot"]) {
             if (argc < 3) { fprintf(stderr, "Usage: rosettasim-ctl boot <UDID>\n"); return 1; }
@@ -1080,10 +1102,44 @@ int main(int argc, const char *argv[]) {
             if (argc < 3) { fprintf(stderr, "Usage: rosettasim-ctl status <UDID>\n"); return 1; }
             return cmd_status([NSString stringWithUTF8String:argv[2]]);
         }
-        else {
-            fprintf(stderr, "Unknown command: %s\n", cmd.UTF8String);
+        else if ([cmd isEqualToString:@"io"]) {
+            /* Handle 'io <device> screenshot' for legacy, passthrough rest */
+            if (argc >= 4 && strcmp(argv[3], "screenshot") == 0) {
+                NSString *udid = resolve_device_arg(argv[2]);
+                id deviceSet = get_device_set();
+                id device = deviceSet ? find_device(deviceSet, udid) : nil;
+                if (device && is_legacy_runtime(get_runtime_id(device))) {
+                    NSString *output = argc >= 5 ? [NSString stringWithUTF8String:argv[4]] : @"screenshot.png";
+                    return cmd_screenshot(udid, output);
+                }
+            }
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"terminate"]) {
+            /* For legacy: kill the app process directly */
+            if (argc >= 4) {
+                NSString *udid = resolve_device_arg(argv[2]);
+                id deviceSet = get_device_set();
+                id device = deviceSet ? find_device(deviceSet, udid) : nil;
+                if (device && is_legacy_runtime(get_runtime_id(device))) {
+                    /* Can't terminate via simctl on legacy — just report */
+                    fprintf(stderr, "terminate not supported on legacy simulators.\n");
+                    return 1;
+                }
+            }
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"help"]) {
+            if (argc >= 3) {
+                /* Forward to simctl help for subcommand help */
+                return passthrough_to_simctl(argc, argv);
+            }
             usage();
-            return 1;
+            return 0;
+        }
+        else {
+            /* Unknown command — passthrough to real simctl */
+            return passthrough_to_simctl(argc, argv);
         }
     }
 }

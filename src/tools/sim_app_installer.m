@@ -1,18 +1,18 @@
 /*
  * sim_app_installer.dylib — x86_64 constructor dylib injected into SpringBoard
  *
- * On load, checks /tmp/rosettasim_pending_installs.json for apps to register.
- * Calls MobileInstallationInstallForLaunchServices() for each.
- * Writes result to /tmp/rosettasim_install_result.txt.
+ * Listens for darwin notifications to install apps and launch them.
+ * Uses device-specific notification names: com.rosettasim.{install,launch}.<UDID>
+ * Command payload is in /tmp/rosettasim_cmd_<UDID>.json (consumed immediately).
  *
  * Build: (x86_64 iOS simulator dylib)
- *   make app_installer
+ *   clang -arch x86_64 -dynamiclib -framework Foundation -fobjc-arc \
+ *     -mios-simulator-version-min=9.0 -install_name /usr/lib/sim_app_installer.dylib \
+ *     -isysroot $(xcrun --show-sdk-path --sdk iphonesimulator) \
+ *     -undefined dynamic_lookup -Wl,-not_for_dyld_shared_cache \
+ *     -o sim_app_installer.dylib sim_app_installer.m
  *
- * Deploy: inject into SpringBoard via insert_dylib or DYLD_INSERT_LIBRARIES
- *   in the device's launchd_bootstrap.plist.
- *
- * Pending installs JSON format:
- *   [{"path": "/path/to/App.app", "bundle_id": "com.example.app"}]
+ * Deploy: inject into SpringBoard via insert_dylib
  */
 
 #import <Foundation/Foundation.h>
@@ -21,22 +21,24 @@
 #import <dlfcn.h>
 #include <notify.h>
 
-#define PENDING_FILE  "/tmp/rosettasim_pending_installs.json"
-#define RESULT_FILE   "/tmp/rosettasim_install_result.txt"
+static const char *g_udid = NULL;
+static char g_cmd_path[512];
+static char g_result_path[512];
+
+/* ================================================================
+ * Logging
+ * ================================================================ */
 
 static void log_result(const char *fmt, ...) {
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
-
-    /* Print to stderr */
-    va_list ap2;
     va_copy(ap2, ap);
+    fprintf(stderr, "[app_installer] ");
     vfprintf(stderr, fmt, ap2);
     fprintf(stderr, "\n");
     va_end(ap2);
 
-    /* Append to result file */
-    FILE *f = fopen(RESULT_FILE, "a");
+    FILE *f = fopen(g_result_path, "a");
     if (f) {
         vfprintf(f, fmt, ap);
         fprintf(f, "\n");
@@ -45,256 +47,204 @@ static void log_result(const char *fmt, ...) {
     va_end(ap);
 }
 
-static void process_pending_installs(void) {
-    NSString *pendingPath = @PENDING_FILE;
+/* ================================================================
+ * Install handler
+ * ================================================================ */
 
-    /* Check if pending file exists */
-    if (![[NSFileManager defaultManager] fileExistsAtPath:pendingPath]) {
-        return; /* Nothing to install — silent return */
-    }
-
-    NSData *data = [NSData dataWithContentsOfFile:pendingPath];
-    if (!data || data.length == 0) {
-        [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
-        return;
-    }
-
-    NSError *jsonErr = nil;
-    NSArray *pending = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-    if (![pending isKindOfClass:[NSArray class]] || pending.count == 0) {
-        log_result("[installer] Invalid or empty pending installs JSON");
-        [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
-        return;
-    }
-
-    /* Clear result file */
-    [@"" writeToFile:@RESULT_FILE atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    log_result("[installer] Processing %lu pending install(s)...", (unsigned long)pending.count);
-
-    /* Load MobileInstallation.framework */
-    void *handle = dlopen("/System/Library/PrivateFrameworks/MobileInstallation.framework/MobileInstallation", RTLD_NOW);
-    if (!handle) {
-        log_result("[installer] ERROR: Failed to load MobileInstallation.framework: %s", dlerror());
-        return;
-    }
-
-    /* Get install functions — try both variants.
-     * Return type may be int (0=success) or id (nil=success, NSError*=failure).
-     * We handle both by checking if return value looks like a pointer or zero. */
-    typedef long (*MIInstallForLS)(id path, id options, id statusCB, id progressCB);
-    typedef long (*MIInstallFn)(id path, id options, void *callback, void *ctx);
-
-    MIInstallForLS installForLS = (MIInstallForLS)dlsym(handle, "MobileInstallationInstallForLaunchServices");
-    MIInstallFn installBasic = (MIInstallFn)dlsym(handle, "MobileInstallationInstall");
-
-    if (!installForLS && !installBasic) {
-        log_result("[installer] ERROR: No MobileInstallation install function found");
-        return;
-    }
-
-    log_result("[installer] Available APIs: ForLaunchServices=%s, Install=%s",
-               installForLS ? "YES" : "NO", installBasic ? "YES" : "NO");
-
-    int success_count = 0;
-    int fail_count = 0;
-
-    for (NSDictionary *entry in pending) {
-        NSString *appPath = entry[@"path"];
-        NSString *bundleID = entry[@"bundle_id"] ?: @"unknown";
-
-        if (!appPath) {
-            log_result("[installer] SKIP: entry missing 'path'");
-            fail_count++;
-            continue;
+static void handle_install(void) {
+    @autoreleasepool {
+        NSString *cmdPath = [NSString stringWithUTF8String:g_cmd_path];
+        NSData *data = [NSData dataWithContentsOfFile:cmdPath];
+        if (!data) {
+            log_result("No command file at %s", g_cmd_path);
+            return;
         }
 
-        if (![[NSFileManager defaultManager] fileExistsAtPath:appPath]) {
-            log_result("[installer] SKIP: app not found at %s", appPath.UTF8String);
-            fail_count++;
-            continue;
+        NSArray *installs = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![installs isKindOfClass:[NSArray class]]) {
+            log_result("Invalid JSON in command file");
+            [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+            return;
         }
 
-        log_result("[installer] Installing %s from %s...", bundleID.UTF8String, appPath.UTF8String);
+        /* Clear result file */
+        [@"" writeToFile:[NSString stringWithUTF8String:g_result_path]
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        /* Build options with extra fields for LaunchServices registration */
-        NSDictionary *options = @{
-            @"ApplicationType": @"User",
-            @"CFBundleIdentifier": bundleID,
-            @"SignerIdentity": @"-",
-            @"IsAdHocSigned": @YES,
-            @"SkipUninstall": @YES,
-        };
-
-        long result = -1;
-        BOOL success = NO;
-
-        /* Try MobileInstallationInstallForLaunchServices first */
-        if (installForLS) {
-            log_result("[installer] Trying MobileInstallationInstallForLaunchServices...");
-            result = installForLS(appPath, options, nil, nil);
-            log_result("[installer] ForLaunchServices returned: %ld (0x%lx)", result, result);
-            /* Return 0 = success. Non-zero could be error code or pointer to error object. */
-            if (result == 0) {
-                success = YES;
-            } else if (result > 0x10000) {
-                /* Likely a pointer to NSError */
-                @try {
-                    id errObj = (__bridge id)(void *)result;
-                    if ([errObj isKindOfClass:[NSError class]]) {
-                        log_result("[installer] ForLaunchServices error: %s",
-                                   ((NSError *)errObj).localizedDescription.UTF8String);
-                    } else {
-                        log_result("[installer] ForLaunchServices returned object: %s",
-                                   [errObj description].UTF8String);
-                    }
-                } @catch (id e) {
-                    log_result("[installer] ForLaunchServices returned non-zero: %ld", result);
-                }
-            }
+        /* Resolve MobileInstallationInstallForLaunchServices */
+        typedef long (*MIInstallFn)(NSString *path, NSDictionary *opts, void *cb, NSString *caller);
+        MIInstallFn miInstall = (MIInstallFn)dlsym(RTLD_DEFAULT,
+            "MobileInstallationInstallForLaunchServices");
+        if (!miInstall) {
+            log_result("MobileInstallationInstallForLaunchServices not found");
+            [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+            return;
         }
 
-        /* If ForLaunchServices failed, try basic MobileInstallationInstall */
-        if (!success && installBasic) {
-            log_result("[installer] Trying MobileInstallationInstall (basic)...");
-            result = installBasic(appPath, options, NULL, NULL);
-            log_result("[installer] Install (basic) returned: %ld (0x%lx)", result, result);
-            if (result == 0) {
-                success = YES;
-            } else if (result > 0x10000) {
-                @try {
-                    id errObj = (__bridge id)(void *)result;
-                    if ([errObj isKindOfClass:[NSError class]]) {
-                        log_result("[installer] Install error: %s",
-                                   ((NSError *)errObj).localizedDescription.UTF8String);
-                    } else {
-                        log_result("[installer] Install returned object: %s",
-                                   [errObj description].UTF8String);
-                    }
-                } @catch (id e) {
-                    log_result("[installer] Install returned non-zero: %ld", result);
-                }
-            }
+        int success = 0;
+        for (NSDictionary *entry in installs) {
+            NSString *path = entry[@"path"];
+            NSString *bundleId = entry[@"bundle_id"];
+            if (!path) continue;
+
+            log_result("Installing: %s (bundleId=%s)", [path UTF8String],
+                      bundleId ? [bundleId UTF8String] : "auto");
+
+            NSDictionary *opts = @{
+                @"PackageType": @"Developer",
+                @"AllowInstallLocalProvisioned": @YES,
+            };
+
+            long result = miInstall(path, opts, NULL, @"rosettasim");
+            log_result("  result=%ld (%s)", result, result == 0 ? "SUCCESS" : "FAILED");
+            if (result == 0) success++;
         }
 
-        if (success) {
-            log_result("[installer] OK: %s installed successfully", bundleID.UTF8String);
-            success_count++;
-        } else {
-            log_result("[installer] FAIL: %s — all install methods failed", bundleID.UTF8String);
-            fail_count++;
+        if (success > 0) {
+            notify_post("com.apple.LaunchServices.ApplicationsChanged");
+            notify_post("com.apple.mobile.application_installed");
+            log_result("Installed %d app(s), notifications posted", success);
         }
+
+        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
     }
-
-    log_result("[installer] Done: %d succeeded, %d failed", success_count, fail_count);
-
-    /* Notify SpringBoard that apps changed so it refreshes the home screen */
-    if (success_count > 0) {
-        log_result("[installer] Posting LaunchServices notifications...");
-
-        /* Post the three key notifications SpringBoard observes */
-        notify_post("com.apple.LaunchServices.ApplicationsChanged");
-        notify_post("com.apple.LaunchServices.applicationRegistered");
-
-        /* Also try the MobileInstallation-specific notification */
-        notify_post("com.apple.mobile.application_installed");
-
-        log_result("[installer] Notifications posted. SpringBoard should refresh.");
-    }
-
-    /* Remove pending file after processing */
-    [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
 }
 
 /* ================================================================
- * Pending launch — launch an app by bundle ID from inside SpringBoard
+ * Launch handler
  * ================================================================ */
 
-#define LAUNCH_FILE "/tmp/rosettasim_pending_launch.txt"
+static void handle_launch(void) {
+    @autoreleasepool {
+        NSString *cmdPath = [NSString stringWithUTF8String:g_cmd_path];
+        NSData *data = [NSData dataWithContentsOfFile:cmdPath];
+        if (!data) {
+            log_result("No command file at %s", g_cmd_path);
+            return;
+        }
 
-static void process_pending_launch(void) {
-    NSString *launchPath = @LAUNCH_FILE;
-    NSString *bundleId = [NSString stringWithContentsOfFile:launchPath
-                                                  encoding:NSUTF8StringEncoding error:nil];
-    if (!bundleId || bundleId.length == 0) return;
+        NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSString *bundleId = cmd[@"bundle_id"];
+        if (!bundleId) {
+            log_result("No bundle_id in command file");
+            [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+            return;
+        }
 
-    bundleId = [bundleId stringByTrimmingCharactersInSet:
-                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    log_result("[installer] Launching app: %s", [bundleId UTF8String]);
+        log_result("Launching: %s", [bundleId UTF8String]);
+        BOOL launched = NO;
 
-    BOOL launched = NO;
-
-    /* Approach 1: LSApplicationWorkspace (works on iOS 8-13) */
-    Class lsClass = objc_getClass("LSApplicationWorkspace");
-    if (lsClass) {
-        id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
-                        sel_registerName("defaultWorkspace"));
-        if (workspace) {
-            BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace,
-                        sel_registerName("openApplicationWithBundleID:"), bundleId);
-            if (ok) {
-                log_result("[installer] LSApplicationWorkspace.openApplicationWithBundleID: succeeded");
-                launched = YES;
+        /* Approach 1: LSApplicationWorkspace */
+        Class lsClass = objc_getClass("LSApplicationWorkspace");
+        if (lsClass && !launched) {
+            id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
+                            sel_registerName("defaultWorkspace"));
+            if (workspace) {
+                BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace,
+                            sel_registerName("openApplicationWithBundleID:"), bundleId);
+                if (ok) {
+                    log_result("  LSApplicationWorkspace: SUCCESS");
+                    launched = YES;
+                }
             }
         }
-    }
 
-    /* Approach 2: FBSSystemService (iOS 8+) */
-    if (!launched) {
-        Class fbsClass = objc_getClass("FBSSystemService");
-        if (fbsClass) {
-            id service = ((id(*)(id, SEL))objc_msgSend)((id)fbsClass,
-                          sel_registerName("sharedService"));
-            if (service) {
-                ((void(*)(id, SEL, id, id, id))objc_msgSend)(service,
-                    sel_registerName("openApplication:options:withResult:"),
-                    bundleId, nil, nil);
-                log_result("[installer] FBSSystemService.openApplication: called");
-                launched = YES;
+        /* Approach 2: FBSSystemService */
+        if (!launched) {
+            Class fbsClass = objc_getClass("FBSSystemService");
+            if (fbsClass) {
+                id service = ((id(*)(id, SEL))objc_msgSend)((id)fbsClass,
+                              sel_registerName("sharedService"));
+                if (service) {
+                    ((void(*)(id, SEL, id, id, id))objc_msgSend)(service,
+                        sel_registerName("openApplication:options:withResult:"),
+                        bundleId, nil, nil);
+                    log_result("  FBSSystemService: called");
+                    launched = YES;
+                }
             }
         }
-    }
 
-    /* Approach 3: SBUserAgent (iOS 7-9) */
-    if (!launched) {
-        Class uaClass = objc_getClass("SBUserAgent");
-        if (uaClass) {
-            id agent = ((id(*)(id, SEL))objc_msgSend)((id)uaClass,
-                        sel_registerName("sharedUserAgent"));
-            if (agent) {
-                ((void(*)(id, SEL, id, id, id))objc_msgSend)(agent,
-                    sel_registerName("launchApplicationFromSource:withBundleIdentifier:url:"),
-                    nil, bundleId, nil);
-                log_result("[installer] SBUserAgent.launchApplication: called");
-                launched = YES;
-            }
+        if (!launched) {
+            log_result("  WARNING: No launch method available");
         }
-    }
 
-    if (!launched) {
-        log_result("[installer] WARNING: No launch method available");
+        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
     }
-
-    /* Remove pending launch file */
-    [[NSFileManager defaultManager] removeItemAtPath:launchPath error:nil];
 }
+
+/* ================================================================
+ * Also process legacy global pending files (backward compat)
+ * ================================================================ */
+
+static void process_legacy_pending(void) {
+    @autoreleasepool {
+        /* Check global pending installs file */
+        NSString *globalInstall = @"/tmp/rosettasim_pending_installs.json";
+        if ([[NSFileManager defaultManager] fileExistsAtPath:globalInstall]) {
+            /* Copy to device-specific path and trigger install */
+            NSData *data = [NSData dataWithContentsOfFile:globalInstall];
+            if (data) {
+                [data writeToFile:[NSString stringWithUTF8String:g_cmd_path] atomically:YES];
+                [[NSFileManager defaultManager] removeItemAtPath:globalInstall error:nil];
+                handle_install();
+            }
+        }
+
+        /* Check global pending launch file */
+        NSString *globalLaunch = @"/tmp/rosettasim_pending_launch.txt";
+        if ([[NSFileManager defaultManager] fileExistsAtPath:globalLaunch]) {
+            NSString *bundleId = [NSString stringWithContentsOfFile:globalLaunch
+                                                           encoding:NSUTF8StringEncoding error:nil];
+            if (bundleId.length > 0) {
+                bundleId = [bundleId stringByTrimmingCharactersInSet:
+                            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                NSDictionary *cmd = @{@"bundle_id": bundleId};
+                NSData *json = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+                [json writeToFile:[NSString stringWithUTF8String:g_cmd_path] atomically:YES];
+                [[NSFileManager defaultManager] removeItemAtPath:globalLaunch error:nil];
+                handle_launch();
+            }
+        }
+    }
+}
+
+/* ================================================================
+ * Constructor
+ * ================================================================ */
 
 __attribute__((constructor))
 static void sim_app_installer_init(void) {
-    /* Delay slightly to let SpringBoard finish its early init.
-     * MobileInstallation needs installd to be running. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        @autoreleasepool {
-            process_pending_installs();
-        }
-    });
+    g_udid = getenv("SIMULATOR_UDID");
+    if (!g_udid || !g_udid[0]) {
+        NSLog(@"[app_installer] SIMULATOR_UDID not set — disabled");
+        return;
+    }
 
-    /* Delay app launch longer — app needs to be installed first */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
+    snprintf(g_cmd_path, sizeof(g_cmd_path), "/tmp/rosettasim_cmd_%s.json", g_udid);
+    snprintf(g_result_path, sizeof(g_result_path), "/tmp/rosettasim_install_result_%s.txt", g_udid);
+
+    NSLog(@"[app_installer] Registering for device %s", g_udid);
+
+    /* Register for install notification */
+    char install_name[256];
+    snprintf(install_name, sizeof(install_name), "com.rosettasim.install.%s", g_udid);
+    int install_token;
+    notify_register_dispatch(install_name, &install_token, dispatch_get_main_queue(),
+        ^(int token) { handle_install(); });
+
+    /* Register for launch notification */
+    char launch_name[256];
+    snprintf(launch_name, sizeof(launch_name), "com.rosettasim.launch.%s", g_udid);
+    int launch_token;
+    notify_register_dispatch(launch_name, &launch_token, dispatch_get_main_queue(),
+        ^(int token) { handle_launch(); });
+
+    NSLog(@"[app_installer] Listening: %s, %s", install_name, launch_name);
+
+    /* Process legacy pending files after delay (backward compat) */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            process_pending_launch();
-        }
+        process_legacy_pending();
     });
 }
