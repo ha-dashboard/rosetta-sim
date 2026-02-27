@@ -16,7 +16,10 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
+#include <notify.h>
 
 #define PENDING_FILE  "/tmp/rosettasim_pending_installs.json"
 #define RESULT_FILE   "/tmp/rosettasim_install_result.txt"
@@ -185,8 +188,95 @@ static void process_pending_installs(void) {
 
     log_result("[installer] Done: %d succeeded, %d failed", success_count, fail_count);
 
+    /* Notify SpringBoard that apps changed so it refreshes the home screen */
+    if (success_count > 0) {
+        log_result("[installer] Posting LaunchServices notifications...");
+
+        /* Post the three key notifications SpringBoard observes */
+        notify_post("com.apple.LaunchServices.ApplicationsChanged");
+        notify_post("com.apple.LaunchServices.applicationRegistered");
+
+        /* Also try the MobileInstallation-specific notification */
+        notify_post("com.apple.mobile.application_installed");
+
+        log_result("[installer] Notifications posted. SpringBoard should refresh.");
+    }
+
     /* Remove pending file after processing */
     [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
+}
+
+/* ================================================================
+ * Pending launch — launch an app by bundle ID from inside SpringBoard
+ * ================================================================ */
+
+#define LAUNCH_FILE "/tmp/rosettasim_pending_launch.txt"
+
+static void process_pending_launch(void) {
+    NSString *launchPath = @LAUNCH_FILE;
+    NSString *bundleId = [NSString stringWithContentsOfFile:launchPath
+                                                  encoding:NSUTF8StringEncoding error:nil];
+    if (!bundleId || bundleId.length == 0) return;
+
+    bundleId = [bundleId stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    log_result("[installer] Launching app: %s", [bundleId UTF8String]);
+
+    BOOL launched = NO;
+
+    /* Approach 1: LSApplicationWorkspace (works on iOS 8-13) */
+    Class lsClass = objc_getClass("LSApplicationWorkspace");
+    if (lsClass) {
+        id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
+                        sel_registerName("defaultWorkspace"));
+        if (workspace) {
+            BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace,
+                        sel_registerName("openApplicationWithBundleID:"), bundleId);
+            if (ok) {
+                log_result("[installer] LSApplicationWorkspace.openApplicationWithBundleID: succeeded");
+                launched = YES;
+            }
+        }
+    }
+
+    /* Approach 2: FBSSystemService (iOS 8+) */
+    if (!launched) {
+        Class fbsClass = objc_getClass("FBSSystemService");
+        if (fbsClass) {
+            id service = ((id(*)(id, SEL))objc_msgSend)((id)fbsClass,
+                          sel_registerName("sharedService"));
+            if (service) {
+                ((void(*)(id, SEL, id, id, id))objc_msgSend)(service,
+                    sel_registerName("openApplication:options:withResult:"),
+                    bundleId, nil, nil);
+                log_result("[installer] FBSSystemService.openApplication: called");
+                launched = YES;
+            }
+        }
+    }
+
+    /* Approach 3: SBUserAgent (iOS 7-9) */
+    if (!launched) {
+        Class uaClass = objc_getClass("SBUserAgent");
+        if (uaClass) {
+            id agent = ((id(*)(id, SEL))objc_msgSend)((id)uaClass,
+                        sel_registerName("sharedUserAgent"));
+            if (agent) {
+                ((void(*)(id, SEL, id, id, id))objc_msgSend)(agent,
+                    sel_registerName("launchApplicationFromSource:withBundleIdentifier:url:"),
+                    nil, bundleId, nil);
+                log_result("[installer] SBUserAgent.launchApplication: called");
+                launched = YES;
+            }
+        }
+    }
+
+    if (!launched) {
+        log_result("[installer] WARNING: No launch method available");
+    }
+
+    /* Remove pending launch file */
+    [[NSFileManager defaultManager] removeItemAtPath:launchPath error:nil];
 }
 
 __attribute__((constructor))
@@ -197,6 +287,14 @@ static void sim_app_installer_init(void) {
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @autoreleasepool {
             process_pending_installs();
+        }
+    });
+
+    /* Delay app launch longer — app needs to be installed first */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            process_pending_launch();
         }
     });
 }

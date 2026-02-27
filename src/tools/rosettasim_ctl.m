@@ -503,17 +503,50 @@ static int cmd_launch(NSString *udid, NSString *bundleID) {
 
     (void)execName; /* app path confirmed valid */
 
-    /* Legacy devices: simctl spawn and simctl launch both fail with Mach errors
-     * under Rosetta 2. The only reliable way to launch an app is via the home screen. */
+    /* Write pending launch file for sim_app_installer.dylib to pick up on boot */
     printf("  App found at: %s\n", appPath.UTF8String);
-    printf("\n");
-    printf("  NOTE: Programmatic app launch is not supported on legacy simulators.\n");
-    printf("  The CoreSimulator spawn/launch APIs fail under Rosetta 2.\n");
-    printf("\n");
-    printf("  To launch the app, tap its icon on the home screen in Simulator.app.\n");
-    printf("  If the icon doesn't appear, reboot the device:\n");
-    printf("    rosettasim-ctl shutdown %s\n", udid.UTF8String);
-    printf("    rosettasim-ctl boot %s\n", udid.UTF8String);
+    printf("  Writing pending launch...\n");
+
+    FILE *f = fopen("/tmp/rosettasim_pending_launch.txt", "w");
+    if (f) {
+        fprintf(f, "%s\n", bundleID.UTF8String);
+        fclose(f);
+    } else {
+        fprintf(stderr, "Failed to write pending launch file.\n");
+        return 1;
+    }
+
+    /* Reboot device to trigger SpringBoard → installer dylib → launch */
+    printf("  Rebooting device to trigger launch...\n");
+    int rc = run_with_timeout(@[@"xcrun", @"simctl", @"shutdown", udid], 15);
+    if (rc == 124) {
+        /* Timeout — force kill */
+        NSString *killCmd = [NSString stringWithFormat:
+            @"pgrep -f 'launchd_sim.*%@' | xargs kill 2>/dev/null", udid];
+        system(killCmd.UTF8String);
+        sleep(2);
+    } else {
+        sleep(3);
+    }
+
+    rc = run_with_timeout(@[@"xcrun", @"simctl", @"boot", udid], 45);
+    if (rc != 0 && rc != 124) {
+        fprintf(stderr, "Boot failed (exit %d). Launch may still work if daemon reboots.\n", rc);
+    }
+
+    printf("  Waiting for SpringBoard to launch app...\n");
+    sleep(15);
+
+    /* Check result */
+    NSString *resultStr = [NSString stringWithContentsOfFile:@"/tmp/rosettasim_install_result.txt"
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    if (resultStr && [resultStr containsString:bundleID]) {
+        printf("Launch triggered for %s\n", bundleID.UTF8String);
+    } else {
+        printf("Launch requested. App should appear after SpringBoard finishes loading.\n");
+        printf("If it doesn't appear, tap its icon on the home screen.\n");
+    }
+
     return 0;
 }
 
@@ -691,6 +724,258 @@ static int cmd_status(NSString *udid) {
     return 0;
 }
 
+/* ── Helper: read LastLaunchServicesMap.plist for a device ── */
+
+static NSDictionary *read_ls_map(NSString *udid) {
+    NSString *path = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Library/MobileInstallation/LastLaunchServicesMap.plist",
+        NSHomeDirectory(), udid];
+    return [NSDictionary dictionaryWithContentsOfFile:path];
+}
+
+/* ── Command: listapps ── */
+
+static int cmd_listapps(NSString *udid) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"listapps", udid], 15);
+    }
+
+    /* Legacy: read from LastLaunchServicesMap.plist */
+    NSDictionary *lsMap = read_ls_map(udid);
+    if (!lsMap) {
+        fprintf(stderr, "No LaunchServicesMap found. Device may not have booted yet.\n");
+        return 1;
+    }
+
+    for (NSString *section in @[@"User", @"System", @"Internal"]) {
+        NSDictionary *apps = lsMap[section];
+        if (![apps isKindOfClass:[NSDictionary class]] || apps.count == 0) continue;
+        printf("-- %s (%lu) --\n", section.UTF8String, (unsigned long)apps.count);
+        for (NSString *bid in [apps.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+            NSDictionary *info = apps[bid];
+            NSString *path = info[@"Path"] ?: @"<no path>";
+            printf("  %s\n    %s\n", bid.UTF8String, path.UTF8String);
+        }
+    }
+    return 0;
+}
+
+/* ── Command: get_app_container ── */
+
+static int cmd_get_app_container(NSString *udid, NSString *bundleID, NSString *containerType) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        NSMutableArray *args = [@[@"xcrun", @"simctl", @"get_app_container", udid, bundleID] mutableCopy];
+        if (containerType) [args addObject:containerType];
+        return run_with_timeout(args, 15);
+    }
+
+    /* Legacy: read from LaunchServicesMap */
+    NSDictionary *lsMap = read_ls_map(udid);
+    if (!lsMap) {
+        fprintf(stderr, "No LaunchServicesMap found.\n");
+        return 1;
+    }
+
+    /* Search all sections */
+    for (NSString *section in @[@"User", @"System", @"Internal", @"CoreServices"]) {
+        NSDictionary *apps = lsMap[section];
+        NSDictionary *appInfo = apps[bundleID];
+        if (!appInfo) continue;
+
+        if ([containerType isEqualToString:@"data"]) {
+            NSString *container = appInfo[@"Container"];
+            if (container) { printf("%s\n", container.UTF8String); return 0; }
+        } else {
+            /* app container (default) = Path without the .app component */
+            NSString *path = appInfo[@"Path"];
+            if (path) {
+                if ([containerType isEqualToString:@"app"] || !containerType) {
+                    printf("%s\n", path.UTF8String);
+                } else {
+                    printf("%s\n", [path stringByDeletingLastPathComponent].UTF8String);
+                }
+                return 0;
+            }
+        }
+    }
+
+    /* Fallback: search Containers/Bundle/Application */
+    NSString *containersPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Containers/Bundle/Application",
+        NSHomeDirectory(), udid];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *cuuid in [fm contentsOfDirectoryAtPath:containersPath error:nil]) {
+        NSString *containerDir = [containersPath stringByAppendingPathComponent:cuuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:containerDir error:nil]) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *infoPlist = [[containerDir stringByAppendingPathComponent:item]
+                                    stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundleID]) {
+                if ([containerType isEqualToString:@"data"]) {
+                    /* Look for matching data container */
+                    NSString *dataPath = [NSString stringWithFormat:
+                        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Containers/Data/Application",
+                        NSHomeDirectory(), udid];
+                    /* Can't reliably map bundle→data without the LS map; print what we have */
+                    printf("%s\n", dataPath.UTF8String);
+                } else {
+                    printf("%s\n", [containerDir stringByAppendingPathComponent:item].UTF8String);
+                }
+                return 0;
+            }
+        }
+    }
+
+    fprintf(stderr, "App %s not found.\n", bundleID.UTF8String);
+    return 1;
+}
+
+/* ── Command: uninstall ── */
+
+static int cmd_uninstall(NSString *udid, NSString *bundleID) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"uninstall", udid, bundleID], 30);
+    }
+
+    /* Legacy: remove app container directory */
+    printf("Uninstalling %s [legacy]...\n", bundleID.UTF8String);
+
+    NSString *containersPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Containers/Bundle/Application",
+        NSHomeDirectory(), udid];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL found = NO;
+
+    for (NSString *cuuid in [fm contentsOfDirectoryAtPath:containersPath error:nil]) {
+        NSString *containerDir = [containersPath stringByAppendingPathComponent:cuuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:containerDir error:nil]) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *infoPlist = [[containerDir stringByAppendingPathComponent:item]
+                                    stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundleID]) {
+                NSError *err = nil;
+                [fm removeItemAtPath:containerDir error:&err];
+                if (err) {
+                    fprintf(stderr, "Failed to remove container: %s\n", err.localizedDescription.UTF8String);
+                    return 1;
+                }
+                printf("  Removed bundle container: %s\n", containerDir.UTF8String);
+                found = YES;
+                break;
+            }
+        }
+        if (found) break;
+    }
+
+    if (!found) {
+        fprintf(stderr, "App %s not found in containers.\n", bundleID.UTF8String);
+        return 1;
+    }
+
+    printf("Uninstalled %s. Reboot device to update home screen.\n", bundleID.UTF8String);
+    return 0;
+}
+
+/* ── Command: openurl ── */
+
+static int cmd_openurl(NSString *udid, NSString *url) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"openurl", udid, url], 15);
+    }
+
+    /* Legacy: simctl openurl hangs. Write pending action for installer dylib. */
+    printf("openurl not directly supported on legacy simulators.\n");
+    printf("URL: %s\n", url.UTF8String);
+    printf("Use Safari on the home screen to navigate to this URL.\n");
+    return 1;
+}
+
+/* ── Command: erase ── */
+
+static int cmd_erase(NSString *udid) {
+    /* erase works through CoreSimulatorService, should work for all devices */
+    printf("Erasing device %s...\n", udid.UTF8String);
+    return run_with_timeout(@[@"xcrun", @"simctl", @"erase", udid], 30);
+}
+
+/* ── Command: spawn ── */
+
+static int cmd_spawn(NSString *udid, NSArray<NSString *> *spawnArgs) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        NSMutableArray *args = [@[@"xcrun", @"simctl", @"spawn", udid] mutableCopy];
+        [args addObjectsFromArray:spawnArgs];
+        return run_with_timeout(args, 30);
+    }
+
+    fprintf(stderr, "spawn is not supported on legacy simulators.\n");
+    fprintf(stderr, "CoreSimulator cannot communicate with legacy launchd_sim.\n");
+    fprintf(stderr, "Workaround: inject code via sim_app_installer.dylib constructor.\n");
+    return 1;
+}
+
+/* ── Command: logverbose ── */
+
+static int cmd_logverbose(NSString *udid, NSString *enabled) {
+    return run_with_timeout(@[@"xcrun", @"simctl", @"logverbose", udid, enabled], 10);
+}
+
 /* ── Usage ── */
 
 static void usage(void) {
@@ -698,13 +983,20 @@ static void usage(void) {
         "Usage: rosettasim-ctl <command> [arguments]\n"
         "\n"
         "Commands:\n"
-        "  list                          List all devices with status\n"
-        "  boot <UDID>                   Boot device\n"
-        "  shutdown <UDID|all>           Shutdown device(s)\n"
-        "  install <UDID> <app-path>     Install .app on device\n"
-        "  launch <UDID> <bundle-id>     Launch app by bundle ID\n"
-        "  screenshot <UDID> <output>    Take screenshot\n"
-        "  status <UDID>                 Show device status\n"
+        "  list                              List all devices with status\n"
+        "  boot <UDID>                       Boot device\n"
+        "  shutdown <UDID|all>               Shutdown device(s)\n"
+        "  install <UDID> <app-path>         Install .app on device\n"
+        "  uninstall <UDID> <bundle-id>      Uninstall app\n"
+        "  launch <UDID> <bundle-id>         Launch app by bundle ID\n"
+        "  openurl <UDID> <url>              Open URL on device\n"
+        "  spawn <UDID> <binary> [args]      Spawn process in device\n"
+        "  screenshot <UDID> <output>        Take screenshot\n"
+        "  listapps <UDID>                   List installed apps\n"
+        "  get_app_container <UDID> <bid> [type]  Get app container path\n"
+        "  erase <UDID>                      Erase device content\n"
+        "  logverbose <UDID> <on|off>        Toggle verbose logging\n"
+        "  status <UDID>                     Show device status\n"
         "\n"
         "Legacy runtimes (iOS 7-14.x) are handled directly.\n"
         "Native runtimes delegate to xcrun simctl.\n"
@@ -746,6 +1038,42 @@ int main(int argc, const char *argv[]) {
         else if ([cmd isEqualToString:@"screenshot"]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl screenshot <UDID> <output.png>\n"); return 1; }
             return cmd_screenshot([NSString stringWithUTF8String:argv[2]],
+                                 [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"listapps"]) {
+            if (argc < 3) { fprintf(stderr, "Usage: rosettasim-ctl listapps <UDID>\n"); return 1; }
+            return cmd_listapps([NSString stringWithUTF8String:argv[2]]);
+        }
+        else if ([cmd isEqualToString:@"get_app_container"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl get_app_container <UDID> <bundle-id> [app|data]\n"); return 1; }
+            return cmd_get_app_container([NSString stringWithUTF8String:argv[2]],
+                                        [NSString stringWithUTF8String:argv[3]],
+                                        argc > 4 ? [NSString stringWithUTF8String:argv[4]] : nil);
+        }
+        else if ([cmd isEqualToString:@"uninstall"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl uninstall <UDID> <bundle-id>\n"); return 1; }
+            return cmd_uninstall([NSString stringWithUTF8String:argv[2]],
+                                [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"openurl"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl openurl <UDID> <url>\n"); return 1; }
+            return cmd_openurl([NSString stringWithUTF8String:argv[2]],
+                              [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"erase"]) {
+            if (argc < 3) { fprintf(stderr, "Usage: rosettasim-ctl erase <UDID>\n"); return 1; }
+            return cmd_erase([NSString stringWithUTF8String:argv[2]]);
+        }
+        else if ([cmd isEqualToString:@"spawn"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl spawn <UDID> <binary> [args]\n"); return 1; }
+            NSMutableArray *spawnArgs = [NSMutableArray new];
+            for (int i = 3; i < argc; i++)
+                [spawnArgs addObject:[NSString stringWithUTF8String:argv[i]]];
+            return cmd_spawn([NSString stringWithUTF8String:argv[2]], spawnArgs);
+        }
+        else if ([cmd isEqualToString:@"logverbose"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl logverbose <UDID> <on|off>\n"); return 1; }
+            return cmd_logverbose([NSString stringWithUTF8String:argv[2]],
                                  [NSString stringWithUTF8String:argv[3]]);
         }
         else if ([cmd isEqualToString:@"status"]) {
