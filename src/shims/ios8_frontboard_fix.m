@@ -56,16 +56,31 @@ static CFDictionaryRef safe_CFDictionaryCreate(CFAllocatorRef allocator,
         if (has_nil) {
             const void *safeKeys[numValues];
             const void *safeValues[numValues];
-            CFIndex safeCount = 0;
             for (CFIndex i = 0; i < numValues; i++) {
-                if (keys[i] != NULL && values[i] != NULL) {
-                    safeKeys[safeCount] = keys[i];
-                    safeValues[safeCount] = values[i];
-                    safeCount++;
+                safeKeys[i] = keys[i] ?: (const void *)CFSTR("");
+                if (values[i] == NULL) {
+                    /* Substitute real values for nil instead of skipping */
+                    if (keys[i] && CFGetTypeID(keys[i]) == CFStringGetTypeID()) {
+                        CFStringRef key = (CFStringRef)keys[i];
+                        if (CFStringFind(key, CFSTR("bundleI"), 0).location != kCFNotFound ||
+                            CFStringFind(key, CFSTR("BundleID"), 0).location != kCFNotFound) {
+                            const char *prog = getprogname();
+                            if (prog && strstr(prog, "SpringBoard"))
+                                safeValues[i] = CFSTR("com.apple.springboard");
+                            else if (prog && strstr(prog, "backboardd"))
+                                safeValues[i] = CFSTR("com.apple.backboardd");
+                            else
+                                safeValues[i] = CFSTR("com.apple.unknown");
+                            continue;
+                        }
+                    }
+                    safeValues[i] = CFSTR("");
+                } else {
+                    safeValues[i] = values[i];
                 }
             }
             return orig_CFDictionaryCreate(allocator, safeKeys, safeValues,
-                                           safeCount, keyCallBacks, valueCallBacks);
+                                           numValues, keyCallBacks, valueCallBacks);
         }
     }
     return orig_CFDictionaryCreate(allocator, keys, values, numValues,
@@ -229,6 +244,31 @@ static void my_cxa_bad_cast(void) {
 }
 
 /* ================================================================
+ * bundleIdentifier nil fix
+ * ================================================================ */
+
+static NSString *(*orig_bundleIdentifier)(id, SEL);
+static NSString *hook_bundleIdentifier(id self, SEL _cmd) {
+    NSString *result = orig_bundleIdentifier(self, _cmd);
+    if (!result) {
+        const char *prog = getprogname();
+        if (prog) {
+            if (strstr(prog, "SpringBoard")) result = @"com.apple.springboard";
+            else if (strstr(prog, "backboardd")) result = @"com.apple.backboardd";
+            else if (strstr(prog, "assertiond")) result = @"com.apple.assertiond";
+            else result = [NSString stringWithFormat:@"com.apple.%s", prog];
+        } else {
+            result = @"com.apple.unknown";
+        }
+        static int logCount = 0;
+        if (logCount++ < 5)
+            NSLog(@"[RosettaSim] bundleIdentifier fix: returning '%@' for %s",
+                  result, prog ?: "unknown");
+    }
+    return result;
+}
+
+/* ================================================================
  * [NSBundle mainBundle] nil fix
  * ================================================================ */
 
@@ -316,6 +356,13 @@ static void fix_frontboard(void) {
     if (mainBundleMethod) {
         orig_mainBundle = (NSBundle *(*)(id, SEL))method_getImplementation(mainBundleMethod);
         method_setImplementation(mainBundleMethod, (IMP)fixed_mainBundle);
+    }
+
+    /* Fix [NSBundle bundleIdentifier] returning nil */
+    Method biMethod = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
+    if (biMethod) {
+        orig_bundleIdentifier = (NSString *(*)(id, SEL))method_getImplementation(biMethod);
+        method_setImplementation(biMethod, (IMP)hook_bundleIdentifier);
     }
 
     /* Suppress NSAssert failures — turns exceptions into log messages.

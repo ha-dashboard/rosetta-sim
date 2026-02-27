@@ -584,6 +584,7 @@ static BOOL is_legacy_runtime(id device) {
                 @"com.apple.CoreSimulator.SimRuntime.iOS-12-4",
                 @"com.apple.CoreSimulator.SimRuntime.iOS-13-7",
                 @"com.apple.CoreSimulator.SimRuntime.iOS-14-5",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-15-7",
             ];
         });
 
