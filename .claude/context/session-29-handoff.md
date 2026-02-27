@@ -2,130 +2,114 @@
 
 ## Session 28 Summary
 
-**3 commits**, focused on 2x scale fix investigation (all approaches failed) and deep protocol research.
+**10 commits**, covering scale fix investigation (failed), screenshot tooling, repo cleanup, and restructuring.
 
 ### Commit Log (Session 28)
 
 ```
+ecd0c83 refactor: restructure repo — source under src/, setup scripts separated
+0bb7e8b feat: simdeviceio screenshot plugin (source + build target)
+c7c8843 chore: remove abandoned broker/bridge code — keep working display bridge only
+a9148ea feat: daemon stores runtime_root per device for future plugin integration
+51c5558 feat: screenshot tool + simctl wrapper for legacy iOS simulators
+d7b3c26 docs: session 29 handoff — scale fix investigation, SimFramebuffer RE
 7df5543 revert: restore pt_width=pixel_width — BSMainScreenScale patch has no visual effect
 bef851c feat: 2x scale fix via BaseBoard binary patch + daemon pt_width/2
-031d00d docs: session 28 handoff — 26 commits, 10 iOS runtimes, zero-copy IOSurface
 ```
 
-### Architecture (Unchanged from Session 27)
+### Repo Structure (NEW — restructured in Session 28)
 
 ```
-┌─────────────┐    PurpleFBServer    ┌──────────────────┐
-│ backboardd  │◄────Mach msg────────►│ rosettasim_daemon │
-│ (sim-side)  │    (map_surface,     │  (host-side)      │
-│             │     flush_shmem)     │                    │
-│ Renders to  │                      │ IOSurface A (write)│
-│ IOSurface A │                      │ IOSurface B (read) │
-└─────────────┘                      │ memcpy A→B on flush│
-                                     └────────┬───────────┘
-                                              │ IOSurfaceLookup(B)
-                                     ┌────────▼───────────┐
-                                     │ sim_display_inject  │
-                                     │ (in Simulator.app)  │
-                                     │                     │
-                                     │ CADisplayLink vsync  │
-                                     │ CGImage from IOSurf  │
-                                     │ → CALayer.contents   │
-                                     │ UDID window matching │
-                                     └─────────────────────┘
+rosetta/
+  README.md
+  CLAUDE.md
+  src/
+    daemon/        rosettasim_daemon.m
+    display/       sim_display_inject.m
+    bridge/        purple_fb_bridge.m
+    screenshot/    fb_to_png.m, rosettasim_screenshot_plugin.m
+    scale/         sim_scale_fix.m
+    viewer/        sim_viewer.m
+    Makefile       builds all → src/build/
+  scripts/
+    setup.sh, start_rosettasim.sh, install_legacy_sim.sh
+    test_all_devices.sh, simctl
+  setup/
+    setup_xcode833.sh, install_sim93.sh, launch_xcode833.sh, stubs/
+  docs/
+    milestone_*.png
+  .claude/
+    context/, plans/, agents/
 ```
 
-### Key Files (Updated)
+### Runtime Compatibility Matrix
 
-| File | Purpose |
-|------|---------|
-| `tools/display_bridge/rosettasim_daemon.m` | Multi-device PurpleFBServer daemon. Now stores runtime_root per device. |
-| `tools/display_bridge/sim_display_inject.m` | Injection dylib for Simulator.app. Unchanged. |
-| `tools/display_bridge/sim_scale_fix.m` | Constructor + interpose scale fix (replaces .c). Built but NOT deployed — all approaches failed. |
-| `tools/display_bridge/Makefile` | scale_fix now uses iOS sim target flags. |
-| `scripts/start_rosettasim.sh` | grep patterns now include iOS 12.4. |
-| `scripts/install_legacy_sim.sh` | Documented iOS 13.7/14.5 launchd crash. |
-| `.claude/context/session-28-findings.md` | SimFramebuffer API, PurpleFB fallback, crash analysis. |
+| iOS | Display Protocol | Status |
+|-----|-----------------|--------|
+| 9.3 | PurpleFBServer | Working (scale=1, square icons) |
+| 10.3 | PurpleFBServer | Working (scale=1, square icons) |
+| 12.4 | PurpleFBServer | Working (100% coverage, full display) |
+| 13.7 | Crashes | launchd bootstrap failure on macOS 26 |
+| 14.5 | Crashes | launchd bootstrap failure on macOS 26 |
+| 15.7+ | Native | Works natively via SimRenderServer |
 
-### Runtime Compatibility Matrix (UPDATED from Session 28)
+### Screenshot Support
 
-| iOS | Build | Display Protocol | Status | Notes |
-|-----|-------|-----------------|--------|-------|
-| 9.3 | 13E233 | PurpleFBServer | ✅ Working (scale=1) | Square icons, no wallpaper |
-| 10.3 | 14E8301 | PurpleFBServer | ✅ Working (scale=1) | Square icons, no wallpaper |
-| 12.4 | 16G73 | PurpleFBServer | ✅ Working (100% coverage) | Full display |
-| 13.7 | 17H22 | PurpleFB (has strings) | ❌ Crashes on boot | launchd bootstrap failure |
-| 14.5 | 18E182 | PurpleFB (has strings) | ❌ Crashes on boot | launchd bootstrap failure |
-| 15.7 | 19H12 | Native (SimRenderServer) | ✅ Works natively | |
-| 16.4 | 20E247 | Native | ✅ Works natively | |
-| 17.4 | 21E213 | Native | ✅ Works natively | |
-| 18.0 | 22A3351 | Native | ✅ Works natively | |
-| 26.2 | 23C54 | Native | ✅ Works natively | |
+- `scripts/simctl io <UDID> screenshot <file>` — works for ALL devices
+  - Legacy: reads daemon's IOSurface via `fb_to_png` tool
+  - Native: delegates to `xcrun simctl io screenshot`
+- Native `xcrun simctl io screenshot` for legacy: NOT possible without modifying Apple's signed binaries
 
-**Missing**: iOS 7, 8, 11 (CDN returns 403; need Xcode 7.3.1/9.4.1 with Apple ID auth)
+### Scale Fix Attempts (ALL FAILED)
 
-### Session 28 Scale Fix Attempts (ALL FAILED)
+| Approach | Result |
+|----------|--------|
+| DYLD_INSERT via SIMCTL_CHILD | launchd_sim strips DYLD_ vars |
+| insert_dylib + __interpose | dyld_sim ignores interpose for LC_LOAD_DYLIB |
+| insert_dylib + constructor | Infinite unmap/remap loop |
+| BaseBoard binary patch | BSMainScreenScale→2.0 doesn't reach Display::set_scale |
+| Constant patch (Session 27) | Breaks display init entirely |
 
-| # | Approach | Result |
-|---|----------|--------|
-| 1 | SIMCTL_CHILD_DYLD_INSERT_LIBRARIES | launchd_sim strips all DYLD_ env vars |
-| 2 | insert_dylib + __interpose section | Dylib loads but dyld_sim ignores __interpose for LC_LOAD_DYLIB |
-| 3 | insert_dylib + constructor setScale:2.0 | Causes infinite unmap/remap loop (setScale triggers display_changed → unmap → map → repeat) |
-| 4 | BaseBoard binary patch (BSMainScreenScale→2.0) | Function returns 2.0 but value never reaches Display::set_scale — no visual change |
-| 5 | Constant patch at 0xbb460 (Session 27) | Broke display init entirely (zero flushes) |
+### simdeviceio Plugin Attempts (ALL FAILED)
 
-**Root cause still unsolved**: BSMainScreenScale returns 2.0 after patch, but the code path from BSMainScreenScale → Display::set_scale is broken or bypassed. The scale value is consumed somewhere that doesn't affect the display geometry.
+| Approach | Result |
+|----------|--------|
+| Custom .simdeviceio bundle | CoreSimulatorService won't load third-party plugins |
+| insert_dylib into IndigoLegacy | Plugin never loads for legacy devices |
+| DYLD_INSERT into CoreSimulatorService | Binary has library-validation flag |
 
-**Next approach to try**: RE the exact code path in backboardd from BSMainScreenScale() call site to Display::set_scale(). Find where the value is stored, what conditions gate the set_scale call, and whether there's a check that prevents it on simulator. This is a Ghidra/disassembly task on the iOS 9.3 backboardd binary.
-
-### Agent Findings (Session 28)
+### Session 28 Findings
 
 | # | Agent | Finding |
 |---|-------|---------|
-| 37 | A | SimFramebuffer protocol RE: iOS 13.7 uses SFB API (SFBConnection/SFBDisplay/SFBSwapchain), IOSurface swapchains. SimFramebufferClient is a dlopen shim to host-side framework. |
-| 37b | A | iOS 13.7 QuartzCore has both SimDisplay AND PurpleDisplay code paths. headServices triggers PurpleFB path. |
-| 38 | A | BSMainScreenScale is in BaseBoard.framework (not BackBoardServices). Patched function entry to return 2.0 — no visual effect. |
-| 39 | A | Constructor setScale:2.0 fires but triggers infinite unmap/remap loop. set_scale → update_geometry → post_display_changed → unmap_surface → map_surface → repeat. |
-| 40 | A | Per-runtime scale function mapping: iOS 9.3/10.3 use BSMainScreenScale (imported), iOS 13.7 uses BKMainDisplayScaleFromMobileGestalt (local, not interposable). |
-| 41 | C | CDN dead end for iOS 8/11. Only Xcode 7.3.1/9.4.1 contain these runtimes. |
-| 42 | C | Complete SimFramebuffer C API extracted: 3 object types (Connection, Display, Swapchain), full function list, rendering flow documented. |
-| 43 | C | PurpleFBServer strings confirmed in ALL runtimes through iOS 14.5. But 13.7/14.5 crash during launchd bootstrap on macOS 26 before reaching display init. |
-| 44 | C | iOS 13.7/14.5 crash analysis: "Failed to bootstrap path: .../backboardd, error = 2" — macOS 26 launchd rejects these binaries during XPC bootstrap. |
+| 37 | A | SimFramebuffer protocol RE (SFB API, IOSurface swapchains) |
+| 38 | A | Screenshot via Display port descriptor (SimDisplayIOSurfaceRenderable) |
+| 39 | A | SimDevice → Display port selector chain |
+| 40 | A | Screenshot IOSurface transport via XPC/ROCKit |
+| 41 | A | simdeviceio plugin bundle structure + loading mechanism |
+| 42 | C | Complete SFB C API surface (SFBConnection/SFBDisplay/SFBSwapchain) |
+| 43 | C | PurpleFBServer in all runtimes through iOS 14.5 |
+| 44 | C | iOS 13.7/14.5 crash during launchd bootstrap |
+| 45 | C | Display port class hierarchy (SimDisplayIOSurfaceRenderable) |
+| 46 | B | IndigoLegacyFramebufferServices never loads for legacy devices |
 
 ### Session 29 Priorities
 
-#### P1: 2x Scale (Deeper RE Required)
-- Must trace BSMainScreenScale → Display::set_scale in backboardd disassembly
-- Key question: does backboardd CALL set_scale at all? Or does it rely on the host framework to set it?
-- Check if CAWindowServer::init sets scale from BSMainScreenScale or if it's a different path
-- The Ghidra instance should have iOS 9.3 backboardd loaded
+#### P1: 2x Scale (Deeper RE)
+- Must trace BSMainScreenScale → Display::set_scale in backboardd
+- The function returns 2.0 after binary patch but value never reaches set_scale
+- Need to find the exact code path and what conditions gate the call
+- Ghidra RE task on iOS 9.3 backboardd
 
-#### P2: iOS 13.7/14.5 Boot Fix (launchd Compatibility)
-- These crash during launchd bootstrap, not display protocol
-- Need to understand what XPC/launchd changes in macOS 26 break iOS 13.x binaries
-- May require patching launchd_sim or the runtime's launchd plists
-- Lower priority than P1 since 15.7+ works natively
+#### P2: iOS 8/11 Runtimes
+- CDN 403 for both — needs Xcode 7.3.1 (iOS 8) or 9.4.1 (iOS 11) with Apple ID auth
 
-#### P3: Install iOS 8/11
-- Requires Apple ID auth for Xcode 7.3.1 (iOS 8) or 9.4.1 (iOS 11)
-- User must initiate the download
-- Once downloaded, extract sim runtime and use install_legacy_sim.sh --patch-all
+#### P3: Native simctl Screenshot
+- Requires deeper CoreSimulator integration (modifying SimRenderServer's display descriptor)
+- Or implementing a full SimRenderServer-compatible display service
+- Low priority — scripts/simctl wrapper works
 
-### What's Working Well
-- Multi-device simultaneous display in Simulator.app
-- UDID-based window matching (no name collisions)
-- Double-buffered IOSurface (no tearing)
-- CADisplayLink vsync-aligned rendering
-- Zero file I/O display pipeline
-- Daemon resilience (SIGTERM, watchdog, dynamic alloc)
-- 10 iOS runtimes installed (9.3 through 26.2)
-- iOS 12.4 at 100% pixel coverage
-- iOS 9.3/10.3 working at scale=1 (functional, interactive)
-- start_rosettasim.sh updated for iOS 12.4
-
-### Known Issues
-- Square icons on iOS 9.3/10.3 (scale=1.0, needs deeper RE)
-- No wallpaper on iOS 9.3/10.3 (procedural wallpaper fails at scale=1.0)
-- iOS 13.7/14.5 crash during launchd bootstrap on macOS 26
-- iOS 8/11 runtimes unavailable (CDN 403, need old Xcode)
-- 30 flushes then stops on iOS 9.3 (render stall after initial boot — possibly normal idle behavior)
+### Communication Protocol
+- Documented in `~/.claude/CLAUDE.md`
+- Use `mcp__happy-mcp__happy_send_message` (NOT built-in SendMessage)
+- Sign off: `[Role - session_id]`
