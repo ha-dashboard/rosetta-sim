@@ -179,6 +179,90 @@ static void safe_addObject(id self, SEL _cmd, id obj) {
 }
 
 /* ================================================================
+ * C++ exception logging — intercept __cxa_throw and __cxa_bad_cast
+ * ================================================================ */
+
+static void (*orig_cxa_throw)(void *, void *, void (*)(void *));
+static void my_cxa_throw(void *thrown_exception, void *tinfo, void (*dest)(void *)) {
+    void *bt[32];
+    int count = backtrace(bt, 32);
+    int fd = open("/tmp/rosettasim_cxa_throw.txt",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char buf[256];
+        /* Try to get type name from typeinfo */
+        const char *tname = "unknown";
+        if (tinfo) {
+            /* std::type_info layout: vtable ptr at [0], name at [1] */
+            const char **ti = (const char **)tinfo;
+            if (ti[1]) tname = ti[1];
+        }
+        int len = snprintf(buf, sizeof(buf),
+            "[RosettaSim] __cxa_throw: type=%s tinfo=%p pid=%d\n",
+            tname, tinfo, getpid());
+        write(fd, buf, len);
+        backtrace_symbols_fd(bt, count, fd);
+        write(fd, "\n", 1);
+        close(fd);
+    }
+    orig_cxa_throw(thrown_exception, tinfo, dest);
+    __builtin_unreachable();
+}
+
+static void (*orig_cxa_bad_cast)(void);
+static void my_cxa_bad_cast(void) {
+    void *bt[32];
+    int count = backtrace(bt, 32);
+    int fd = open("/tmp/rosettasim_cxa_throw.txt",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf),
+            "[RosettaSim] __cxa_bad_cast pid=%d\n", getpid());
+        write(fd, buf, len);
+        backtrace_symbols_fd(bt, count, fd);
+        write(fd, "\n", 1);
+        close(fd);
+    }
+    orig_cxa_bad_cast();
+    __builtin_unreachable();
+}
+
+/* ================================================================
+ * [NSBundle mainBundle] nil fix
+ * ================================================================ */
+
+static NSBundle *(*orig_mainBundle)(id, SEL);
+static NSBundle *fixed_mainBundle(id self, SEL _cmd) {
+    NSBundle *bundle = orig_mainBundle(self, _cmd);
+    if (!bundle) {
+        static NSBundle *fallback = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            NSString *execPath = [NSProcessInfo processInfo].arguments.firstObject;
+            if (execPath) {
+                /* Walk up to find .app directory */
+                NSString *path = execPath;
+                while (path.length > 1 && ![[path pathExtension] isEqualToString:@"app"]) {
+                    path = [path stringByDeletingLastPathComponent];
+                }
+                if ([[path pathExtension] isEqualToString:@"app"]) {
+                    fallback = [NSBundle bundleWithPath:path];
+                    NSLog(@"[RosettaSim] mainBundle fix: created fallback from %@", path);
+                }
+            }
+            if (!fallback) {
+                fallback = [NSBundle bundleForClass:NSClassFromString(@"SpringBoard")]
+                    ?: [NSBundle bundleWithPath:@"/System/Library/CoreServices/SpringBoard.app"];
+                NSLog(@"[RosettaSim] mainBundle fix: using last resort path");
+            }
+        });
+        return fallback;
+    }
+    return bundle;
+}
+
+/* ================================================================
  * Constructor
  * ================================================================ */
 
@@ -206,6 +290,12 @@ static void fix_frontboard(void) {
         fclose(f2);
     }
 
+    /* Rebind __cxa_throw and __cxa_bad_cast for C++ exception logging */
+    orig_cxa_throw = NULL;
+    rebind_symbol("__cxa_throw", (void *)my_cxa_throw, (void **)&orig_cxa_throw);
+    orig_cxa_bad_cast = NULL;
+    rebind_symbol("__cxa_bad_cast", (void *)my_cxa_bad_cast, (void **)&orig_cxa_bad_cast);
+
     /* Swizzle __NSArrayM */
     Class cls = objc_getClass("__NSArrayM");
     if (cls) {
@@ -218,6 +308,38 @@ static void fix_frontboard(void) {
         if (m2) {
             orig_addObject = (void *)method_getImplementation(m2);
             method_setImplementation(m2, (IMP)safe_addObject);
+        }
+    }
+
+    /* Fix [NSBundle mainBundle] returning nil */
+    Method mainBundleMethod = class_getClassMethod([NSBundle class], @selector(mainBundle));
+    if (mainBundleMethod) {
+        orig_mainBundle = (NSBundle *(*)(id, SEL))method_getImplementation(mainBundleMethod);
+        method_setImplementation(mainBundleMethod, (IMP)fixed_mainBundle);
+    }
+
+    /* Suppress NSAssert failures — turns exceptions into log messages.
+     * Under Rosetta 2, ObjC exceptions → std::terminate → crash.
+     * This intercepts ALL NSAssert/NSCAssert before they throw. */
+    Class ahCls = objc_getClass("NSAssertionHandler");
+    if (ahCls) {
+        SEL sel1 = sel_registerName("handleFailureInMethod:object:file:lineNumber:description:");
+        Method am1 = class_getInstanceMethod(ahCls, sel1);
+        if (am1) {
+            method_setImplementation(am1, imp_implementationWithBlock(
+                ^(id self, SEL sel, id obj, NSString *file, NSInteger line, NSString *desc) {
+                    NSLog(@"[RosettaSim] ASSERTION SUPPRESSED: %@ (line %ld in %@)",
+                          desc, (long)line, file);
+                }));
+        }
+        SEL sel2 = sel_registerName("handleFailureInFunction:file:lineNumber:description:");
+        Method am2 = class_getInstanceMethod(ahCls, sel2);
+        if (am2) {
+            method_setImplementation(am2, imp_implementationWithBlock(
+                ^(id self, NSString *func, NSString *file, NSInteger line, NSString *desc) {
+                    NSLog(@"[RosettaSim] ASSERTION SUPPRESSED: %@ in %@ (line %ld in %@)",
+                          desc, func, (long)line, file);
+                }));
         }
     }
 }
