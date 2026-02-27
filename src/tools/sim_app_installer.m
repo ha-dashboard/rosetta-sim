@@ -76,13 +76,22 @@ static void process_pending_installs(void) {
         return;
     }
 
-    /* Get install function */
-    typedef int (*MIInstallForLS)(id path, id options, id statusCB, id progressCB);
-    MIInstallForLS installFn = (MIInstallForLS)dlsym(handle, "MobileInstallationInstallForLaunchServices");
-    if (!installFn) {
-        log_result("[installer] ERROR: MobileInstallationInstallForLaunchServices not found");
+    /* Get install functions — try both variants.
+     * Return type may be int (0=success) or id (nil=success, NSError*=failure).
+     * We handle both by checking if return value looks like a pointer or zero. */
+    typedef long (*MIInstallForLS)(id path, id options, id statusCB, id progressCB);
+    typedef long (*MIInstallFn)(id path, id options, void *callback, void *ctx);
+
+    MIInstallForLS installForLS = (MIInstallForLS)dlsym(handle, "MobileInstallationInstallForLaunchServices");
+    MIInstallFn installBasic = (MIInstallFn)dlsym(handle, "MobileInstallationInstall");
+
+    if (!installForLS && !installBasic) {
+        log_result("[installer] ERROR: No MobileInstallation install function found");
         return;
     }
+
+    log_result("[installer] Available APIs: ForLaunchServices=%s, Install=%s",
+               installForLS ? "YES" : "NO", installBasic ? "YES" : "NO");
 
     int success_count = 0;
     int fail_count = 0;
@@ -105,17 +114,71 @@ static void process_pending_installs(void) {
 
         log_result("[installer] Installing %s from %s...", bundleID.UTF8String, appPath.UTF8String);
 
+        /* Build options with extra fields for LaunchServices registration */
         NSDictionary *options = @{
             @"ApplicationType": @"User",
+            @"CFBundleIdentifier": bundleID,
+            @"SignerIdentity": @"-",
+            @"IsAdHocSigned": @YES,
+            @"SkipUninstall": @YES,
         };
 
-        int result = installFn(appPath, options, nil, nil);
+        long result = -1;
+        BOOL success = NO;
 
-        if (result == 0) {
+        /* Try MobileInstallationInstallForLaunchServices first */
+        if (installForLS) {
+            log_result("[installer] Trying MobileInstallationInstallForLaunchServices...");
+            result = installForLS(appPath, options, nil, nil);
+            log_result("[installer] ForLaunchServices returned: %ld (0x%lx)", result, result);
+            /* Return 0 = success. Non-zero could be error code or pointer to error object. */
+            if (result == 0) {
+                success = YES;
+            } else if (result > 0x10000) {
+                /* Likely a pointer to NSError */
+                @try {
+                    id errObj = (__bridge id)(void *)result;
+                    if ([errObj isKindOfClass:[NSError class]]) {
+                        log_result("[installer] ForLaunchServices error: %s",
+                                   ((NSError *)errObj).localizedDescription.UTF8String);
+                    } else {
+                        log_result("[installer] ForLaunchServices returned object: %s",
+                                   [errObj description].UTF8String);
+                    }
+                } @catch (id e) {
+                    log_result("[installer] ForLaunchServices returned non-zero: %ld", result);
+                }
+            }
+        }
+
+        /* If ForLaunchServices failed, try basic MobileInstallationInstall */
+        if (!success && installBasic) {
+            log_result("[installer] Trying MobileInstallationInstall (basic)...");
+            result = installBasic(appPath, options, NULL, NULL);
+            log_result("[installer] Install (basic) returned: %ld (0x%lx)", result, result);
+            if (result == 0) {
+                success = YES;
+            } else if (result > 0x10000) {
+                @try {
+                    id errObj = (__bridge id)(void *)result;
+                    if ([errObj isKindOfClass:[NSError class]]) {
+                        log_result("[installer] Install error: %s",
+                                   ((NSError *)errObj).localizedDescription.UTF8String);
+                    } else {
+                        log_result("[installer] Install returned object: %s",
+                                   [errObj description].UTF8String);
+                    }
+                } @catch (id e) {
+                    log_result("[installer] Install returned non-zero: %ld", result);
+                }
+            }
+        }
+
+        if (success) {
             log_result("[installer] OK: %s installed successfully", bundleID.UTF8String);
             success_count++;
         } else {
-            log_result("[installer] FAIL: %s install returned %d", bundleID.UTF8String, result);
+            log_result("[installer] FAIL: %s — all install methods failed", bundleID.UTF8String);
             fail_count++;
         }
     }
