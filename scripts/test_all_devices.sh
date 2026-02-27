@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - rosettasim_daemon running (starts automatically if not)
-#   - tools built: make -C tools/display_bridge
+#   - tools built: make -C src
 #
 # Usage:
 #   ./scripts/test_all_devices.sh              # test all legacy runtimes
@@ -17,7 +17,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOLS="$PROJECT_ROOT/tools/display_bridge"
+TOOLS="$PROJECT_ROOT/src/build"
 
 TEST_ALL=0
 [[ "${1:-}" == "--all" ]] && TEST_ALL=1

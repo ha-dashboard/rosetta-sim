@@ -13,7 +13,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOOLS_DIR="$PROJECT_ROOT/tools/display_bridge"
+SRC_DIR="$PROJECT_ROOT/src"
+BUILD_DIR="$SRC_DIR/build"
 
 SIMULATOR_SRC="/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app"
 SIMULATOR_DST="/tmp/Simulator_nolv.app"
@@ -71,7 +72,7 @@ echo ""
 
 # --- Step 2: Build tools ---
 echo "Building display bridge tools..."
-cd "$TOOLS_DIR"
+cd "$SRC_DIR"
 make clean
 make
 echo ""
@@ -203,9 +204,10 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Tools built:"
-echo "  $TOOLS_DIR/purple_fb_bridge"
-echo "  $TOOLS_DIR/sim_display_inject.dylib"
-echo "  $TOOLS_DIR/sim_viewer"
+echo "  $BUILD_DIR/rosettasim_daemon"
+echo "  $BUILD_DIR/sim_display_inject.dylib"
+echo "  $BUILD_DIR/purple_fb_bridge"
+echo "  $BUILD_DIR/sim_viewer"
 echo ""
 echo "Re-signed Simulator:"
 echo "  $SIMULATOR_DST"
@@ -214,7 +216,5 @@ echo "Available legacy devices:"
 xcrun simctl list devices 2>&1 | grep -E '9\.3|10\.3' | grep -v unavailable | sed 's/^/  /'
 echo ""
 echo "To run:"
-echo "  ./scripts/run_legacy_sim.sh \"iPhone 6s\""
-echo "  ./scripts/run_legacy_sim.sh \"iPad Pro\""
-echo "  ./scripts/run_legacy_sim.sh --ios10"
+echo "  ./scripts/start_rosettasim.sh"
 echo ""

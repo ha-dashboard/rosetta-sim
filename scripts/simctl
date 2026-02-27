@@ -19,12 +19,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-FB_TO_PNG="$PROJECT_ROOT/tools/display_bridge/fb_to_png"
+FB_TO_PNG="$PROJECT_ROOT/src/build/fb_to_png"
 
 # Build fb_to_png if needed
 build_fb_to_png() {
     if [[ ! -x "$FB_TO_PNG" ]]; then
-        local src="$PROJECT_ROOT/tools/display_bridge/fb_to_png.m"
+        local src="$PROJECT_ROOT/src/screenshot/fb_to_png.m"
         if [[ ! -f "$src" ]]; then
             # Create source inline
             src="/tmp/fb_to_png_build.m"

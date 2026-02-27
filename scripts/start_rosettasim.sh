@@ -19,8 +19,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DAEMON="$PROJECT_ROOT/tools/display_bridge/rosettasim_daemon"
-INJECT="$PROJECT_ROOT/tools/display_bridge/sim_display_inject.dylib"
+DAEMON="$PROJECT_ROOT/src/build/rosettasim_daemon"
+INJECT="$PROJECT_ROOT/src/build/sim_display_inject.dylib"
 SIMULATOR="/tmp/Simulator_nolv.app/Contents/MacOS/Simulator"
 DYLD_FW_PATH="/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks:/Library/Developer/PrivateFrameworks"
 
@@ -102,7 +102,7 @@ fi
 echo "  Daemon running (PID $DAEMON_PID)"
 
 # --- Step 2a: Set scale fix for sim processes ---
-SCALE_FIX="$PROJECT_ROOT/tools/display_bridge/sim_scale_fix.dylib"
+SCALE_FIX="$PROJECT_ROOT/src/build/sim_scale_fix.dylib"
 if [[ -f "$SCALE_FIX" ]]; then
     export SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$SCALE_FIX"
     export SIMCTL_CHILD_ROSETTA_SCREEN_SCALE=2
