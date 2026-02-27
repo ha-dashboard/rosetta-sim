@@ -29,6 +29,7 @@ CDN_BASE="https://devimages-cdn.apple.com/downloads/xcode/simulators"
 SDK_STUB_DIR="/Library/Developer/CoreSimulator/Profiles/Runtimes"
 XCODES="/opt/homebrew/bin/xcodes"
 KEEP_XCODE=0
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -340,6 +341,79 @@ PROFILEPLIST
 }
 
 # =============================================================================
+# =============================================================================
+# Post-install runtime modifications
+# =============================================================================
+
+patch_runtime_binaries() {
+    local VERSION="$1"
+    local RUNTIME_DIR="$2"
+    local RTROOT="$RUNTIME_DIR/Contents/Resources/RuntimeRoot"
+    local MAJOR
+    MAJOR=$(echo "$VERSION" | cut -d. -f1)
+
+    # --- SimFramebufferClient stub (iOS 12+) ---
+    # Prevents backboardd ud2 trap from SimFramebufferClient framework
+    local SFB_STUB="$PROJECT_ROOT/src/build/SimFramebufferClient"
+    local SFB_FW="$RTROOT/System/Library/PrivateFrameworks/SimFramebufferClient.framework"
+    if [ -f "$SFB_STUB" ] && [ -d "$SFB_FW" ] && [ "$MAJOR" -ge 12 ]; then
+        if [ ! -f "$SFB_FW/SimFramebufferClient.orig" ]; then
+            cp "$SFB_FW/SimFramebufferClient" "$SFB_FW/SimFramebufferClient.orig" 2>/dev/null || true
+        fi
+        cp "$SFB_STUB" "$SFB_FW/SimFramebufferClient"
+        codesign --force --sign - "$SFB_FW/SimFramebufferClient" 2>/dev/null
+        log "Deployed SimFramebufferClient stub (iOS $VERSION)"
+    fi
+
+    # --- App installer dylib (all legacy runtimes) ---
+    local INSTALLER="$PROJECT_ROOT/src/build/sim_app_installer.dylib"
+    local SB="$RTROOT/System/Library/CoreServices/SpringBoard.app/SpringBoard"
+    if [ -f "$INSTALLER" ] && [ -f "$SB" ]; then
+        if ! otool -L "$SB" 2>/dev/null | grep -q sim_app_installer; then
+            cp "$INSTALLER" "$RTROOT/usr/lib/" 2>/dev/null
+            codesign --force --sign - "$RTROOT/usr/lib/sim_app_installer.dylib" 2>/dev/null
+            cp "$SB" "${SB}.orig_installer" 2>/dev/null || true
+            insert_dylib --inplace --all-yes /usr/lib/sim_app_installer.dylib "$SB" 2>/dev/null
+            codesign --force --sign - --options=0 "$SB" 2>/dev/null
+            log "Patched SpringBoard with app installer"
+        fi
+    fi
+
+    # --- Scale fix (iOS 9.x/10.x) ---
+    local SCALE_FIX="$PROJECT_ROOT/src/build/sim_scale_fix.dylib"
+    local BB="$RTROOT/usr/libexec/backboardd"
+    if [ -f "$SCALE_FIX" ] && [ -f "$BB" ] && [ "$MAJOR" -le 10 ]; then
+        if [ ! -f "$RTROOT/usr/lib/sim_scale_fix.dylib" ]; then
+            cp "$SCALE_FIX" "$RTROOT/usr/lib/"
+            codesign --force --sign - "$RTROOT/usr/lib/sim_scale_fix.dylib" 2>/dev/null
+            log "Deployed scale fix dylib"
+        fi
+        if ! otool -L "$BB" 2>/dev/null | grep -q sim_scale_fix; then
+            cp "$BB" "${BB}.orig" 2>/dev/null || true
+            insert_dylib --inplace --all-yes /usr/lib/sim_scale_fix.dylib "$BB" 2>/dev/null
+            codesign --force --sign - --options=0 "$BB" 2>/dev/null
+            log "Patched backboardd with scale fix"
+        fi
+    fi
+
+    # --- HID backport (iOS 12.4) ---
+    local HID_BACKPORT="$PROJECT_ROOT/src/build/hid_backport.dylib"
+    if [ -f "$HID_BACKPORT" ] && [ -f "$BB" ] && [ "$VERSION" = "12.4" ]; then
+        if ! otool -L "$BB" 2>/dev/null | grep -q hid_backport; then
+            cp "$HID_BACKPORT" "$RTROOT/usr/lib/"
+            codesign --force --sign - --options=0 "$RTROOT/usr/lib/hid_backport.dylib" 2>/dev/null
+            # backboardd may already have been patched by scale_fix above
+            if [ ! -f "${BB}.orig" ]; then
+                cp "$BB" "${BB}.orig" 2>/dev/null || true
+            fi
+            insert_dylib --inplace --all-yes /usr/lib/hid_backport.dylib "$BB" 2>/dev/null
+            codesign --force --sign - --options=0 "$BB" 2>/dev/null
+            log "Patched backboardd with HID backport"
+        fi
+    fi
+}
+
+# =============================================================================
 # Install from old Xcode via xcodes CLI
 # =============================================================================
 
@@ -506,6 +580,9 @@ install_from_xcode() {
         generate_profile_plist "$VERSION" "$RUNTIME_DIR"
     fi
 
+    # Patch runtime binaries (SFB stub, app installer, scale fix, HID backport)
+    patch_runtime_binaries "$VERSION" "$RUNTIME_DIR"
+
     # Cleanup Xcode (unless --keep-xcode)
     if [ "$KEEP_XCODE" -eq 0 ]; then
         local xcode_size
@@ -660,6 +737,9 @@ install_version() {
             [ -f "$lib" ] && codesign --force --sign - "$lib" 2>/dev/null
         done
     fi
+
+    # Patch runtime binaries (SFB stub, app installer, scale fix, HID backport)
+    patch_runtime_binaries "$VERSION" "$RUNTIME_DIR"
 
     # Cleanup
     rm -rf "$EXTRACT_DIR" "$MOUNT_POINT" 2>/dev/null

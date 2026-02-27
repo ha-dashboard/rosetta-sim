@@ -28,57 +28,7 @@
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
 extern mach_port_t bootstrap_port;
 
-/* fishhook GOT rebinding */
-#include <mach-o/nlist.h>
-#include <mach-o/loader.h>
-
-static void rebind_symbol(const char *name, void *replacement, void **original) {
-    void *sym = dlsym(RTLD_DEFAULT, name);
-    if (sym && original) *original = sym;
-    uint32_t imgcount = _dyld_image_count();
-    for (uint32_t i = 0; i < imgcount; i++) {
-        const struct mach_header_64 *header =
-            (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!header || header->magic != MH_MAGIC_64) continue;
-        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        const struct load_command *cmd = (void *)((char *)header + sizeof(*header));
-        const struct segment_command_64 *linkedit_seg = NULL, *data_seg = NULL;
-        const struct symtab_command *symtab_cmd = NULL;
-        const struct dysymtab_command *dysymtab = NULL;
-        for (uint32_t j = 0; j < header->ncmds; j++) {
-            if (cmd->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (void *)cmd;
-                if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit_seg = seg;
-                else if (strcmp(seg->segname, "__DATA") == 0) data_seg = seg;
-            } else if (cmd->cmd == LC_SYMTAB) symtab_cmd = (void *)cmd;
-            else if (cmd->cmd == LC_DYSYMTAB) dysymtab = (void *)cmd;
-            cmd = (void *)((char *)cmd + cmd->cmdsize);
-        }
-        if (!linkedit_seg || !data_seg || !symtab_cmd || !dysymtab) continue;
-        uintptr_t linkedit_base = slide + linkedit_seg->vmaddr - linkedit_seg->fileoff;
-        const struct nlist_64 *syms = (void *)(linkedit_base + symtab_cmd->symoff);
-        const char *strtab = (void *)(linkedit_base + symtab_cmd->stroff);
-        const uint32_t *indirect_syms = (void *)(linkedit_base + dysymtab->indirectsymoff);
-        const struct section_64 *sec = (void *)((char *)data_seg + sizeof(*data_seg));
-        for (uint32_t s = 0; s < data_seg->nsects; s++, sec++) {
-            uint32_t type = sec->flags & SECTION_TYPE;
-            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-            uint32_t nptrs = (uint32_t)(sec->size / sizeof(void *));
-            void **ptrs = (void **)(slide + sec->addr);
-            for (uint32_t p = 0; p < nptrs; p++) {
-                uint32_t symidx = indirect_syms[sec->reserved1 + p];
-                if (symidx == INDIRECT_SYMBOL_ABS || symidx == INDIRECT_SYMBOL_LOCAL) continue;
-                if (symidx >= symtab_cmd->nsyms) continue;
-                const char *sname = strtab + syms[symidx].n_un.n_strx;
-                if (sname[0] == '_') sname++;
-                if (strcmp(sname, name) == 0) {
-                    if (original && *original == NULL) *original = ptrs[p];
-                    ptrs[p] = replacement;
-                }
-            }
-        }
-    }
-}
+/* No fishhook needed — using __DATA,__interpose instead */
 
 /* Forward declaration */
 static void hid_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -250,10 +200,20 @@ static bool hook_SpawnLoopback(void *hidSystem) {
 }
 
 /* ================================================================
- * Constructor — binary patch + diagnostics
+ * DYLD __interpose section — processed at load time, before constructors
  * ================================================================ */
 
-#include <sys/mman.h>
+/* Declare the original function for the interpose table */
+extern bool IndigoHIDSystemSpawnLoopback(void *hidSystem);
+
+__attribute__((used, section("__DATA,__interpose")))
+static struct { void *replacement; void *original; } interpose_table[] = {
+    { (void *)hook_SpawnLoopback, (void *)IndigoHIDSystemSpawnLoopback },
+};
+
+/* ================================================================
+ * Constructor — diagnostics only (interpose already happened at load time)
+ * ================================================================ */
 
 __attribute__((constructor))
 static void hid_backport_init(void) {
@@ -262,36 +222,7 @@ static void hid_backport_init(void) {
 
     fprintf(out, "\n=== [HID-backport] constructor pid=%d prog=%s ===\n",
             getpid(), getprogname());
-
-    /* 1. Find the original function */
-    void *orig = dlsym(RTLD_DEFAULT, "IndigoHIDSystemSpawnLoopback");
-    fprintf(out, "  IndigoHIDSystemSpawnLoopback = %p\n", orig);
-
-    if (orig) {
-        /* 2. Make the page writable */
-        uintptr_t page = (uintptr_t)orig & ~(uintptr_t)0xFFF;
-        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x2000,
-                                       false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-        fprintf(out, "  vm_protect(RWX): kr=%d\n", kr);
-
-        if (kr == KERN_SUCCESS) {
-            /* 3. Write JMP to our hook: movabs rax, <addr>; jmp rax (12 bytes) */
-            uint8_t *p = (uint8_t *)orig;
-            p[0] = 0x48; p[1] = 0xB8; /* movabs rax, imm64 */
-            *(uint64_t *)(p + 2) = (uint64_t)hook_SpawnLoopback;
-            p[10] = 0xFF; p[11] = 0xE0; /* jmp rax */
-
-            /* 4. Restore protection */
-            vm_protect(mach_task_self(), (vm_address_t)page, 0x2000,
-                       false, VM_PROT_READ | VM_PROT_EXECUTE);
-
-            fprintf(out, "  PATCHED: %p → %p (12 bytes)\n", orig, (void *)hook_SpawnLoopback);
-        } else {
-            fprintf(out, "  FAILED: vm_protect denied\n");
-        }
-    } else {
-        fprintf(out, "  Symbol not found — no patch applied\n");
-    }
+    fprintf(out, "  g_hid_recv_port = 0x%x (0=interpose didn't fire)\n", g_hid_recv_port);
 
     const char *envs[] = {
         "SIMULATOR_UDID", "DYLD_ROOT_PATH",

@@ -730,6 +730,30 @@ static void inject_init(void) {
                    dispatch_get_main_queue(), ^{
         /* Install keyboard crash fix (must be after Simulator init completes) */
         install_keyboard_swizzle();
+
+        /* Suppress NSAssertionHandler to prevent assertion crashes during
+         * touch interaction with legacy simulator windows */
+        Class ahCls = objc_getClass("NSAssertionHandler");
+        if (ahCls) {
+            SEL sel1 = sel_registerName("handleFailureInMethod:object:file:lineNumber:description:");
+            Method am1 = class_getInstanceMethod(ahCls, sel1);
+            if (am1) {
+                method_setImplementation(am1, imp_implementationWithBlock(
+                    ^(id self, SEL sel, id obj, NSString *file, NSInteger line, NSString *desc) {
+                        NSLog(@"[inject] ASSERTION SUPPRESSED: %@ (line %ld in %@)", desc, (long)line, file);
+                    }));
+            }
+            SEL sel2 = sel_registerName("handleFailureInFunction:file:lineNumber:description:");
+            Method am2 = class_getInstanceMethod(ahCls, sel2);
+            if (am2) {
+                method_setImplementation(am2, imp_implementationWithBlock(
+                    ^(id self, NSString *func, NSString *file, NSInteger line, NSString *desc) {
+                        NSLog(@"[inject] ASSERTION SUPPRESSED: %@ in %@ (line %ld in %@)", desc, func, (long)line, file);
+                    }));
+            }
+            NSLog(@"[inject] NSAssertionHandler suppression installed");
+        }
+
         retry_injection();
     });
 }
