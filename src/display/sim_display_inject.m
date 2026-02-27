@@ -61,6 +61,7 @@ static DeviceDisplay *g_devices = NULL;
 static int g_device_count = 0;
 static int g_device_capacity = 0;
 static id g_display_link = nil; /* CADisplayLink or NSTimer fallback */
+static NSTimer *g_idle_timer = nil; /* 5s timer when no active devices */
 static int g_frame_count = 0;
 static BOOL g_multi_device_mode = NO;
 
@@ -464,11 +465,41 @@ static NSTimeInterval g_last_rescan = 0;
         active = 1;
     }
 
-    if (active == 0 && now - g_last_rescan > 5.0) {
-        g_last_rescan = now;
-        NSLog(@"[inject] No active devices — re-scanning windows...");
-        g_injection_done = NO;
-        attempt_injection();
+    if (active == 0) {
+        /* No active devices — pause the display link to save CPU.
+         * We'll check again every 5s via a slow timer. */
+        if ([g_display_link respondsToSelector:@selector(setPaused:)]) {
+            [g_display_link setPaused:YES];
+        }
+        if (!g_idle_timer) {
+            g_idle_timer = [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES
+                block:^(NSTimer *timer) {
+                    /* Re-scan for devices periodically while idle */
+                    g_injection_done = NO;
+                    attempt_injection();
+                    /* Check if we found active devices */
+                    int recheck = 0;
+                    if (g_multi_device_mode) {
+                        for (int i = 0; i < g_device_count; i++)
+                            if (g_devices[i].active) recheck++;
+                    } else if (g_single_device.active) recheck = 1;
+                    if (recheck > 0) {
+                        /* Resume display link */
+                        if ([g_display_link respondsToSelector:@selector(setPaused:)])
+                            [g_display_link setPaused:NO];
+                        [timer invalidate];
+                        g_idle_timer = nil;
+                        NSLog(@"[inject] Resumed display link — %d active device(s)", recheck);
+                    }
+                }];
+            NSLog(@"[inject] No active devices — paused display link, checking every 5s");
+        }
+    } else if (g_idle_timer) {
+        /* Devices became active while idle timer was running — cleanup */
+        [g_idle_timer invalidate];
+        g_idle_timer = nil;
+        if ([g_display_link respondsToSelector:@selector(setPaused:)])
+            [g_display_link setPaused:NO];
     }
 
     if (g_frame_count <= 3 || g_frame_count % 1800 == 0) {
