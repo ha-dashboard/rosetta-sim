@@ -1,6 +1,7 @@
 # Build artifacts
 src/build/
 setup/stubs/*.dylib
+RosettaSim.app
 *.o
 *.dSYM/
 *.raw

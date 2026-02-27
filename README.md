@@ -7,10 +7,13 @@ Legacy simulators use the PurpleFBServer Mach protocol for framebuffer display, 
 ## Quick Start
 
 ```bash
-# One-click: double-click RosettaSim.command in Finder, or:
-./RosettaSim.command
+# Build the app (one-time):
+./scripts/build_app.sh
 
-# Or step-by-step:
+# Then double-click RosettaSim.app in Finder!
+# It starts the daemon and Simulator with display injection automatically.
+
+# Or use the CLI:
 ./scripts/setup.sh              # one-time: build tools, create devices
 ./scripts/start_rosettasim.sh   # start daemon + Simulator
 
@@ -42,7 +45,7 @@ setup/launch_xcode833.sh   # launch
 ## Project Structure
 
 ```
-RosettaSim.command         # One-click launcher (double-click in Finder)
+RosettaSim.app             # Double-click to launch (built by scripts/build_app.sh)
 
 src/                       # Source code
   daemon/                  # rosettasim_daemon — monitors devices, registers PurpleFBServer
@@ -55,6 +58,7 @@ src/                       # Source code
   Makefile                 # builds everything → src/build/
 
 scripts/                   # Operational scripts
+  build_app.sh             # builds RosettaSim.app (double-clickable)
   setup.sh                 # one-time build + device creation
   start_rosettasim.sh      # daemon + Simulator launcher
   install_legacy_sim.sh    # iOS runtime installer
