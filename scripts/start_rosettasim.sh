@@ -152,12 +152,15 @@ find_and_boot_device() {
 
     local runtime_id="com.apple.CoreSimulator.SimRuntime.iOS-${ios_ver//./-}"
 
-    # Find existing device matching preferred name, or any device for this runtime
+    # Find existing device for this runtime
+    # simctl list devices doesn't filter by runtime_id, so we extract the section
     local udid=""
     local name=""
+    local section
+    section=$(xcrun simctl list devices 2>/dev/null | sed -n "/-- iOS ${ios_ver} --/,/-- /p" | grep -v "^--")
 
     # Try preferred device name first (Shutdown or Booted, not transitional)
-    udid=$(xcrun simctl list devices "$runtime_id" 2>/dev/null \
+    udid=$(echo "$section" \
         | grep -E "(Shutdown|Booted)" \
         | grep "$preferred_name" \
         | grep -oE '[A-F0-9-]{36}' \
@@ -165,7 +168,7 @@ find_and_boot_device() {
 
     if [[ -z "$udid" ]]; then
         # Try any device of the right type (iPhone or iPad)
-        udid=$(xcrun simctl list devices "$runtime_id" 2>/dev/null \
+        udid=$(echo "$section" \
             | grep -E "(Shutdown|Booted)" \
             | grep "$DEVICE_TYPE" \
             | grep -oE '[A-F0-9-]{36}' \

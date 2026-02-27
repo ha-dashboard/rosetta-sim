@@ -561,15 +561,37 @@ static void deactivate_device(DeviceContext *ctx) {
 
 static BOOL is_legacy_runtime(id device) {
     @try {
-        /* Get runtime object and check its profile.plist for PurpleFBServer in headServices */
+        /* Check runtime identifier against known legacy runtimes.
+         * Only match runtimes where we provide PurpleFBServer display bridge.
+         * This avoids matching modern devices that share runtime bundles. */
+        NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
+                           sel_registerName("runtimeIdentifier"));
+        if (!rtId) return NO;
+
+        /* Known legacy runtime identifiers that use PurpleFBServer */
+        static NSArray *legacyRuntimeIds = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            legacyRuntimeIds = @[
+                @"com.apple.CoreSimulator.SimRuntime.iOS-7-0",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-8-2",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-9-3",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-10-0",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-10-1",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-10-2",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-10-3",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-11-4",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-12-4",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-13-7",
+                @"com.apple.CoreSimulator.SimRuntime.iOS-14-5",
+            ];
+        });
+
+        if ([legacyRuntimeIds containsObject:rtId]) return YES;
+
+        /* Also check profile.plist headServices for runtimes we may not know by ID */
         id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
         if (!runtime) return NO;
-
-        /* Verify device has a valid device type profile */
-        id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
-        if (!deviceType) return NO;
-
-        /* Try to get the runtime's bundle path and read profile.plist */
         id bundleURL = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("bundleURL"));
         if (bundleURL) {
             NSString *bundlePath = ((id(*)(id, SEL))objc_msgSend)(bundleURL, sel_registerName("path"));
@@ -580,19 +602,12 @@ static BOOL is_legacy_runtime(id device) {
                     NSArray *headServices = profile[@"headServices"];
                     if ([headServices isKindOfClass:[NSArray class]] &&
                         [headServices containsObject:@"PurpleFBServer"]) {
-                        return YES;
+                        /* Only match if the runtime ID contains "iOS" (not watchOS/tvOS) */
+                        return [rtId containsString:@"iOS"];
                     }
-                    return NO; /* profile exists but no PurpleFBServer */
                 }
             }
         }
-
-        /* Fallback: match known runtime IDs if profile.plist couldn't be read */
-        NSString *rtId = ((id(*)(id, SEL))objc_msgSend)(device,
-                           sel_registerName("runtimeIdentifier"));
-        if (!rtId) return NO;
-        if ([rtId containsString:@"iOS-9"] || [rtId containsString:@"iOS-10"]
-            || [rtId containsString:@"iOS-15-4"]) return YES;
         return NO;
     } @catch (id e) {
         return NO;
@@ -705,12 +720,12 @@ int main(int argc, const char *argv[]) {
 
             long currentState = ((long(*)(id, SEL))objc_msgSend)(device, sel_registerName("state"));
             if (currentState != 1) {
-                NSLog(@"[daemon] %s: state=%ld (not shutdown), skipping pre-register",
+                NSLog(@"[daemon] %s: state=%ld (already booted — will pick up on re-scan if rebooted)",
                       dctx->name, currentState);
                 continue;
             }
 
-            /* Pre-register: create surface + port + register, but don't mark active yet */
+            /* Pre-register PurpleFBServer for shutdown devices (ready for boot) */
             activate_device(dctx, device);
             if (dctx->active) {
                 NSLog(@"[daemon] %s: pre-registered PurpleFBServer (ready for boot)",
@@ -807,8 +822,88 @@ int main(int argc, const char *argv[]) {
         });
         dispatch_activate(watchdog);
 
-        /* Run forever */
-        CFRunLoopRun();
+        /* Periodic re-scan: discover newly booted or newly created devices every 5s */
+        __block id capturedDevSet = devSet;
+        dispatch_source_t rescan = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                                                           0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(rescan, dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC),
+                                  5*NSEC_PER_SEC, 1*NSEC_PER_SEC);
+        dispatch_source_set_event_handler(rescan, ^{
+            @autoreleasepool {
+                NSDictionary *allDevs = ((id(*)(id, SEL))objc_msgSend)(
+                    capturedDevSet, sel_registerName("devicesByUDID"));
+                for (NSUUID *udid in allDevs) {
+                    id dev = allDevs[udid];
+                    if (!is_legacy_runtime(dev)) continue;
+
+                    NSString *udidStr = [udid UUIDString];
+                    DeviceContext *dctx = find_context([udidStr UTF8String]);
+
+                    if (!dctx) {
+                        /* New device — create context and register */
+                        NSString *name = ((id(*)(id, SEL))objc_msgSend)(dev, sel_registerName("name"));
+                        dctx = alloc_context([udidStr UTF8String], [name UTF8String]);
+                        if (!dctx) continue;
+
+                        /* Store RuntimeRoot path */
+                        @try {
+                            id runtime = ((id(*)(id, SEL))objc_msgSend)(dev, sel_registerName("runtime"));
+                            if (runtime) {
+                                id bundleURL = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("bundleURL"));
+                                if (bundleURL) {
+                                    NSString *bp = ((id(*)(id, SEL))objc_msgSend)(bundleURL, sel_registerName("path"));
+                                    if (bp) {
+                                        NSString *rr = [bp stringByAppendingPathComponent:@"Contents/Resources/RuntimeRoot"];
+                                        strlcpy(dctx->runtime_root, [rr UTF8String], sizeof(dctx->runtime_root));
+                                    }
+                                }
+                            }
+                        } @catch(id e) {}
+
+                        long newState = ((long(*)(id, SEL))objc_msgSend)(dev, sel_registerName("state"));
+                        NSLog(@"[daemon] Re-scan: new device %s (%s) state=%ld",
+                              dctx->name, dctx->udid, newState);
+                        if (newState == 1) {
+                            /* Shutdown — pre-register for next boot */
+                            activate_device(dctx, dev);
+                            if (dctx->active) {
+                                NSLog(@"[daemon] Re-scan: pre-registered PurpleFBServer for %s", dctx->name);
+                                write_active_devices();
+                            }
+                        }
+                        /* Already-booted new devices: skip (registerPort hangs).
+                         * They'll be picked up after their next shutdown→boot cycle. */
+                        continue;
+                    }
+
+                    /* Existing device — check for state transitions */
+                    long currentState = ((long(*)(id, SEL))objc_msgSend)(dev, sel_registerName("state"));
+                    if (!dctx->active && currentState == 1) {
+                        /* Device is shutdown and not registered — pre-register */
+                        NSLog(@"[daemon] Re-scan: %s shutdown, pre-registering", dctx->name);
+                        activate_device(dctx, dev);
+                        if (dctx->active) {
+                            write_active_devices();
+                        }
+                    } else if (dctx->active && currentState == 1) {
+                        /* Device shut down — deactivate */
+                        NSLog(@"[daemon] Re-scan: %s shut down, deactivating", dctx->name);
+                        deactivate_device(dctx);
+                        write_active_devices();
+                    }
+                }
+            }
+        });
+        dispatch_activate(rescan);
+
+        NSLog(@"[daemon] Periodic re-scan active (every 5s)");
+
+        /* Run forever — restart CFRunLoopRun if it returns */
+        while (1) {
+            CFRunLoopRun();
+            NSLog(@"[daemon] CFRunLoopRun returned — restarting run loop");
+            sleep(1);
+        }
     }
     return 0;
 }
