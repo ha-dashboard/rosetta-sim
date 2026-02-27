@@ -387,6 +387,33 @@ static int cmd_install(NSString *udid, NSString *appPath) {
         @".com.apple.mobile_container_manager.metadata.plist"];
     [metadata writeToFile:metadataPath atomically:YES];
 
+    /* Write to LastLaunchServicesMap.plist for persistence across reboots.
+     * registerApplicationDictionary: only updates lsd's in-memory state;
+     * on fresh devices the registration is lost on reboot without this. */
+    NSString *lsMapPath = [NSString stringWithFormat:
+        @"%@/Library/MobileInstallation/LastLaunchServicesMap.plist",
+        deviceDataPath];
+    NSString *lsMapDir = [lsMapPath stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:lsMapDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSMutableDictionary *lsMap = [NSMutableDictionary dictionaryWithContentsOfFile:lsMapPath]
+        ?: [NSMutableDictionary new];
+    if (!lsMap[@"User"]) lsMap[@"User"] = [NSMutableDictionary new];
+    NSMutableDictionary *userApps = [lsMap[@"User"] mutableCopy];
+
+    userApps[bundleID] = @{
+        @"CFBundleIdentifier": bundleID,
+        @"Path": destApp,
+        @"ApplicationType": @"User",
+        @"Container": containerDir,
+        @"SignerIdentity": @"Simulator",
+        @"IsContainerized": @YES,
+    };
+    lsMap[@"User"] = userApps;
+    [lsMap writeToFile:lsMapPath atomically:YES];
+    printf("  Updated LaunchServicesMap for persistence.\n");
+
     /* Notify sim_app_installer.dylib inside SpringBoard via darwin notification.
      * Write command file, then post device-specific notification. */
     printf("  Triggering install via sim_app_installer...\n");
