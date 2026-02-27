@@ -331,6 +331,74 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
 }
 
 /* ================================================================
+ * Display port diagnostics — enumerate IO ports for screenshot support
+ * ================================================================ */
+
+static void diagnose_display_ports(id device, DeviceContext *ctx) {
+    @try {
+        id io = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("io"));
+        NSLog(@"[daemon] %s: device.io = %@ (class=%s)", ctx->name, io,
+              io ? class_getName([io class]) : "nil");
+        if (!io) return;
+
+        NSArray *ports = ((id(*)(id, SEL))objc_msgSend)(io, sel_registerName("ioPorts"));
+        NSLog(@"[daemon] %s: ioPorts count = %lu", ctx->name, (unsigned long)ports.count);
+
+        for (id port in ports) {
+            NSString *ident = ((id(*)(id, SEL))objc_msgSend)(
+                port, sel_registerName("portIdentifier"));
+            id desc = nil;
+            if ([port respondsToSelector:sel_registerName("descriptor")])
+                desc = ((id(*)(id, SEL))objc_msgSend)(port, sel_registerName("descriptor"));
+            id ioPortDesc = nil;
+            if ([port respondsToSelector:sel_registerName("ioPortDescriptor")])
+                ioPortDesc = ((id(*)(id, SEL))objc_msgSend)(port, sel_registerName("ioPortDescriptor"));
+
+            NSLog(@"[daemon] %s:   port: '%@' class=%s descriptor=%s ioPortDescriptor=%s",
+                  ctx->name, ident, class_getName([port class]),
+                  desc ? class_getName([desc class]) : "nil",
+                  ioPortDesc ? class_getName([ioPortDesc class]) : "nil");
+
+            /* If descriptor has state, log it too */
+            if (desc && [desc respondsToSelector:sel_registerName("state")]) {
+                id state = ((id(*)(id, SEL))objc_msgSend)(desc, sel_registerName("state"));
+                NSLog(@"[daemon] %s:     descriptor.state class=%s", ctx->name,
+                      state ? class_getName([state class]) : "nil");
+            }
+
+            /* Check if descriptor responds to framebufferSurface and what it returns */
+            id checkTarget = desc ?: port;
+            BOOL hasFB = [checkTarget respondsToSelector:sel_registerName("framebufferSurface")];
+            NSLog(@"[daemon] %s:     responds to framebufferSurface: %s", ctx->name,
+                  hasFB ? "YES" : "NO");
+            if (hasFB) {
+                @try {
+                    id surface = ((id(*)(id, SEL))objc_msgSend)(checkTarget,
+                                    sel_registerName("framebufferSurface"));
+                    if (surface) {
+                        IOSurfaceRef sref = (__bridge IOSurfaceRef)surface;
+                        NSLog(@"[daemon] %s:     framebufferSurface = %@ (id=%u, %zux%zu)",
+                              ctx->name, surface, IOSurfaceGetID(sref),
+                              IOSurfaceGetWidth(sref), IOSurfaceGetHeight(sref));
+                    } else {
+                        NSLog(@"[daemon] %s:     framebufferSurface = nil", ctx->name);
+                    }
+                } @catch (id e) {
+                    NSLog(@"[daemon] %s:     framebufferSurface threw: %@", ctx->name, e);
+                }
+            }
+
+            /* Check setIoPortDescriptor: */
+            BOOL canSet = [port respondsToSelector:sel_registerName("setIoPortDescriptor:")];
+            NSLog(@"[daemon] %s:     responds to setIoPortDescriptor: %s", ctx->name,
+                  canSet ? "YES" : "NO");
+        }
+    } @catch (id e) {
+        NSLog(@"[daemon] %s: exception in diagnose_display_ports: %@", ctx->name, e);
+    }
+}
+
+/* ================================================================
  * Device activation / deactivation
  * ================================================================ */
 
@@ -451,6 +519,9 @@ static void activate_device(DeviceContext *ctx, id device) {
 
     NSLog(@"[daemon] %s: PurpleFBServer registered (port=0x%x, surface=%ux%u id=%u)",
           ctx->name, ctx->service_port, ctx->pixel_width, ctx->pixel_height, ctx->surface_id);
+
+    /* Diagnose Display port for screenshot support */
+    diagnose_display_ports(device, ctx);
 }
 
 static void deactivate_device(DeviceContext *ctx) {
