@@ -380,38 +380,51 @@ static int cmd_install(NSString *udid, NSString *appPath) {
         @".com.apple.mobile_container_manager.metadata.plist"];
     [metadata writeToFile:metadataPath atomically:YES];
 
-    /* Trigger SpringBoard re-scan via darwin notification */
-    printf("  Triggering app discovery...\n");
+    /* Write pending install entry for sim_app_installer.dylib to pick up.
+     * The dylib runs inside SpringBoard and calls MobileInstallationInstallForLaunchServices(). */
+    printf("  Writing pending install for sim_app_installer...\n");
 
-    /* Try notifyutil in the sim */
-    int rc = run_with_timeout(@[@"xcrun", @"simctl", @"spawn", udid,
-        @"/usr/bin/notifyutil", @"-p", @"com.apple.mobile.installd.app_changed"], 10);
+    NSString *pendingPath = @"/tmp/rosettasim_pending_installs.json";
+    NSMutableArray *pendingArray = [NSMutableArray new];
 
-    if (rc != 0) {
-        /* Fallback: try direct notify_post from host (crosses into sim via launchd) */
-        printf("  notifyutil failed (rc=%d), trying alternative...\n", rc);
-
-        /* Try touching the install sentinel */
-        NSString *sentinel = [NSString stringWithFormat:
-            @"%@/Library/Caches/com.apple.mobile.installd.staging/", deviceDataPath];
-        [[NSFileManager defaultManager] createDirectoryAtPath:sentinel
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil error:nil];
-
-        /* Also try simctl spawn with full paths */
-        rc = run_with_timeout(@[@"xcrun", @"simctl", @"spawn", udid,
-            @"/usr/bin/killall", @"-HUP", @"SpringBoard"], 10);
-        if (rc == 0) {
-            printf("  Sent HUP to SpringBoard to trigger re-scan.\n");
-        } else {
-            printf("  Warning: Could not trigger app discovery automatically.\n");
-            printf("  The app has been copied. Reboot the device to pick it up:\n");
-            printf("    rosettasim-ctl shutdown %s && rosettasim-ctl boot %s\n",
-                   udid.UTF8String, udid.UTF8String);
-        }
+    /* Read existing pending installs if any */
+    NSData *existingData = [NSData dataWithContentsOfFile:pendingPath];
+    if (existingData) {
+        NSArray *existing = [NSJSONSerialization JSONObjectWithData:existingData options:0 error:nil];
+        if ([existing isKindOfClass:[NSArray class]])
+            [pendingArray addObjectsFromArray:existing];
     }
 
-    printf("Installed %s (%s)\n", bundleID.UTF8String, appName.UTF8String);
+    /* Add new entry */
+    [pendingArray addObject:@{
+        @"path": destApp,
+        @"bundle_id": bundleID,
+    }];
+
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:pendingArray
+                                                       options:NSJSONWritingPrettyPrinted error:nil];
+    [jsonData writeToFile:pendingPath atomically:YES];
+
+    /* Check if sim_app_installer.dylib is deployed */
+    NSString *installerDylib = [NSString stringWithFormat:
+        @"%@/usr/local/lib/sim_app_installer.dylib", deviceDataPath];
+    BOOL installerDeployed = [[NSFileManager defaultManager] fileExistsAtPath:installerDylib];
+
+    printf("  Pending install written to %s\n", pendingPath.UTF8String);
+
+    if (installerDeployed) {
+        printf("  sim_app_installer.dylib is deployed. Reboot device to register:\n");
+    } else {
+        printf("  NOTE: sim_app_installer.dylib not deployed to this device.\n");
+        printf("  Deploy it first, then reboot:\n");
+        printf("    mkdir -p %s/usr/local/lib\n", deviceDataPath.UTF8String);
+        printf("    cp build/sim_app_installer.dylib %s/usr/local/lib/\n", deviceDataPath.UTF8String);
+    }
+    printf("    rosettasim-ctl shutdown %s\n", udid.UTF8String);
+    printf("    rosettasim-ctl boot %s\n", udid.UTF8String);
+
+    printf("Installed %s (%s) — pending registration on next boot\n",
+           bundleID.UTF8String, appName.UTF8String);
     return 0;
 }
 
