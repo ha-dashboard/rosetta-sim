@@ -52,11 +52,15 @@ SCALE_BIN     = sim_scale_fix.dylib
 SCREENSHOT_SRC = fb_to_png.m
 SCREENSHOT_BIN = fb_to_png
 
+# Screenshot plugin: simdeviceio companion that adds framebufferSurface to PurpleFBDescriptor
+PLUGIN_SRC    = rosettasim_screenshot_plugin.m
+PLUGIN_BIN    = RosettaSimScreenshot.simdeviceio/Contents/MacOS/RosettaSimScreenshot
+
 IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
 
-.PHONY: all bridge inject viewer daemon scale_fix screenshot clean
+.PHONY: all bridge inject viewer daemon scale_fix screenshot screenshot_plugin clean
 
-all: bridge inject viewer daemon scale_fix screenshot
+all: bridge inject viewer daemon scale_fix screenshot screenshot_plugin
 
 bridge: $(BRIDGE_BIN)
 
@@ -99,6 +103,22 @@ $(SCALE_BIN): $(SCALE_SRC)
 		-o $@ $<
 	@echo "Built: $@"
 
+screenshot_plugin: $(PLUGIN_BIN)
+
+$(PLUGIN_BIN): $(PLUGIN_SRC)
+	@mkdir -p RosettaSimScreenshot.simdeviceio/Contents/MacOS
+	$(CC) $(CFLAGS_COMMON) -bundle -framework Foundation -framework IOSurface \
+		-Wl,-undefined,dynamic_lookup -o $@ $<
+	@/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.rosettasim.screenshot" \
+		RosettaSimScreenshot.simdeviceio/Contents/Info.plist 2>/dev/null || true
+	@/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string RosettaSimScreenshot" \
+		RosettaSimScreenshot.simdeviceio/Contents/Info.plist 2>/dev/null || true
+	@/usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string BNDL" \
+		RosettaSimScreenshot.simdeviceio/Contents/Info.plist 2>/dev/null || true
+	codesign --force --sign - RosettaSimScreenshot.simdeviceio
+	@echo "Built: RosettaSimScreenshot.simdeviceio"
+
 clean:
 	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN) $(SCALE_BIN) $(SCREENSHOT_BIN)
+	rm -rf RosettaSimScreenshot.simdeviceio
 	@echo "Cleaned."
