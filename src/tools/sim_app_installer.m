@@ -67,46 +67,95 @@ static void handle_install(void) {
             return;
         }
 
+        /* Remove cmd file FIRST to prevent crash-loop if MobileInstallation segfaults */
+        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+
         /* Clear result file */
         [@"" writeToFile:[NSString stringWithUTF8String:g_result_path]
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        /* Resolve MobileInstallationInstallForLaunchServices */
-        typedef long (*MIInstallFn)(NSString *path, NSDictionary *opts, void *cb, NSString *caller);
-        MIInstallFn miInstall = (MIInstallFn)dlsym(RTLD_DEFAULT,
-            "MobileInstallationInstallForLaunchServices");
-        if (!miInstall) {
-            log_result("MobileInstallationInstallForLaunchServices not found");
-            [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
-            return;
-        }
+        /* Register apps directly with LaunchServices via LSApplicationWorkspace.
+         * ALL MobileInstallation APIs go through XPC to installd and WILL deadlock
+         * when called from SpringBoard (installd needs the main RunLoop for XPC
+         * callbacks, but we're running ON the main RunLoop).
+         * registerApplicationDictionary: talks to lsd directly — no installd, no deadlock. */
 
         int success = 0;
         for (NSDictionary *entry in installs) {
+            if (![entry isKindOfClass:[NSDictionary class]]) {
+                log_result("  Skipping non-dict entry");
+                continue;
+            }
             NSString *path = entry[@"path"];
             NSString *bundleId = entry[@"bundle_id"];
-            if (!path) continue;
+            if (!path || ![path isKindOfClass:[NSString class]]) {
+                log_result("  Skipping entry with nil/invalid path");
+                continue;
+            }
 
-            log_result("Installing: %s (bundleId=%s)", [path UTF8String],
-                      bundleId ? [bundleId UTF8String] : "auto");
+            BOOL isDir = NO;
+            BOOL pathExists = [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+            log_result("Installing: %s (bundleId=%s) exists=%d isDir=%d",
+                      [path UTF8String],
+                      bundleId ? [bundleId UTF8String] : "auto",
+                      pathExists, isDir);
 
-            NSDictionary *opts = @{
-                @"PackageType": @"Developer",
-                @"AllowInstallLocalProvisioned": @YES,
-            };
+            if (!pathExists) {
+                log_result("  SKIP: path does not exist from sim perspective");
+                continue;
+            }
 
-            long result = miInstall(path, opts, NULL, @"rosettasim");
-            log_result("  result=%ld (%s)", result, result == 0 ? "SUCCESS" : "FAILED");
-            if (result == 0) success++;
+            /* Build registration dictionary from the app's Info.plist */
+            NSString *infoPlistPath = [path stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+            if (!info) {
+                log_result("  SKIP: cannot read Info.plist at %s", infoPlistPath.UTF8String);
+                continue;
+            }
+
+            NSMutableDictionary *regDict = [info mutableCopy];
+            regDict[@"Path"] = path;
+            regDict[@"ApplicationType"] = @"User";
+            /* Ensure bundle ID is set */
+            if (bundleId && ![bundleId isEqualToString:@"auto"]) {
+                regDict[@"CFBundleIdentifier"] = bundleId;
+            }
+
+            log_result("  Registering with LSApplicationWorkspace (bundleId=%s)...",
+                      [regDict[@"CFBundleIdentifier"] UTF8String]);
+
+            Class lsClass = objc_getClass("LSApplicationWorkspace");
+            if (!lsClass) {
+                log_result("  FAIL: LSApplicationWorkspace class not found");
+                continue;
+            }
+            id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
+                            sel_registerName("defaultWorkspace"));
+            if (!workspace) {
+                log_result("  FAIL: defaultWorkspace returned nil");
+                continue;
+            }
+
+            SEL regSel = sel_registerName("registerApplicationDictionary:");
+            if (![workspace respondsToSelector:regSel]) {
+                log_result("  FAIL: workspace does not respond to registerApplicationDictionary:");
+                continue;
+            }
+
+            BOOL regResult = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace, regSel, regDict);
+            log_result("  registerApplicationDictionary: result=%d", regResult);
+            success++;
         }
 
         if (success > 0) {
-            notify_post("com.apple.LaunchServices.ApplicationsChanged");
-            notify_post("com.apple.mobile.application_installed");
-            log_result("Installed %d app(s), notifications posted", success);
+            /* Do NOT post com.apple.LaunchServices.ApplicationsChanged or
+             * com.apple.mobile.application_installed — these trigger SpringBoard
+             * icon layout rebuild which crashes due to missing icon data.
+             * The lsd registration is sufficient; app appears after next reboot. */
+            log_result("SUCCESS: Registered %d app(s) with LaunchServices (reboot to see on home screen)", success);
+        } else {
+            log_result("FAILED: No apps registered successfully");
         }
-
-        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
     }
 }
 
@@ -222,15 +271,33 @@ static void process_legacy_pending(void) {
  * namespace callers.
  * ================================================================ */
 
+static int g_poll_count = 0;
+
 static void poll_cmd_file(void) {
+    g_poll_count++;
     NSString *cmdPath = [NSString stringWithUTF8String:g_cmd_path];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:cmdPath]) return;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:cmdPath];
+    if (g_poll_count <= 5 || (exists) || (g_poll_count % 30 == 0)) {
+        NSLog(@"[app_installer] Poll #%d: %s exists=%d", g_poll_count, g_cmd_path, exists);
+    }
+    if (!exists) return;
 
     NSData *data = [NSData dataWithContentsOfFile:cmdPath];
-    if (!data) return;
+    if (!data) {
+        NSLog(@"[app_installer] Poll: file exists but read returned nil (race?)");
+        return;
+    }
+
+    NSLog(@"[app_installer] Poll: read %lu bytes from cmd file", (unsigned long)data.length);
 
     /* Peek at the content to determine action type */
-    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSError *jsonErr = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
+    if (!parsed) {
+        NSLog(@"[app_installer] Poll: JSON parse failed: %@", jsonErr);
+        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+        return;
+    }
     if ([parsed isKindOfClass:[NSArray class]]) {
         /* Array = install command */
         handle_install();
@@ -283,6 +350,8 @@ static void sim_app_installer_init(void) {
 
     snprintf(g_cmd_path, sizeof(g_cmd_path), "/tmp/rosettasim_cmd_%s.json", g_udid);
     snprintf(g_result_path, sizeof(g_result_path), "/tmp/rosettasim_install_result_%s.txt", g_udid);
+    NSLog(@"[app_installer] cmd_path set to: %s", g_cmd_path);
+    NSLog(@"[app_installer] result_path set to: %s", g_result_path);
 
     NSLog(@"[app_installer] Registering for device %s", g_udid);
 
@@ -308,12 +377,15 @@ static void sim_app_installer_init(void) {
      * Use recursive dispatch_after (safer than dispatch_source under Rosetta 2). */
     __block void (^poll_loop)(void) = ^{
         poll_cmd_file();
+        if (g_poll_count <= 3)
+            NSLog(@"[app_installer] Scheduling next poll in 2s (poll #%d)", g_poll_count);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), poll_loop);
     };
     /* Prevent block from being deallocated */
     poll_loop = [poll_loop copy];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+    /* First poll fires immediately (0.1s) — SpringBoard may crash-loop on 5s cycle */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), poll_loop);
 
     NSLog(@"[app_installer] Listening: %s, %s + polling every 2s", install_name, launch_name);

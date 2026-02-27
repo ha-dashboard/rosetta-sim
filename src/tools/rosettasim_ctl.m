@@ -391,9 +391,7 @@ static int cmd_install(NSString *udid, NSString *appPath) {
      * Write command file, then post device-specific notification. */
     printf("  Triggering install via sim_app_installer...\n");
 
-    NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
     NSArray *installEntry = @[@{@"path": destApp, @"bundle_id": bundleID}];
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:installEntry
                                                        options:NSJSONWritingPrettyPrinted error:nil];
@@ -504,8 +502,7 @@ static int cmd_launch(NSString *udid, NSString *bundleID) {
     printf("  App found at: %s\n", appPath.UTF8String);
 
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *launchCmd = @{@"bundle_id": bundleID};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:launchCmd options:0 error:nil];
     [jsonData writeToFile:cmdPath atomically:YES];
@@ -1040,8 +1037,7 @@ static int cmd_openurl(NSString *udid, NSString *url) {
     printf("Opening URL on %s [legacy]: %s\n", get_device_name(device).UTF8String, url.UTF8String);
 
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *cmd = @{@"action": @"openurl", @"url": url};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
     [jsonData writeToFile:cmdPath atomically:YES];
@@ -1492,8 +1488,7 @@ static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
     /* Write touch command file and notify sim_display_inject.dylib
      * (loaded in Simulator.app, has access to SimHIDSystem) */
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *touchCmd = @{
         @"action": @"touch",
         @"x": @(x),
@@ -1536,8 +1531,7 @@ static int cmd_location(NSString *udid, int argc, const char *argv[]) {
 
     if (strcmp(argv[3], "clear") == 0) {
         NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
         NSDictionary *cmd = @{@"action": @"location", @"clear": @YES};
         NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
         [jsonData writeToFile:cmdPath atomically:YES];
@@ -1562,8 +1556,7 @@ static int cmd_location(NSString *udid, int argc, const char *argv[]) {
     }
 
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *cmd = @{@"action": @"location", @"lat": @(lat), @"lon": @(lon)};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
     [jsonData writeToFile:cmdPath atomically:YES];
@@ -1623,8 +1616,7 @@ static int cmd_push(NSString *udid, int argc, const char *argv[]) {
 
     /* Write push command for sim_app_installer.dylib */
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *cmd = @{
         @"action": @"push",
         @"bundle_id": bundleID,
@@ -1861,8 +1853,7 @@ static int cmd_pbcopy(NSString *udid) {
 
     /* Write command for sim_app_installer.dylib */
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *cmd = @{@"action": @"pbcopy", @"text": text};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
     [jsonData writeToFile:cmdPath atomically:YES];
@@ -1894,8 +1885,7 @@ static int cmd_pbpaste(NSString *udid) {
 
     /* Write command for sim_app_installer.dylib */
     NSString *cmdPath = [NSString stringWithFormat:
-        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/tmp/rosettasim_cmd_%@.json",
-        NSHomeDirectory(), udid, udid];
+        @"/tmp/rosettasim_cmd_%@.json", udid];
     NSDictionary *cmd = @{@"action": @"pbpaste"};
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
     [jsonData writeToFile:cmdPath atomically:YES];
