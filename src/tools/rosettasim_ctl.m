@@ -399,6 +399,118 @@ static int cmd_install(NSString *udid, NSString *appPath) {
     return 0;
 }
 
+/* ── Command: launch ── */
+
+static int cmd_launch(NSString *udid, NSString *bundleID) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        /* Native — delegate to simctl */
+        printf("Launching %s on %s (native)...\n", bundleID.UTF8String,
+               get_device_name(device).UTF8String);
+        return run_with_timeout(@[@"xcrun", @"simctl", @"launch", udid, bundleID], 30);
+    }
+
+    /* Legacy — find .app and launch via simctl spawn or open URL */
+    printf("Launching %s on %s [legacy]...\n", bundleID.UTF8String,
+           get_device_name(device).UTF8String);
+
+    NSString *deviceDataPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data",
+        NSHomeDirectory(), udid];
+
+    /* Search for the app in Containers/Bundle/Application/ */
+    NSString *containersPath = [deviceDataPath stringByAppendingPathComponent:
+        @"Containers/Bundle/Application"];
+    NSString *appPath = nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSArray *containerUUIDs = [fm contentsOfDirectoryAtPath:containersPath error:nil];
+    for (NSString *cuuid in containerUUIDs) {
+        NSString *containerDir = [containersPath stringByAppendingPathComponent:cuuid];
+        NSArray *contents = [fm contentsOfDirectoryAtPath:containerDir error:nil];
+        for (NSString *item in contents) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *candidate = [containerDir stringByAppendingPathComponent:item];
+            NSString *infoPlist = [candidate stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundleID]) {
+                appPath = candidate;
+                break;
+            }
+        }
+        if (appPath) break;
+    }
+
+    if (!appPath) {
+        fprintf(stderr, "App %s not found in device containers.\n", bundleID.UTF8String);
+        fprintf(stderr, "Install it first: rosettasim-ctl install %s <path.app>\n", udid.UTF8String);
+        return 1;
+    }
+
+    /* Get executable name from Info.plist */
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+        [appPath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *execName = info[@"CFBundleExecutable"];
+    if (!execName) {
+        fprintf(stderr, "No CFBundleExecutable in app Info.plist\n");
+        return 1;
+    }
+
+    NSString *execPath = [appPath stringByAppendingPathComponent:execName];
+
+    /* Try simctl spawn with the executable path */
+    printf("  Spawning %s...\n", execPath.UTF8String);
+    int rc = run_with_timeout(@[@"xcrun", @"simctl", @"spawn", udid, execPath], 15);
+    if (rc == 124) {
+        /* simctl spawn timed out — try openurl scheme instead */
+        fprintf(stderr, "  spawn timed out. Trying openurl fallback...\n");
+
+        /* Try simctl openurl if the app has a URL scheme */
+        NSArray *urlTypes = info[@"CFBundleURLTypes"];
+        if ([urlTypes isKindOfClass:[NSArray class]] && urlTypes.count > 0) {
+            NSDictionary *urlType = urlTypes[0];
+            NSArray *schemes = urlType[@"CFBundleURLSchemes"];
+            if ([schemes isKindOfClass:[NSArray class]] && schemes.count > 0) {
+                NSString *scheme = schemes[0];
+                NSString *url = [NSString stringWithFormat:@"%@://", scheme];
+                rc = run_with_timeout(@[@"xcrun", @"simctl", @"openurl", udid, url], 10);
+                if (rc == 0) {
+                    printf("Launched %s via URL scheme %s://\n", bundleID.UTF8String, scheme.UTF8String);
+                    return 0;
+                }
+            }
+        }
+
+        fprintf(stderr, "  Could not launch app automatically.\n");
+        fprintf(stderr, "  The app is installed — tap its icon on the home screen.\n");
+        return 1;
+    }
+
+    if (rc != 0) {
+        fprintf(stderr, "Launch failed (exit %d).\n", rc);
+        return rc;
+    }
+
+    printf("Launched %s\n", bundleID.UTF8String);
+    return 0;
+}
+
 /* ── Command: screenshot ── */
 
 static int cmd_screenshot(NSString *udid, NSString *outputPath) {
@@ -584,6 +696,7 @@ static void usage(void) {
         "  boot <UDID>                   Boot device\n"
         "  shutdown <UDID|all>           Shutdown device(s)\n"
         "  install <UDID> <app-path>     Install .app on device\n"
+        "  launch <UDID> <bundle-id>     Launch app by bundle ID\n"
         "  screenshot <UDID> <output>    Take screenshot\n"
         "  status <UDID>                 Show device status\n"
         "\n"
@@ -618,6 +731,11 @@ int main(int argc, const char *argv[]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl install <UDID> <app-path>\n"); return 1; }
             return cmd_install([NSString stringWithUTF8String:argv[2]],
                               [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"launch"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl launch <UDID> <bundle-id>\n"); return 1; }
+            return cmd_launch([NSString stringWithUTF8String:argv[2]],
+                             [NSString stringWithUTF8String:argv[3]]);
         }
         else if ([cmd isEqualToString:@"screenshot"]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl screenshot <UDID> <output.png>\n"); return 1; }
