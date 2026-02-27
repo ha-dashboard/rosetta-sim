@@ -41,7 +41,7 @@ if [[ "${1:-}" == "--stop" ]] || [[ "${1:-}" == "stop" ]]; then
     fi
     pkill -f rosettasim_daemon 2>/dev/null || true
     # Shutdown all legacy sims
-    for udid in $(xcrun simctl list devices 2>/dev/null | grep -E -e '9\.3|10\.3' | grep -v unavailable | grep Booted | sed 's/.*(\([A-F0-9-]*\)).*/\1/'); do
+    for udid in $(xcrun simctl list devices 2>/dev/null | grep -E -e '9\.3|10\.3|12\.4' | grep -v unavailable | grep Booted | sed 's/.*(\([A-F0-9-]*\)).*/\1/'); do
         xcrun simctl shutdown "$udid" 2>/dev/null || true
     done
     rm -f /tmp/rosettasim_*.json /tmp/rosettasim_fb_*.raw /tmp/sim_framebuffer.raw
@@ -74,7 +74,7 @@ cleanup() {
     [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null || true
     rm -f "$PIDFILE_DAEMON" "$PIDFILE_SIM"
     # Shutdown all legacy sims
-    for udid in $(xcrun simctl list devices 2>/dev/null | grep -E -e '9\.3|10\.3' | grep -v unavailable | grep Booted | sed 's/.*(\([A-F0-9-]*\)).*/\1/'); do
+    for udid in $(xcrun simctl list devices 2>/dev/null | grep -E -e '9\.3|10\.3|12\.4' | grep -v unavailable | grep Booted | sed 's/.*(\([A-F0-9-]*\)).*/\1/'); do
         xcrun simctl shutdown "$udid" 2>/dev/null || true
     done
     rm -f /tmp/rosettasim_*.json /tmp/rosettasim_fb_*.raw /tmp/sim_framebuffer.raw
@@ -115,7 +115,7 @@ fi
 echo "Booting default legacy device..."
 DEFAULT_UDID=$(xcrun simctl list devices 2>/dev/null \
     | grep -E '(Shutdown|Booted)' \
-    | grep -E '9\.3|10\.3' \
+    | grep -E '9\.3|10\.3|12\.4' \
     | grep -v unavailable \
     | head -1 \
     | sed 's/.*(\([A-F0-9-]*\)).*/\1/')

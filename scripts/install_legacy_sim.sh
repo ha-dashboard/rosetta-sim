@@ -59,6 +59,10 @@ cdn_url_for() {
 ALL_VERSIONS="9.3 10.0 10.1 10.2 12.4 13.7 14.5 15.5"
 
 # Does this version use PurpleFBServer? (needs headServices in profile)
+# NOTE: iOS 13.7/14.5 QuartzCore DOES contain PurpleFBServer strings, but these
+# runtimes crash during launchd bootstrap on macOS 26 (XPC/launchd incompatibility)
+# before backboardd ever connects to PurpleFBServer. Only iOS 9.3-12.4 actually
+# boot successfully on modern macOS. iOS 15.7+ works natively via SimRenderServer.
 is_purplefb() {
     case "$1" in
         9.3|10.0|10.1|10.2|10.3|12.4) return 0 ;;

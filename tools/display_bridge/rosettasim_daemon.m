@@ -84,6 +84,7 @@ typedef struct DeviceContext {
     int             active;
     time_t          last_flush_time;
     long            last_state;     /* for state change deduplication */
+    char            runtime_root[512]; /* RuntimeRoot path for scale fix detection */
 } DeviceContext;
 
 static DeviceContext *g_devices = NULL;
@@ -229,16 +230,25 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        /* pt_width = pixel_width for now (scale=1).
-         * Finding 33/34: BSMainScreenScale interpose + set_scale needed for 2x.
-         * Simple constant patch breaks display init. Need insert_dylib approach. */
-        r.pt_width = ctx->pixel_width;
-        r.pt_height = ctx->pixel_height;
+        /* Session 28: insert_dylib injects sim_scale_fix.dylib into backboardd,
+         * which interposes BSMainScreenScale to return 2.0. With scale=2, the
+         * point dimensions must be half the pixel dimensions for correct layout.
+         * Check if the scale fix dylib exists in this runtime's usr/lib/. */
+        BOOL has_scale_fix = NO;
+        if (ctx->runtime_root[0]) {
+            NSString *fixPath = [NSString stringWithFormat:@"%s/usr/lib/sim_scale_fix.dylib",
+                                 ctx->runtime_root];
+            has_scale_fix = [[NSFileManager defaultManager] fileExistsAtPath:fixPath];
+        }
+        uint32_t scale = has_scale_fix ? 2 : 1;
+        r.pt_width = ctx->pixel_width / scale;
+        r.pt_height = ctx->pixel_height / scale;
 
         kern_return_t skr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
                       0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u)",
-              ctx->name, skr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row);
+        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u pt=%ux%u scale=%u root='%s')",
+              ctx->name, skr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row,
+              r.pt_width, r.pt_height, scale, ctx->runtime_root);
 
     } else if (msg->msgh_id == 3) {
         /* flush_shmem — reply and dump pixels */
@@ -584,6 +594,21 @@ int main(int argc, const char *argv[]) {
             DeviceContext *dctx = alloc_context([[udid UUIDString] UTF8String],
                                                 [name UTF8String]);
             if (!dctx) continue;
+
+            /* Store RuntimeRoot path for scale fix detection */
+            @try {
+                id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
+                if (runtime) {
+                    id bundleURL = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("bundleURL"));
+                    if (bundleURL) {
+                        NSString *bp = ((id(*)(id, SEL))objc_msgSend)(bundleURL, sel_registerName("path"));
+                        if (bp) {
+                            NSString *rr = [bp stringByAppendingPathComponent:@"Contents/Resources/RuntimeRoot"];
+                            strlcpy(dctx->runtime_root, [rr UTF8String], sizeof(dctx->runtime_root));
+                        }
+                    }
+                }
+            } @catch(id e) {}
 
             [legacyDevices addObject:device];
         }

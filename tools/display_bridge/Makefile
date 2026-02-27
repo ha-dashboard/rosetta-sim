@@ -44,9 +44,11 @@ DAEMON_CFLAGS = $(CFLAGS_COMMON)
 DAEMON_LDFLAGS = -framework Foundation -framework IOSurface -framework CoreGraphics \
                  -Wl,-undefined,dynamic_lookup
 
-# Scale fix: x86_64 interpose dylib injected into sim processes
-SCALE_SRC     = sim_scale_fix.c
+# Scale fix: x86_64 interpose dylib injected into sim processes via insert_dylib
+# Must be built with iOS simulator target or dyld_sim will reject it
+SCALE_SRC     = sim_scale_fix.m
 SCALE_BIN     = sim_scale_fix.dylib
+IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
 
 .PHONY: all bridge inject viewer daemon scale_fix clean
 
@@ -79,7 +81,10 @@ $(DAEMON_BIN): $(DAEMON_SRC)
 scale_fix: $(SCALE_BIN)
 
 $(SCALE_BIN): $(SCALE_SRC)
-	$(CC) -arch x86_64 -shared -Wl,-undefined,dynamic_lookup -o $@ $<
+	$(CC) -arch x86_64 -target x86_64-apple-ios9.0-simulator -isysroot $(IPHONE_SIM_SDK) \
+		-shared -flat_namespace -undefined suppress \
+		-framework Foundation -framework QuartzCore \
+		-o $@ $<
 	@echo "Built: $@"
 
 clean:
