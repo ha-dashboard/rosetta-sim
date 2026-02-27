@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <notify.h>
 
 /* ── Forward declarations ── */
 static int run_with_timeout(NSArray<NSString *> *args, int timeout_secs);
@@ -386,51 +387,39 @@ static int cmd_install(NSString *udid, NSString *appPath) {
         @".com.apple.mobile_container_manager.metadata.plist"];
     [metadata writeToFile:metadataPath atomically:YES];
 
-    /* Write pending install entry for sim_app_installer.dylib to pick up.
-     * The dylib runs inside SpringBoard and calls MobileInstallationInstallForLaunchServices(). */
-    printf("  Writing pending install for sim_app_installer...\n");
+    /* Notify sim_app_installer.dylib inside SpringBoard via darwin notification.
+     * Write command file, then post device-specific notification. */
+    printf("  Triggering install via sim_app_installer...\n");
 
-    NSString *pendingPath = @"/tmp/rosettasim_pending_installs.json";
-    NSMutableArray *pendingArray = [NSMutableArray new];
-
-    /* Read existing pending installs if any */
-    NSData *existingData = [NSData dataWithContentsOfFile:pendingPath];
-    if (existingData) {
-        NSArray *existing = [NSJSONSerialization JSONObjectWithData:existingData options:0 error:nil];
-        if ([existing isKindOfClass:[NSArray class]])
-            [pendingArray addObjectsFromArray:existing];
-    }
-
-    /* Add new entry */
-    [pendingArray addObject:@{
-        @"path": destApp,
-        @"bundle_id": bundleID,
-    }];
-
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:pendingArray
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSArray *installEntry = @[@{@"path": destApp, @"bundle_id": bundleID}];
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:installEntry
                                                        options:NSJSONWritingPrettyPrinted error:nil];
-    [jsonData writeToFile:pendingPath atomically:YES];
+    [jsonData writeToFile:cmdPath atomically:YES];
 
-    /* Check if sim_app_installer.dylib is deployed */
-    NSString *installerDylib = [NSString stringWithFormat:
-        @"%@/usr/local/lib/sim_app_installer.dylib", deviceDataPath];
-    BOOL installerDeployed = [[NSFileManager defaultManager] fileExistsAtPath:installerDylib];
+    /* Post device-specific notification */
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.install.%s", udid.UTF8String);
+    notify_post(notifyName);
 
-    printf("  Pending install written to %s\n", pendingPath.UTF8String);
+    printf("  Notification sent: %s\n", notifyName);
 
-    if (installerDeployed) {
-        printf("  sim_app_installer.dylib is deployed. Reboot device to register:\n");
+    /* Wait briefly for result */
+    usleep(2000000); /* 2 seconds */
+
+    NSString *resultPath = [NSString stringWithFormat:@"/tmp/rosettasim_install_result_%@.txt", udid];
+    NSString *resultStr = [NSString stringWithContentsOfFile:resultPath
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    if (resultStr && [resultStr containsString:@"SUCCESS"]) {
+        printf("Installed %s (%s) — registered with MobileInstallation\n",
+               bundleID.UTF8String, appName.UTF8String);
+    } else if (resultStr) {
+        printf("Install result: %s\n", resultStr.UTF8String);
     } else {
-        printf("  NOTE: sim_app_installer.dylib not deployed to this device.\n");
-        printf("  Deploy it first, then reboot:\n");
-        printf("    mkdir -p %s/usr/local/lib\n", deviceDataPath.UTF8String);
-        printf("    cp build/sim_app_installer.dylib %s/usr/local/lib/\n", deviceDataPath.UTF8String);
+        printf("Installed %s (%s) — pending registration.\n",
+               bundleID.UTF8String, appName.UTF8String);
+        printf("  If sim_app_installer.dylib is not loaded, reboot the device.\n");
     }
-    printf("    rosettasim-ctl shutdown %s\n", udid.UTF8String);
-    printf("    rosettasim-ctl boot %s\n", udid.UTF8String);
-
-    printf("Installed %s (%s) — pending registration on next boot\n",
-           bundleID.UTF8String, appName.UTF8String);
     return 0;
 }
 
@@ -509,48 +498,33 @@ static int cmd_launch(NSString *udid, NSString *bundleID) {
 
     (void)execName; /* app path confirmed valid */
 
-    /* Write pending launch file for sim_app_installer.dylib to pick up on boot */
+    /* Notify sim_app_installer.dylib to launch the app via darwin notification */
     printf("  App found at: %s\n", appPath.UTF8String);
-    printf("  Writing pending launch...\n");
 
-    FILE *f = fopen("/tmp/rosettasim_pending_launch.txt", "w");
-    if (f) {
-        fprintf(f, "%s\n", bundleID.UTF8String);
-        fclose(f);
-    } else {
-        fprintf(stderr, "Failed to write pending launch file.\n");
-        return 1;
-    }
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *launchCmd = @{@"bundle_id": bundleID};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:launchCmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
 
-    /* Reboot device to trigger SpringBoard → installer dylib → launch */
-    printf("  Rebooting device to trigger launch...\n");
-    int rc = run_with_timeout(@[@"xcrun", @"simctl", @"shutdown", udid], 15);
-    if (rc == 124) {
-        /* Timeout — force kill */
-        NSString *killCmd = [NSString stringWithFormat:
-            @"pgrep -f 'launchd_sim.*%@' | xargs kill 2>/dev/null", udid];
-        system(killCmd.UTF8String);
-        sleep(2);
-    } else {
-        sleep(3);
-    }
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.launch.%s", udid.UTF8String);
+    notify_post(notifyName);
 
-    rc = run_with_timeout(@[@"xcrun", @"simctl", @"boot", udid], 45);
-    if (rc != 0 && rc != 124) {
-        fprintf(stderr, "Boot failed (exit %d). Launch may still work if daemon reboots.\n", rc);
-    }
+    printf("  Launch notification sent: %s\n", notifyName);
 
-    printf("  Waiting for SpringBoard to launch app...\n");
-    sleep(15);
+    /* Wait briefly for result */
+    usleep(2000000); /* 2 seconds */
 
-    /* Check result */
-    NSString *resultStr = [NSString stringWithContentsOfFile:@"/tmp/rosettasim_install_result.txt"
+    NSString *resultPath = [NSString stringWithFormat:@"/tmp/rosettasim_install_result_%@.txt", udid];
+    NSString *resultStr = [NSString stringWithContentsOfFile:resultPath
                                                    encoding:NSUTF8StringEncoding error:nil];
-    if (resultStr && [resultStr containsString:bundleID]) {
-        printf("Launch triggered for %s\n", bundleID.UTF8String);
+    if (resultStr && [resultStr containsString:@"SUCCESS"]) {
+        printf("Launched %s\n", bundleID.UTF8String);
+    } else if (resultStr) {
+        printf("Launch result: %s\n", resultStr.UTF8String);
     } else {
-        printf("Launch requested. App should appear after SpringBoard finishes loading.\n");
-        printf("If it doesn't appear, tap its icon on the home screen.\n");
+        printf("Launch requested for %s.\n", bundleID.UTF8String);
+        printf("  If sim_app_installer.dylib is not loaded, reboot the device.\n");
     }
 
     return 0;
@@ -917,6 +891,123 @@ static int cmd_uninstall(NSString *udid, NSString *bundleID) {
     return 0;
 }
 
+/* ── Command: terminate ── */
+
+static int cmd_terminate(NSString *udid, NSString *bundleID) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"terminate", udid, bundleID], 15);
+    }
+
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    /* Legacy: find the app's CFBundleExecutable, then pgrep inside the device's process tree */
+    NSString *execName = nil;
+
+    /* Search containers for the app's Info.plist */
+    NSString *containersPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Containers/Bundle/Application",
+        NSHomeDirectory(), udid];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *cuuid in [fm contentsOfDirectoryAtPath:containersPath error:nil]) {
+        NSString *containerDir = [containersPath stringByAppendingPathComponent:cuuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:containerDir error:nil]) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *infoPlist = [[containerDir stringByAppendingPathComponent:item]
+                                    stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+            if ([info[@"CFBundleIdentifier"] isEqualToString:bundleID]) {
+                execName = info[@"CFBundleExecutable"];
+                break;
+            }
+        }
+        if (execName) break;
+    }
+
+    /* Also check LaunchServicesMap */
+    if (!execName) {
+        NSDictionary *lsMap = read_ls_map(udid);
+        for (NSString *section in @[@"User", @"System", @"Internal"]) {
+            NSDictionary *appInfo = lsMap[section][bundleID];
+            if (appInfo[@"Path"]) {
+                NSString *appInfoPlist = [appInfo[@"Path"] stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:appInfoPlist];
+                execName = info[@"CFBundleExecutable"];
+                if (execName) break;
+            }
+        }
+    }
+
+    if (!execName) {
+        fprintf(stderr, "Cannot find CFBundleExecutable for %s\n", bundleID.UTF8String);
+        return 1;
+    }
+
+    /* Find the launchd_sim PID for this device, then find the app process in its tree */
+    NSString *pgrepCmd = [NSString stringWithFormat:
+        @"pgrep -f 'launchd_sim.*%@'", udid];
+    int ec = 0;
+    NSString *launchdPid = run_capture(@[@"/bin/sh", @"-c", pgrepCmd], &ec);
+    launchdPid = [launchdPid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if (ec != 0 || launchdPid.length == 0) {
+        fprintf(stderr, "Cannot find launchd_sim for device %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    /* Find app process: child of this launchd_sim with matching exec name */
+    NSString *findCmd = [NSString stringWithFormat:
+        @"ps -o pid,ppid,comm -ax | awk '$2 == %@ && $3 ~ /%@$/ {print $1}'",
+        launchdPid, execName];
+    NSString *appPid = run_capture(@[@"/bin/sh", @"-c", findCmd], &ec);
+    appPid = [appPid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if (appPid.length == 0) {
+        /* Try broader match: any process with this exec name under launchd_sim's session */
+        findCmd = [NSString stringWithFormat:
+            @"pgrep -P %@ %@", launchdPid, execName];
+        appPid = run_capture(@[@"/bin/sh", @"-c", findCmd], &ec);
+        appPid = [appPid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+
+    if (appPid.length == 0) {
+        fprintf(stderr, "App %s (%s) is not running on device %s\n",
+                bundleID.UTF8String, execName.UTF8String, udid.UTF8String);
+        return 1;
+    }
+
+    /* Kill by exact PID */
+    pid_t pid = (pid_t)appPid.intValue;
+    printf("Terminating %s (pid %d)...\n", bundleID.UTF8String, pid);
+    if (kill(pid, SIGTERM) != 0) {
+        fprintf(stderr, "kill(%d) failed: %s\n", pid, strerror(errno));
+        return 1;
+    }
+
+    /* Wait briefly, then SIGKILL if still alive */
+    usleep(500000);
+    if (kill(pid, 0) == 0) {
+        kill(pid, SIGKILL);
+    }
+
+    printf("Terminated %s\n", bundleID.UTF8String);
+    return 0;
+}
+
 /* ── Command: openurl ── */
 
 static int cmd_openurl(NSString *udid, NSString *url) {
@@ -935,11 +1026,29 @@ static int cmd_openurl(NSString *udid, NSString *url) {
         return run_with_timeout(@[@"xcrun", @"simctl", @"openurl", udid, url], 15);
     }
 
-    /* Legacy: simctl openurl hangs. Write pending action for installer dylib. */
-    printf("openurl not directly supported on legacy simulators.\n");
-    printf("URL: %s\n", url.UTF8String);
-    printf("Use Safari on the home screen to navigate to this URL.\n");
-    return 1;
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    /* Legacy: write openurl command file and notify sim_app_installer.dylib */
+    printf("Opening URL on %s [legacy]: %s\n", get_device_name(device).UTF8String, url.UTF8String);
+
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *cmd = @{@"action": @"openurl", @"url": url};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    /* Notify the installer dylib */
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.openurl.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    printf("  Notification sent: %s\n", notifyName);
+    printf("  Note: openurl requires sim_app_installer.dylib with openurl handler.\n");
+    printf("  If not supported yet, open Safari and navigate manually.\n");
+    return 0;
 }
 
 /* ── Command: erase ── */
@@ -961,6 +1070,12 @@ static int cmd_spawn(NSString *udid, NSArray<NSString *> *spawnArgs) {
         return 1;
     }
 
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
     NSString *rtID = get_runtime_id(device);
     BOOL legacy = is_legacy_runtime(rtID);
 
@@ -970,9 +1085,65 @@ static int cmd_spawn(NSString *udid, NSArray<NSString *> *spawnArgs) {
         return run_with_timeout(args, 30);
     }
 
-    fprintf(stderr, "spawn is not supported on legacy simulators.\n");
-    fprintf(stderr, "CoreSimulator cannot communicate with legacy launchd_sim.\n");
-    fprintf(stderr, "Workaround: inject code via sim_app_installer.dylib constructor.\n");
+    /* Legacy: try simctl spawn with a short timeout — it may hang due to XPC issues */
+    printf("Attempting spawn on legacy device (may timeout)...\n");
+    NSMutableArray *args = [@[@"xcrun", @"simctl", @"spawn", udid] mutableCopy];
+    [args addObjectsFromArray:spawnArgs];
+    int rc = run_with_timeout(args, 10);
+    if (rc == 124) {
+        fprintf(stderr, "spawn timed out. CoreSimulator cannot communicate with legacy launchd_sim.\n");
+        fprintf(stderr, "Alternatives:\n");
+        fprintf(stderr, "  - Use 'rosettasim-ctl launch' to launch apps by bundle ID\n");
+        fprintf(stderr, "  - Inject code via sim_app_installer.dylib constructor\n");
+        return 1;
+    }
+    return rc;
+}
+
+/* ── Command: getenv ── */
+
+static int cmd_getenv(NSString *udid, NSString *varname) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"getenv", udid, varname], 10);
+    }
+
+    /* Legacy: simctl getenv uses XPC to query launchd_sim, which hangs.
+     * Try reading from the launchd_sim process environment directly. */
+    NSString *pgrepCmd = [NSString stringWithFormat:
+        @"pgrep -f 'launchd_sim.*%@'", udid];
+    int ec = 0;
+    NSString *pid = run_capture(@[@"/bin/sh", @"-c", pgrepCmd], &ec);
+    pid = [pid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if (pid.length > 0) {
+        /* Read environment from ps */
+        NSString *envCmd = [NSString stringWithFormat:
+            @"ps -p %@ -wwE -o command= | tr ' ' '\\n' | grep '^%@='", pid, varname];
+        NSString *result = run_capture(@[@"/bin/sh", @"-c", envCmd], &ec);
+        result = [result stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (result.length > 0) {
+            /* Extract value after = */
+            NSRange eq = [result rangeOfString:@"="];
+            if (eq.location != NSNotFound) {
+                printf("%s\n", [result substringFromIndex:eq.location + 1].UTF8String);
+                return 0;
+            }
+        }
+    }
+
+    fprintf(stderr, "getenv: variable '%s' not found (legacy device — limited support)\n",
+            varname.UTF8String);
     return 1;
 }
 
@@ -982,10 +1153,759 @@ static int cmd_logverbose(NSString *udid, NSString *enabled) {
     return run_with_timeout(@[@"xcrun", @"simctl", @"logverbose", udid, enabled], 10);
 }
 
+/* ── Command: delete (with legacy safety) ── */
+
+static int cmd_delete(int argc, const char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: rosettasim-ctl delete <UDID|unavailable|all>\n");
+        return 1;
+    }
+
+    NSString *target = [NSString stringWithUTF8String:argv[2]];
+
+    if ([target isEqualToString:@"unavailable"]) {
+        /* SAFETY: simctl considers legacy runtimes "unavailable" since they're not
+         * in the current Xcode SDK. We must protect legacy devices from deletion.
+         * Only delete devices whose runtimes are truly missing (not just old). */
+        printf("Filtering out legacy devices from 'unavailable' deletion...\n");
+
+        id deviceSet = get_device_set();
+        if (!deviceSet) return passthrough_to_simctl(argc, argv);
+
+        NSDictionary *devices = ((id(*)(id, SEL))objc_msgSend)(deviceSet, sel_registerName("devicesByUDID"));
+        int deleted = 0;
+        for (NSUUID *uuid in devices) {
+            id dev = devices[uuid];
+            NSString *rtID = get_runtime_id(dev);
+            if (!rtID) continue;
+
+            /* Check if runtime is "available" (has a valid runtime object with a root path) */
+            id runtime = ((id(*)(id, SEL))objc_msgSend)(dev, sel_registerName("runtime"));
+            BOOL available = NO;
+            if (runtime) {
+                NSString *rootPath = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("root"));
+                available = (rootPath != nil && [[NSFileManager defaultManager] fileExistsAtPath:rootPath]);
+            }
+
+            if (!available && !is_legacy_runtime(rtID)) {
+                /* Truly unavailable non-legacy device — delete it */
+                printf("  Deleting: %s (%s)\n", uuid.UUIDString.UTF8String,
+                       get_device_name(dev).UTF8String);
+                run_with_timeout(@[@"xcrun", @"simctl", @"delete", uuid.UUIDString], 15);
+                deleted++;
+            } else if (!available && is_legacy_runtime(rtID)) {
+                printf("  Protecting legacy device: %s (%s) [%s]\n",
+                       uuid.UUIDString.UTF8String, get_device_name(dev).UTF8String,
+                       rtID.UTF8String);
+            }
+        }
+        printf("Deleted %d unavailable non-legacy device(s).\n", deleted);
+        return 0;
+    }
+
+    /* For explicit UDID or "all", passthrough is fine */
+    return passthrough_to_simctl(argc, argv);
+}
+
+/* ── Command: appinfo ── */
+
+static int cmd_appinfo(NSString *udid, NSString *bundleID) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        /* Native: use simctl appinfo if available, else listapps + filter */
+        return run_with_timeout(@[@"xcrun", @"simctl", @"appinfo", udid, bundleID], 15);
+    }
+
+    /* Legacy: read from LaunchServicesMap + app Info.plist */
+    NSDictionary *lsMap = read_ls_map(udid);
+    NSDictionary *appInfo = nil;
+    NSString *section = nil;
+
+    for (NSString *sec in @[@"User", @"System", @"Internal"]) {
+        if (lsMap[sec][bundleID]) {
+            appInfo = lsMap[sec][bundleID];
+            section = sec;
+            break;
+        }
+    }
+
+    NSMutableDictionary *result = [NSMutableDictionary new];
+    result[@"CFBundleIdentifier"] = bundleID;
+
+    if (appInfo) {
+        if (appInfo[@"Path"]) result[@"Path"] = appInfo[@"Path"];
+        if (appInfo[@"Container"]) result[@"DataContainer"] = appInfo[@"Container"];
+        result[@"ApplicationType"] = section;
+
+        /* Read additional fields from the app's Info.plist */
+        NSString *appPlistPath = [appInfo[@"Path"] stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:appPlistPath];
+        if (info) {
+            if (info[@"CFBundleDisplayName"]) result[@"CFBundleDisplayName"] = info[@"CFBundleDisplayName"];
+            if (info[@"CFBundleName"]) result[@"CFBundleName"] = info[@"CFBundleName"];
+            if (info[@"CFBundleExecutable"]) result[@"CFBundleExecutable"] = info[@"CFBundleExecutable"];
+            if (info[@"CFBundleVersion"]) result[@"CFBundleVersion"] = info[@"CFBundleVersion"];
+            if (info[@"CFBundleShortVersionString"]) result[@"CFBundleShortVersionString"] = info[@"CFBundleShortVersionString"];
+            if (info[@"MinimumOSVersion"]) result[@"MinimumOSVersion"] = info[@"MinimumOSVersion"];
+        }
+        /* Bundle container = parent of .app */
+        if (appInfo[@"Path"])
+            result[@"Bundle"] = [appInfo[@"Path"] stringByDeletingLastPathComponent];
+    } else {
+        /* Fallback: search containers */
+        NSString *containersPath = [NSString stringWithFormat:
+            @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Containers/Bundle/Application",
+            NSHomeDirectory(), udid];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *cuuid in [fm contentsOfDirectoryAtPath:containersPath error:nil]) {
+            NSString *containerDir = [containersPath stringByAppendingPathComponent:cuuid];
+            for (NSString *item in [fm contentsOfDirectoryAtPath:containerDir error:nil]) {
+                if (![item hasSuffix:@".app"]) continue;
+                NSString *appPath = [containerDir stringByAppendingPathComponent:item];
+                NSString *infoPlist = [appPath stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+                if ([info[@"CFBundleIdentifier"] isEqualToString:bundleID]) {
+                    result[@"Path"] = appPath;
+                    result[@"Bundle"] = containerDir;
+                    result[@"ApplicationType"] = @"User";
+                    if (info[@"CFBundleDisplayName"]) result[@"CFBundleDisplayName"] = info[@"CFBundleDisplayName"];
+                    if (info[@"CFBundleExecutable"]) result[@"CFBundleExecutable"] = info[@"CFBundleExecutable"];
+                    if (info[@"CFBundleVersion"]) result[@"CFBundleVersion"] = info[@"CFBundleVersion"];
+                    if (info[@"CFBundleShortVersionString"]) result[@"CFBundleShortVersionString"] = info[@"CFBundleShortVersionString"];
+                    goto found;
+                }
+            }
+        }
+        fprintf(stderr, "App %s not found.\n", bundleID.UTF8String);
+        return 1;
+    }
+found:;
+
+    /* Print as JSON */
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:result
+                                                       options:NSJSONWritingPrettyPrinted error:nil];
+    if (jsonData) {
+        printf("%s\n", [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding].UTF8String);
+    }
+    return 0;
+}
+
+/* ── Command: privacy (TCC.db manipulation for legacy) ── */
+
+static int cmd_privacy(NSString *udid, NSString *action, NSString *service, NSString *bundleID) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        NSMutableArray *args = [@[@"xcrun", @"simctl", @"privacy", udid, action, service] mutableCopy];
+        if (bundleID) [args addObject:bundleID];
+        return run_with_timeout(args, 15);
+    }
+
+    /* Map service names to TCC service keys */
+    NSDictionary *serviceMap = @{
+        @"photos": @"kTCCServicePhotos",
+        @"camera": @"kTCCServiceCamera",
+        @"microphone": @"kTCCServiceMicrophone",
+        @"contacts": @"kTCCServiceAddressBook",
+        @"calendar": @"kTCCServiceCalendar",
+        @"reminders": @"kTCCServiceReminders",
+        @"location": @"kTCCServiceLocation",
+        @"media-library": @"kTCCServiceMediaLibrary",
+        @"motion": @"kTCCServiceMotion",
+        @"siri": @"kTCCServiceSiri",
+        @"speech-recognition": @"kTCCServiceSpeechRecognition",
+        @"all": @"ALL",
+    };
+
+    NSString *tccService = serviceMap[service];
+    if (!tccService) {
+        fprintf(stderr, "Unknown service: %s\nKnown: photos, camera, microphone, contacts, calendar, "
+                "reminders, location, media-library, motion, siri, speech-recognition, all\n",
+                service.UTF8String);
+        return 1;
+    }
+
+    NSString *tccPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Library/TCC/TCC.db",
+        NSHomeDirectory(), udid];
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:tccPath]) {
+        /* Create TCC directory and empty DB */
+        NSString *tccDir = [tccPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:tccDir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *createCmd = [NSString stringWithFormat:
+            @"sqlite3 '%@' 'CREATE TABLE IF NOT EXISTS access ("
+            "service TEXT NOT NULL, client TEXT NOT NULL, client_type INTEGER NOT NULL DEFAULT 0, "
+            "allowed INTEGER NOT NULL DEFAULT 1, prompt_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (service, client, client_type))'", tccPath];
+        system(createCmd.UTF8String);
+    }
+
+    if ([action isEqualToString:@"grant"]) {
+        if (!bundleID) { fprintf(stderr, "grant requires a bundle-id\n"); return 1; }
+        if ([tccService isEqualToString:@"ALL"]) {
+            for (NSString *svc in serviceMap.allValues) {
+                if ([svc isEqualToString:@"ALL"]) continue;
+                NSString *sql = [NSString stringWithFormat:
+                    @"sqlite3 '%@' \"INSERT OR REPLACE INTO access (service, client, client_type, allowed, prompt_count) "
+                    "VALUES ('%@', '%@', 0, 1, 0)\"", tccPath, svc, bundleID];
+                system(sql.UTF8String);
+            }
+        } else {
+            NSString *sql = [NSString stringWithFormat:
+                @"sqlite3 '%@' \"INSERT OR REPLACE INTO access (service, client, client_type, allowed, prompt_count) "
+                "VALUES ('%@', '%@', 0, 1, 0)\"", tccPath, tccService, bundleID];
+            system(sql.UTF8String);
+        }
+        printf("Granted %s access to %s\n", service.UTF8String, bundleID.UTF8String);
+    }
+    else if ([action isEqualToString:@"revoke"]) {
+        if (!bundleID) { fprintf(stderr, "revoke requires a bundle-id\n"); return 1; }
+        NSString *sql = [NSString stringWithFormat:
+            @"sqlite3 '%@' \"UPDATE access SET allowed=0 WHERE client='%@'%@\"",
+            tccPath, bundleID,
+            [tccService isEqualToString:@"ALL"] ? @"" :
+            [NSString stringWithFormat:@" AND service='%@'", tccService]];
+        system(sql.UTF8String);
+        printf("Revoked %s access for %s\n", service.UTF8String, bundleID.UTF8String);
+    }
+    else if ([action isEqualToString:@"reset"]) {
+        NSString *sql;
+        if (bundleID) {
+            sql = [NSString stringWithFormat:
+                @"sqlite3 '%@' \"DELETE FROM access WHERE client='%@'%@\"",
+                tccPath, bundleID,
+                [tccService isEqualToString:@"ALL"] ? @"" :
+                [NSString stringWithFormat:@" AND service='%@'", tccService]];
+        } else {
+            sql = [NSString stringWithFormat:
+                @"sqlite3 '%@' \"DELETE FROM access%@\"",
+                tccPath,
+                [tccService isEqualToString:@"ALL"] ? @"" :
+                [NSString stringWithFormat:@" WHERE service='%@'", tccService]];
+        }
+        system(sql.UTF8String);
+        printf("Reset %s privacy settings%s\n", service.UTF8String,
+               bundleID ? [NSString stringWithFormat:@" for %@", bundleID].UTF8String : "");
+    }
+    else {
+        fprintf(stderr, "Unknown action: %s (use grant, revoke, or reset)\n", action.UTF8String);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ── Command: addmedia ── */
+
+static int cmd_addmedia(NSString *udid, NSArray<NSString *> *files) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    BOOL legacy = is_legacy_runtime(rtID);
+
+    if (!legacy) {
+        NSMutableArray *args = [@[@"xcrun", @"simctl", @"addmedia", udid] mutableCopy];
+        [args addObjectsFromArray:files];
+        return run_with_timeout(args, 30);
+    }
+
+    /* Legacy: copy to DCIM directory */
+    NSString *dcimPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Media/DCIM/100APPLE",
+        NSHomeDirectory(), udid];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dcimPath
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    int copied = 0;
+    for (NSString *file in files) {
+        if (![fm fileExistsAtPath:file]) {
+            fprintf(stderr, "File not found: %s\n", file.UTF8String);
+            continue;
+        }
+        NSString *dest = [dcimPath stringByAppendingPathComponent:[file lastPathComponent]];
+        NSError *err = nil;
+        [fm removeItemAtPath:dest error:nil];
+        if ([fm copyItemAtPath:file toPath:dest error:&err]) {
+            printf("  Copied: %s\n", [file lastPathComponent].UTF8String);
+            copied++;
+        } else {
+            fprintf(stderr, "  Failed: %s (%s)\n", [file lastPathComponent].UTF8String,
+                    err.localizedDescription.UTF8String);
+        }
+    }
+    printf("Added %d file(s) to device media.\n", copied);
+    printf("  Note: Files are in DCIM but won't appear in Photos without DB update.\n");
+    return copied > 0 ? 0 : 1;
+}
+
+/* ── Command: touch (rosettasim extension) ── */
+
+static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    /* Write touch command file and notify sim_display_inject.dylib
+     * (loaded in Simulator.app, has access to SimHIDSystem) */
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *touchCmd = @{
+        @"action": @"touch",
+        @"x": @(x),
+        @"y": @(y),
+        @"duration": @(duration_ms),
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:touchCmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.touch.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    printf("Touch at (%.0f, %.0f) duration=%dms on %s\n",
+           x, y, duration_ms, get_device_name(device).UTF8String);
+    return 0;
+}
+
+/* ── Command: location ── */
+
+static int cmd_location(NSString *udid, int argc, const char *argv[]) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        return passthrough_to_simctl(argc, argv);
+    }
+
+    if (argc < 4) {
+        fprintf(stderr, "Usage: rosettasim-ctl location <UDID> set <lat>,<lon>\n");
+        fprintf(stderr, "       rosettasim-ctl location <UDID> clear\n");
+        return 1;
+    }
+
+    if (strcmp(argv[3], "clear") == 0) {
+        NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+        NSDictionary *cmd = @{@"action": @"location", @"clear": @YES};
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+        [jsonData writeToFile:cmdPath atomically:YES];
+        char notifyName[256];
+        snprintf(notifyName, sizeof(notifyName), "com.rosettasim.location.%s", udid.UTF8String);
+        notify_post(notifyName);
+        printf("Location cleared on %s\n", get_device_name(device).UTF8String);
+        return 0;
+    }
+
+    if (strcmp(argv[3], "set") != 0 || argc < 5) {
+        fprintf(stderr, "Usage: rosettasim-ctl location <UDID> set <lat>,<lon>\n");
+        fprintf(stderr, "       rosettasim-ctl location <UDID> clear\n");
+        return 1;
+    }
+
+    /* Parse lat,lon */
+    double lat = 0, lon = 0;
+    if (sscanf(argv[4], "%lf,%lf", &lat, &lon) != 2) {
+        fprintf(stderr, "Invalid coordinates: %s (expected lat,lon e.g. 51.5074,-0.1278)\n", argv[4]);
+        return 1;
+    }
+
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *cmd = @{@"action": @"location", @"lat": @(lat), @"lon": @(lon)};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.location.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    printf("Location set to %.6f, %.6f on %s\n", lat, lon, get_device_name(device).UTF8String);
+    printf("  Note: requires sim_app_installer.dylib with location handler.\n");
+    return 0;
+}
+
+/* ── Command: push ── */
+
+static int cmd_push(NSString *udid, int argc, const char *argv[]) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        return passthrough_to_simctl(argc, argv);
+    }
+
+    /* Usage: push <device> <bundle-id> <json-file-or--> */
+    if (argc < 5) {
+        fprintf(stderr, "Usage: rosettasim-ctl push <UDID> <bundle-id> <payload.json|->\n");
+        return 1;
+    }
+
+    NSString *bundleID = [NSString stringWithUTF8String:argv[3]];
+    NSString *payloadArg = [NSString stringWithUTF8String:argv[4]];
+
+    /* Read payload from file or stdin */
+    NSData *payloadData = nil;
+    if ([payloadArg isEqualToString:@"-"]) {
+        payloadData = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
+    } else {
+        payloadData = [NSData dataWithContentsOfFile:payloadArg];
+        if (!payloadData) {
+            fprintf(stderr, "Cannot read payload file: %s\n", payloadArg.UTF8String);
+            return 1;
+        }
+    }
+
+    /* Validate JSON */
+    NSDictionary *payload = [NSJSONSerialization JSONObjectWithData:payloadData options:0 error:nil];
+    if (![payload isKindOfClass:[NSDictionary class]]) {
+        fprintf(stderr, "Invalid JSON payload\n");
+        return 1;
+    }
+
+    /* Write push command for sim_app_installer.dylib */
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *cmd = @{
+        @"action": @"push",
+        @"bundle_id": bundleID,
+        @"payload": payload,
+    };
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.push.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    /* Extract alert for display */
+    NSDictionary *aps = payload[@"aps"];
+    NSString *alert = nil;
+    if ([aps[@"alert"] isKindOfClass:[NSString class]]) alert = aps[@"alert"];
+    else if ([aps[@"alert"] isKindOfClass:[NSDictionary class]]) alert = aps[@"alert"][@"body"];
+
+    printf("Push notification sent to %s on %s\n", bundleID.UTF8String,
+           get_device_name(device).UTF8String);
+    if (alert) printf("  Alert: %s\n", alert.UTF8String);
+    printf("  Note: requires sim_app_installer.dylib with push handler.\n");
+    return 0;
+}
+
+/* ── Command: ui ── */
+
+static int cmd_ui(NSString *udid, int argc, const char *argv[]) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        return passthrough_to_simctl(argc, argv);
+    }
+
+    if (argc < 5) {
+        fprintf(stderr, "Usage: rosettasim-ctl ui <UDID> content_size <category>\n");
+        fprintf(stderr, "       rosettasim-ctl ui <UDID> appearance <light|dark>\n");
+        fprintf(stderr, "\nContent size categories: extra-small, small, medium, large (default),\n");
+        fprintf(stderr, "  extra-large, extra-extra-large, extra-extra-extra-large,\n");
+        fprintf(stderr, "  accessibility-medium, accessibility-large, accessibility-extra-large,\n");
+        fprintf(stderr, "  accessibility-extra-extra-large, accessibility-extra-extra-extra-large\n");
+        return 1;
+    }
+
+    NSString *option = [NSString stringWithUTF8String:argv[3]];
+    NSString *value = [NSString stringWithUTF8String:argv[4]];
+
+    if ([option isEqualToString:@"appearance"]) {
+        fprintf(stderr, "appearance (dark mode) requires iOS 13+. Not available on legacy simulators.\n");
+        return 1;
+    }
+
+    if ([option isEqualToString:@"content_size"]) {
+        /* Map size name to UIContentSizeCategory key */
+        NSDictionary *sizeMap = @{
+            @"extra-small": @"UICTContentSizeCategoryXS",
+            @"small": @"UICTContentSizeCategoryS",
+            @"medium": @"UICTContentSizeCategoryM",
+            @"large": @"UICTContentSizeCategoryL",
+            @"extra-large": @"UICTContentSizeCategoryXL",
+            @"extra-extra-large": @"UICTContentSizeCategoryXXL",
+            @"extra-extra-extra-large": @"UICTContentSizeCategoryXXXL",
+            @"accessibility-medium": @"UICTContentSizeCategoryAccessibilityM",
+            @"accessibility-large": @"UICTContentSizeCategoryAccessibilityL",
+            @"accessibility-extra-large": @"UICTContentSizeCategoryAccessibilityXL",
+            @"accessibility-extra-extra-large": @"UICTContentSizeCategoryAccessibilityXXL",
+            @"accessibility-extra-extra-extra-large": @"UICTContentSizeCategoryAccessibilityXXXL",
+        };
+
+        NSString *category = sizeMap[value];
+        if (!category) {
+            fprintf(stderr, "Unknown content size: %s\n", value.UTF8String);
+            return 1;
+        }
+
+        /* Write to device's accessibility prefs plist */
+        NSString *prefsPath = [NSString stringWithFormat:
+            @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Library/Preferences/com.apple.Accessibility.plist",
+            NSHomeDirectory(), udid];
+
+        /* Ensure directory exists */
+        NSString *prefsDir = [prefsPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:prefsDir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+
+        /* Read existing or create new */
+        NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:prefsPath] ?: [NSMutableDictionary new];
+        prefs[@"PreferredContentSizeCategoryName"] = category;
+        [prefs writeToFile:prefsPath atomically:YES];
+
+        printf("Content size set to %s (%s) on %s\n",
+               value.UTF8String, category.UTF8String, get_device_name(device).UTF8String);
+        printf("  Reboot device for change to take effect.\n");
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown UI option: %s (use content_size or appearance)\n", option.UTF8String);
+    return 1;
+}
+
+/* ── Command: keychain ── */
+
+static int cmd_keychain(NSString *udid, int argc, const char *argv[]) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        return passthrough_to_simctl(argc, argv);
+    }
+
+    if (argc < 4) {
+        fprintf(stderr, "Usage: rosettasim-ctl keychain <UDID> reset\n");
+        fprintf(stderr, "       rosettasim-ctl keychain <UDID> add-root-cert <cert.pem>\n");
+        fprintf(stderr, "       rosettasim-ctl keychain <UDID> add-cert <cert.pem>\n");
+        return 1;
+    }
+
+    NSString *action = [NSString stringWithUTF8String:argv[3]];
+    NSString *deviceDataPath = [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data",
+        NSHomeDirectory(), udid];
+
+    if ([action isEqualToString:@"reset"]) {
+        /* Delete keychain databases */
+        NSString *keychainsDir = [deviceDataPath stringByAppendingPathComponent:@"Library/Keychains"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        int removed = 0;
+        for (NSString *file in [fm contentsOfDirectoryAtPath:keychainsDir error:nil]) {
+            if ([file hasPrefix:@"keychain-"] || [file hasPrefix:@"TrustStore"]) {
+                [fm removeItemAtPath:[keychainsDir stringByAppendingPathComponent:file] error:nil];
+                removed++;
+            }
+        }
+        printf("Keychain reset: removed %d file(s) from %s\n", removed, keychainsDir.UTF8String);
+        printf("  Reboot device for change to take effect.\n");
+        return 0;
+    }
+
+    if ([action isEqualToString:@"add-root-cert"] || [action isEqualToString:@"add-cert"]) {
+        if (argc < 5) {
+            fprintf(stderr, "Usage: rosettasim-ctl keychain <UDID> %s <cert.pem|cert.der>\n",
+                    action.UTF8String);
+            return 1;
+        }
+        NSString *certPath = [NSString stringWithUTF8String:argv[4]];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:certPath]) {
+            fprintf(stderr, "Certificate file not found: %s\n", certPath.UTF8String);
+            return 1;
+        }
+
+        /* Copy cert to device's TrustStore via sqlite3 */
+        NSData *certData = [NSData dataWithContentsOfFile:certPath];
+        if (!certData) {
+            fprintf(stderr, "Cannot read certificate file\n");
+            return 1;
+        }
+
+        NSString *trustStorePath = [deviceDataPath stringByAppendingPathComponent:
+            @"Library/Keychains/TrustStore.sqlite3"];
+        NSString *keychainsDir = [trustStorePath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:keychainsDir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+
+        /* Create table if needed and insert cert */
+        NSString *createSql = [NSString stringWithFormat:
+            @"sqlite3 '%@' 'CREATE TABLE IF NOT EXISTS tsettings ("
+            "sha1 BLOB NOT NULL DEFAULT (x\\'\\'), subj BLOB NOT NULL DEFAULT (x\\'\\'), "
+            "tset BLOB, data BLOB, PRIMARY KEY (sha1))'", trustStorePath];
+        system(createSql.UTF8String);
+
+        /* Write cert data to temp file for sqlite3 import */
+        NSString *tmpCert = [NSString stringWithFormat:@"/tmp/rosettasim_cert_%@.der", udid];
+        [certData writeToFile:tmpCert atomically:YES];
+
+        NSString *insertSql = [NSString stringWithFormat:
+            @"sqlite3 '%@' \"INSERT OR REPLACE INTO tsettings (sha1, subj, data) "
+            "VALUES (x'0000000000000000000000000000000000000000', x'00', readfile('%@'))\"",
+            trustStorePath, tmpCert];
+        int rc = system(insertSql.UTF8String);
+        [[NSFileManager defaultManager] removeItemAtPath:tmpCert error:nil];
+
+        if (rc == 0) {
+            printf("Certificate added to TrustStore on %s\n", get_device_name(device).UTF8String);
+            printf("  Reboot device for change to take effect.\n");
+        } else {
+            fprintf(stderr, "Failed to add certificate to TrustStore\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown keychain action: %s\n", action.UTF8String);
+    return 1;
+}
+
+/* ── Command: pbcopy ── */
+
+static int cmd_pbcopy(NSString *udid) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        /* Native: passthrough stdin to simctl pbcopy */
+        NSMutableArray *args = [@[@"xcrun", @"simctl", @"pbcopy", udid] mutableCopy];
+        return run_with_timeout(args, 10);
+    }
+
+    /* Read stdin */
+    NSData *inputData = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
+    NSString *text = [[NSString alloc] initWithData:inputData encoding:NSUTF8StringEncoding];
+    if (!text || text.length == 0) {
+        fprintf(stderr, "No input received on stdin\n");
+        return 1;
+    }
+
+    /* Write command for sim_app_installer.dylib */
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *cmd = @{@"action": @"pbcopy", @"text": text};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.pbcopy.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    printf("Copied %lu characters to device pasteboard\n", (unsigned long)text.length);
+    printf("  Note: requires sim_app_installer.dylib with pbcopy handler.\n");
+    return 0;
+}
+
+/* ── Command: pbpaste ── */
+
+static int cmd_pbpaste(NSString *udid) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    NSString *rtID = get_runtime_id(device);
+    if (!is_legacy_runtime(rtID)) {
+        return run_with_timeout(@[@"xcrun", @"simctl", @"pbpaste", udid], 10);
+    }
+
+    /* Write command for sim_app_installer.dylib */
+    NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%@.json", udid];
+    NSDictionary *cmd = @{@"action": @"pbpaste"};
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:cmd options:0 error:nil];
+    [jsonData writeToFile:cmdPath atomically:YES];
+
+    char notifyName[256];
+    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.pbpaste.%s", udid.UTF8String);
+    notify_post(notifyName);
+
+    /* Wait for result */
+    usleep(2000000);
+
+    NSString *resultPath = [NSString stringWithFormat:@"/tmp/rosettasim_result_%@.txt", udid];
+    NSString *result = [NSString stringWithContentsOfFile:resultPath
+                                                encoding:NSUTF8StringEncoding error:nil];
+    if (result) {
+        printf("%s", result.UTF8String);
+        [[NSFileManager defaultManager] removeItemAtPath:resultPath error:nil];
+    } else {
+        fprintf(stderr, "No pasteboard content received.\n");
+        fprintf(stderr, "  Note: requires sim_app_installer.dylib with pbpaste handler.\n");
+        return 1;
+    }
+    return 0;
+}
+
 /* ── Usage ── */
 
 static void usage(void) {
-    /* Match simctl's help format for drop-in compatibility */
     fprintf(stderr,
         "usage: simctl [--set <path>] [--profiles <path>] <subcommand> ...\n"
         "       simctl help [subcommand]\n"
@@ -997,24 +1917,39 @@ static void usage(void) {
         "will choose one of them.\n"
         "\n"
         "Subcommands:\n"
+        "\taddmedia            Add photos/videos to a device.\n"
+        "\tappinfo             Show info about an installed app.\n"
         "\tboot                Boot a device or device pair.\n"
+        "\tclone               Clone an existing device.\n"
         "\tcreate              Create a new device.\n"
         "\tdelete              Delete specified devices, unavailable devices, or all devices.\n"
+        "\tdiagnose            Collect diagnostic info for the Simulator.\n"
         "\terase               Erase a device's contents and settings.\n"
         "\tget_app_container   Print the path of the installed app's container\n"
         "\tgetenv              Print an environment variable from a running device.\n"
         "\thelp                Prints the usage for a given subcommand.\n"
         "\tinstall             Install an app on a device.\n"
         "\tio                  Set up a device IO operation.\n"
+        "\tkeychain            Manipulate a device's keychain.\n"
         "\tlaunch              Launch an application by identifier on a device.\n"
         "\tlist                List available devices, device types, runtimes, or device pairs.\n"
         "\tlistapps            Show the installed applications.\n"
+        "\tlocation            Control a device's simulated location.\n"
         "\tlogverbose          enable or disable verbose logging for a device\n"
         "\topenurl             Open a URL in a device.\n"
+        "\tpbcopy              Copy standard input onto the device pasteboard.\n"
+        "\tpbpaste             Print the contents of the device pasteboard.\n"
+        "\tpbsync              Sync the pasteboard content.\n"
+        "\tprivacy             Grant, revoke, or reset privacy permissions.\n"
+        "\tpush                Send a simulated push notification.\n"
+        "\trename              Rename a device.\n"
         "\tshutdown            Shutdown a device.\n"
         "\tspawn               Spawn a process by executing a given executable on a device.\n"
         "\tstatus              Show device status (rosettasim extension).\n"
+        "\tstatus_bar           Override information shown in the status bar.\n"
         "\tterminate           Terminate an application by identifier on a device.\n"
+        "\ttouch               Send a touch event to a device (rosettasim extension).\n"
+        "\tui                  Get or set UI options.\n"
         "\tuninstall           Uninstall an app from a device.\n"
         "\n"
         "rosettasim-ctl: drop-in simctl replacement with legacy device support.\n"
@@ -1079,7 +2014,7 @@ int main(int argc, const char *argv[]) {
         }
         else if ([cmd isEqualToString:@"openurl"]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl openurl <UDID> <url>\n"); return 1; }
-            return cmd_openurl([NSString stringWithUTF8String:argv[2]],
+            return cmd_openurl(resolve_device_arg(argv[2]),
                               [NSString stringWithUTF8String:argv[3]]);
         }
         else if ([cmd isEqualToString:@"erase"]) {
@@ -1091,7 +2026,106 @@ int main(int argc, const char *argv[]) {
             NSMutableArray *spawnArgs = [NSMutableArray new];
             for (int i = 3; i < argc; i++)
                 [spawnArgs addObject:[NSString stringWithUTF8String:argv[i]]];
-            return cmd_spawn([NSString stringWithUTF8String:argv[2]], spawnArgs);
+            return cmd_spawn(resolve_device_arg(argv[2]), spawnArgs);
+        }
+        else if ([cmd isEqualToString:@"create"]) {
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"delete"]) {
+            return cmd_delete(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"clone"]) {
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"rename"]) {
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"diagnose"]) {
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"appinfo"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl appinfo <UDID> <bundle-id>\n"); return 1; }
+            return cmd_appinfo(resolve_device_arg(argv[2]),
+                              [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"privacy"]) {
+            if (argc < 5) { fprintf(stderr, "Usage: rosettasim-ctl privacy <UDID> <grant|revoke|reset> <service> [bundle-id]\n"); return 1; }
+            return cmd_privacy(resolve_device_arg(argv[2]),
+                              [NSString stringWithUTF8String:argv[3]],
+                              [NSString stringWithUTF8String:argv[4]],
+                              argc > 5 ? [NSString stringWithUTF8String:argv[5]] : nil);
+        }
+        else if ([cmd isEqualToString:@"getenv"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl getenv <UDID> <variable>\n"); return 1; }
+            return cmd_getenv(resolve_device_arg(argv[2]),
+                             [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"addmedia"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl addmedia <UDID> <file> [file...]\n"); return 1; }
+            NSMutableArray *files = [NSMutableArray new];
+            for (int i = 3; i < argc; i++)
+                [files addObject:[NSString stringWithUTF8String:argv[i]]];
+            return cmd_addmedia(resolve_device_arg(argv[2]), files);
+        }
+        else if ([cmd isEqualToString:@"location"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl location <UDID> set <lat>,<lon>\n"); return 1; }
+            return cmd_location(resolve_device_arg(argv[2]), argc, argv);
+        }
+        else if ([cmd isEqualToString:@"push"]) {
+            if (argc < 5) { fprintf(stderr, "Usage: rosettasim-ctl push <UDID> <bundle-id> <payload.json|->\n"); return 1; }
+            return cmd_push(resolve_device_arg(argv[2]), argc, argv);
+        }
+        else if ([cmd isEqualToString:@"status_bar"]) {
+            /* status_bar overrides require iOS 13+ UIStatusBar override API — genuinely unavailable */
+            if (argc >= 3) {
+                NSString *devUdid = resolve_device_arg(argv[2]);
+                id ds = get_device_set();
+                id dev = ds ? find_device(ds, devUdid) : nil;
+                if (dev && is_legacy_runtime(get_runtime_id(dev))) {
+                    fprintf(stderr, "status_bar overrides require iOS 13+ (UIStatusBar override API does not exist on legacy runtimes).\n");
+                    return 1;
+                }
+            }
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"keychain"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl keychain <UDID> <reset|add-root-cert|add-cert> [cert]\n"); return 1; }
+            return cmd_keychain(resolve_device_arg(argv[2]), argc, argv);
+        }
+        else if ([cmd isEqualToString:@"pbcopy"]) {
+            if (argc < 3) { fprintf(stderr, "Usage: echo text | rosettasim-ctl pbcopy <UDID>\n"); return 1; }
+            return cmd_pbcopy(resolve_device_arg(argv[2]));
+        }
+        else if ([cmd isEqualToString:@"pbpaste"]) {
+            if (argc < 3) { fprintf(stderr, "Usage: rosettasim-ctl pbpaste <UDID>\n"); return 1; }
+            return cmd_pbpaste(resolve_device_arg(argv[2]));
+        }
+        else if ([cmd isEqualToString:@"pbsync"]) {
+            /* pbsync syncs host↔device pasteboard — for legacy, same as pbpaste */
+            if (argc < 3) return passthrough_to_simctl(argc, argv);
+            NSString *devUdid = resolve_device_arg(argv[2]);
+            id ds = get_device_set();
+            id dev = ds ? find_device(ds, devUdid) : nil;
+            if (dev && is_legacy_runtime(get_runtime_id(dev))) {
+                fprintf(stderr, "pbsync: use pbcopy/pbpaste for legacy devices (no bidirectional sync).\n");
+                return 1;
+            }
+            return passthrough_to_simctl(argc, argv);
+        }
+        else if ([cmd isEqualToString:@"ui"]) {
+            if (argc < 5) { fprintf(stderr, "Usage: rosettasim-ctl ui <UDID> content_size <category>\n"); return 1; }
+            return cmd_ui(resolve_device_arg(argv[2]), argc, argv);
+        }
+        else if ([cmd isEqualToString:@"touch"]) {
+            if (argc < 5) { fprintf(stderr, "Usage: rosettasim-ctl touch <UDID> <x> <y> [--duration=<ms>]\n"); return 1; }
+            float x = atof(argv[3]);
+            float y = atof(argv[4]);
+            int duration = 100; /* default tap duration */
+            for (int i = 5; i < argc; i++) {
+                if (strncmp(argv[i], "--duration=", 11) == 0)
+                    duration = atoi(argv[i] + 11);
+            }
+            return cmd_touch(resolve_device_arg(argv[2]), x, y, duration);
         }
         else if ([cmd isEqualToString:@"logverbose"]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl logverbose <UDID> <on|off>\n"); return 1; }
@@ -1116,18 +2150,9 @@ int main(int argc, const char *argv[]) {
             return passthrough_to_simctl(argc, argv);
         }
         else if ([cmd isEqualToString:@"terminate"]) {
-            /* For legacy: kill the app process directly */
-            if (argc >= 4) {
-                NSString *udid = resolve_device_arg(argv[2]);
-                id deviceSet = get_device_set();
-                id device = deviceSet ? find_device(deviceSet, udid) : nil;
-                if (device && is_legacy_runtime(get_runtime_id(device))) {
-                    /* Can't terminate via simctl on legacy — just report */
-                    fprintf(stderr, "terminate not supported on legacy simulators.\n");
-                    return 1;
-                }
-            }
-            return passthrough_to_simctl(argc, argv);
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl terminate <UDID> <bundle-id>\n"); return 1; }
+            return cmd_terminate(resolve_device_arg(argv[2]),
+                                [NSString stringWithUTF8String:argv[3]]);
         }
         else if ([cmd isEqualToString:@"help"]) {
             if (argc >= 3) {

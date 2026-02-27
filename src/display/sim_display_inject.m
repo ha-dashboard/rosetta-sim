@@ -24,9 +24,11 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <mach/mach_time.h>
+#include <notify.h>
 
 /* --- Per-device display state --- */
 
@@ -720,6 +722,162 @@ static void install_keyboard_swizzle(void) {
     NSLog(@"[inject] Installed keyboard crash swizzle on SimDevice");
 }
 
+/* --- Touch event injection via darwin notification --- */
+
+/* Dispatch a touch event through Simulator.app's SimHIDSystem.
+ * Simulator.app has SimulatorKit loaded which provides the full HID pipeline.
+ * We use the SimDevice's IO client to send digitizer events. */
+
+static void handle_touch_notification(const char *udid) {
+    @autoreleasepool {
+        NSString *cmdPath = [NSString stringWithFormat:@"/tmp/rosettasim_cmd_%s.json", udid];
+        NSData *data = [NSData dataWithContentsOfFile:cmdPath];
+        if (!data) return;
+
+        NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![cmd isKindOfClass:[NSDictionary class]]) return;
+        if (![[cmd[@"action"] description] isEqualToString:@"touch"]) return;
+
+        float x = [cmd[@"x"] floatValue];
+        float y = [cmd[@"y"] floatValue];
+        int duration_ms = [cmd[@"duration"] intValue];
+        if (duration_ms <= 0) duration_ms = 100;
+
+        [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+
+        NSLog(@"[inject] Touch event: (%.0f, %.0f) duration=%dms udid=%s", x, y, duration_ms, udid);
+
+        /* Find the SimDevice for this UDID via CoreSimulator */
+        Class SimServiceContext = objc_getClass("SimServiceContext");
+        if (!SimServiceContext) {
+            NSLog(@"[inject] SimServiceContext not found — cannot inject touch");
+            return;
+        }
+
+        NSError *err = nil;
+        id ctx = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
+            (id)SimServiceContext,
+            sel_registerName("sharedServiceContextForDeveloperDir:error:"),
+            @"/Applications/Xcode.app/Contents/Developer", &err);
+        if (!ctx) return;
+
+        id deviceSet = ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("defaultDeviceSetWithError:"));
+        if (!deviceSet) return;
+
+        NSDictionary *devices = ((id(*)(id, SEL))objc_msgSend)(deviceSet, sel_registerName("devicesByUDID"));
+        NSString *udidStr = [NSString stringWithUTF8String:udid];
+        NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:udidStr];
+        id device = devices[uuid];
+        if (!device) {
+            NSLog(@"[inject] Device %s not found in device set", udid);
+            return;
+        }
+
+        /* Try to get the HID system port via SimDevice's sendEventToHIDSystem:
+         * or through the IO client. Simulator.app typically has a SimHIDSystem
+         * instance we can use. */
+
+        /* Approach: Use SimDevice's HID event API if available */
+        SEL sendHIDSel = sel_registerName("sendEventToHIDSystem:");
+        if ([device respondsToSelector:sendHIDSel]) {
+            /* Build an IOHIDEvent for a digitizer touch.
+             * We use IOHIDEventCreateDigitizerFingerEvent from IOKit. */
+            typedef void* (*CreateFingerEventFn)(void *allocator, uint64_t timestamp,
+                uint32_t index, uint32_t identity, uint32_t eventMask,
+                float x, float y, float z, float tipPressure, float twist,
+                BOOL range, BOOL touch, uint32_t options);
+            CreateFingerEventFn createFinger = (CreateFingerEventFn)dlsym(RTLD_DEFAULT,
+                "IOHIDEventCreateDigitizerFingerEvent");
+
+            typedef void* (*CreateDigitizerEventFn)(void *allocator, uint64_t timestamp,
+                uint32_t transducerType, uint32_t index, uint32_t identity,
+                uint32_t eventMask, uint32_t buttonMask,
+                float x, float y, float z, float tipPressure, float barrelPressure,
+                BOOL range, BOOL touch, uint32_t options);
+            CreateDigitizerEventFn createDigitizer = (CreateDigitizerEventFn)dlsym(RTLD_DEFAULT,
+                "IOHIDEventCreateDigitizerEvent");
+
+            typedef void (*AppendEventFn)(void *parent, void *child);
+            AppendEventFn appendEvent = (AppendEventFn)dlsym(RTLD_DEFAULT,
+                "IOHIDEventAppendEvent");
+
+            if (createFinger && createDigitizer && appendEvent) {
+                uint64_t ts = mach_absolute_time();
+
+                /* Find device screen dimensions for normalizing coordinates */
+                float devW = 0, devH = 0;
+                for (int i = 0; i < g_device_count; i++) {
+                    if (strcmp(g_devices[i].udid, udid) == 0) {
+                        devW = (float)g_devices[i].width / g_devices[i].scale;
+                        devH = (float)g_devices[i].height / g_devices[i].scale;
+                        break;
+                    }
+                }
+                if (devW <= 0 || devH <= 0) { devW = 1024; devH = 768; } /* iPad default */
+
+                /* Normalize to 0.0-1.0 range */
+                float nx = x / devW;
+                float ny = y / devH;
+                if (nx < 0) nx = 0; if (nx > 1) nx = 1;
+                if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+
+                /* Touch down */
+                void *parent = createDigitizer(NULL, ts, 2 /*finger*/, 0, 0,
+                    (1<<0)|(1<<1)|(1<<5), /* range|touch|position */
+                    0, nx, ny, 0, 1.0, 0, YES, YES, 0);
+                void *finger = createFinger(NULL, ts, 0, 2, (1<<0)|(1<<1)|(1<<5),
+                    nx, ny, 0, 1.0, 0, YES, YES, 0);
+                if (parent && finger) {
+                    appendEvent(parent, finger);
+                    ((void(*)(id, SEL, void*))objc_msgSend)(device, sendHIDSel, parent);
+                    CFRelease(finger);
+                    NSLog(@"[inject] Touch DOWN sent at (%.2f, %.2f)", nx, ny);
+                }
+
+                /* Wait for duration */
+                usleep(duration_ms * 1000);
+
+                /* Touch up */
+                ts = mach_absolute_time();
+                void *upParent = createDigitizer(NULL, ts, 2, 0, 0,
+                    (1<<0)|(1<<1)|(1<<5), 0, nx, ny, 0, 0, 0, NO, NO, 0);
+                void *upFinger = createFinger(NULL, ts, 0, 2, (1<<0)|(1<<1)|(1<<5),
+                    nx, ny, 0, 0, 0, NO, NO, 0);
+                if (upParent && upFinger) {
+                    appendEvent(upParent, upFinger);
+                    ((void(*)(id, SEL, void*))objc_msgSend)(device, sendHIDSel, upParent);
+                    CFRelease(upFinger);
+                    NSLog(@"[inject] Touch UP sent");
+                }
+                if (parent) CFRelease(parent);
+                if (upParent) CFRelease(upParent);
+            } else {
+                NSLog(@"[inject] IOHIDEvent creation functions not found");
+            }
+        } else {
+            NSLog(@"[inject] SimDevice does not respond to sendEventToHIDSystem:");
+            /* Fallback: try posting through the window's NSEvent system */
+        }
+    }
+}
+
+static void register_touch_notifications(void) {
+    /* Register for touch notifications for all active devices */
+    for (int i = 0; i < g_device_count; i++) {
+        if (!g_devices[i].active) continue;
+        char notifyName[256];
+        snprintf(notifyName, sizeof(notifyName), "com.rosettasim.touch.%s", g_devices[i].udid);
+        int token;
+        const char *udid_copy = g_devices[i].udid; /* stable pointer — struct persists */
+        notify_register_dispatch(notifyName, &token, dispatch_get_main_queue(),
+            ^(int t) {
+                (void)t;
+                handle_touch_notification(udid_copy);
+            });
+        NSLog(@"[inject] Registered touch handler: %s", notifyName);
+    }
+}
+
 __attribute__((constructor))
 static void inject_init(void) {
     NSLog(@"[inject] sim_display_inject loaded into %s (pid=%d)",
@@ -755,5 +913,14 @@ static void inject_init(void) {
         }
 
         retry_injection();
+
+        /* Register touch notification handlers after a delay
+         * (device list needs to be loaded first) */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10*NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            if (g_device_count > 0) {
+                register_touch_notifications();
+            }
+        });
     });
 }
