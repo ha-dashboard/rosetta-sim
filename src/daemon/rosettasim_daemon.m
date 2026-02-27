@@ -886,11 +886,14 @@ int main(int argc, const char *argv[]) {
                         if (dctx->active) {
                             write_active_devices();
                         }
-                    } else if (dctx->active && currentState == 1) {
-                        /* Device shut down — deactivate and re-register for next boot.
-                         * Only deactivate when state is definitively 1 (Shutdown).
-                         * Never deactivate booted devices (state 2/3/4) even if flush_count==0. */
-                        NSLog(@"[daemon] Re-scan: %s shut down (state=1), re-registering", dctx->name);
+                    } else if (dctx->active && currentState == 1 && dctx->flush_count > 0) {
+                        /* Device was booted (received flushes) and has now shut down.
+                         * Deactivate and re-register for next boot.
+                         * flush_count > 0 ensures we only deactivate devices that WERE
+                         * actually booted and rendering, not pre-registered devices
+                         * still waiting for their first boot. */
+                        NSLog(@"[daemon] Re-scan: %s shut down after %d flushes, re-registering",
+                              dctx->name, dctx->flush_count);
                         deactivate_device(dctx);
                         activate_device(dctx, dev);
                         write_active_devices();
