@@ -1,115 +1,58 @@
 # Session 29 Handoff
 
-## Session 28 Summary
+## Summary
+Session focused on iOS 7, 8, 13, 14, 15 runtime support. Went from 5 working runtimes to 7+ with display rendering, multiple root causes found and fixed.
 
-**10 commits**, covering scale fix investigation (failed), screenshot tooling, repo cleanup, and restructuring.
+## Commits (Session 29)
+- `b0ff220` — iOS 8.2 + 13.7 runtime support (msg_id=2, FrontBoard fix, SFB stub, install script)
+- `584b9f7` — Daemon periodic re-scan + CFRunLoopRun stability
+- `225296c` — Daemon re-scan stability (only deactivate used devices)
+- `cf84eed` — RosettaSim.app builder (double-clickable macOS app)
+- `654c27b` — RosettaSim.app cleanup on exit
+- `3be9cef` — Idle CPU fix + iOS 8.2 CFDictionaryCreate crash fix
+- `e2a73d1` — iOS 8.2 crash protection (6-layer shim)
+- `7b563e4` — iOS 8.2 comprehensive status doc (parked)
+- `a767e36` — iOS 15.7 daemon allowlist + iOS 8.2 bundleIdentifier fix
 
-### Commit Log (Session 28)
+## Runtime Status
 
-```
-ecd0c83 refactor: restructure repo — source under src/, setup scripts separated
-0bb7e8b feat: simdeviceio screenshot plugin (source + build target)
-c7c8843 chore: remove abandoned broker/bridge code — keep working display bridge only
-a9148ea feat: daemon stores runtime_root per device for future plugin integration
-51c5558 feat: screenshot tool + simctl wrapper for legacy iOS simulators
-d7b3c26 docs: session 29 handoff — scale fix investigation, SimFramebuffer RE
-7df5543 revert: restore pt_width=pixel_width — BSMainScreenScale patch has no visual effect
-bef851c feat: 2x scale fix via BaseBoard binary patch + daemon pt_width/2
-```
+| Runtime | Arch | Display | Touch | Status |
+|---------|------|---------|-------|--------|
+| iOS 7.0 | x86_64 | — | — | Parked — liblaunch_sim protocol mismatch |
+| iOS 8.2 | x86_64 | Black | — | Parked — zero flushes (bundleID nil chain). Full doc: ios82-status.md |
+| iOS 9.3 | x86_64 | ✅ | ✅ | Working |
+| iOS 10.3 | x86_64 | ✅ | ✅ | Working |
+| iOS 12.4 | x86_64 | ✅ | Testing | SimulatorHID copied into RuntimeRoot — awaiting touch test |
+| iOS 13.7 | x86_64 | ✅ | Testing | SFB stub + PurpleFB fallback — needs SimulatorHID copy like 12.4 |
+| iOS 14.5 | x86_64+arm64 | ❌ | ❌ | Blocked — systemic SIGBUS crash-loop |
+| iOS 15.7 | arm64+x86_64 | Testing | — | Universal SFB stub + headServices — Agent D testing |
+| iOS 16.4+ | arm64 | ✅ | ✅ | Working (native) |
 
-### Repo Structure (NEW — restructured in Session 28)
+## Key Fixes
 
-```
-rosetta/
-  README.md
-  CLAUDE.md
-  src/
-    daemon/        rosettasim_daemon.m
-    display/       sim_display_inject.m
-    bridge/        purple_fb_bridge.m
-    screenshot/    fb_to_png.m, rosettasim_screenshot_plugin.m
-    scale/         sim_scale_fix.m
-    viewer/        sim_viewer.m
-    Makefile       builds all → src/build/
-  scripts/
-    setup.sh, start_rosettasim.sh, install_legacy_sim.sh
-    test_all_devices.sh, simctl
-  setup/
-    setup_xcode833.sh, install_sim93.sh, launch_xcode833.sh, stubs/
-  docs/
-    milestone_*.png
-  .claude/
-    context/, plans/, agents/
-```
+### SimFramebufferClient stub (iOS 13.7, 15.7)
+`src/shims/sim_framebuffer_stub.c` — returns NULL from SFBConnectionCreate instead of ud2 trap. With headServices → PurpleFB fallback. iOS 15.7 needs universal (arm64+x86_64) build.
 
-### Runtime Compatibility Matrix
+### iOS 8.2 crash protection (parked)
+`src/shims/ios8_frontboard_fix.m` — 7-layer shim. Both processes survive but zero flushes. Root cause: [NSBundle mainBundle] nil under Rosetta 2. Full analysis in ios82-status.md.
 
-| iOS | Display Protocol | Status |
-|-----|-----------------|--------|
-| 9.3 | PurpleFBServer | Working (scale=1, square icons) |
-| 10.3 | PurpleFBServer | Working (scale=1, square icons) |
-| 12.4 | PurpleFBServer | Working (100% coverage, full display) |
-| 13.7 | Crashes | launchd bootstrap failure on macOS 26 |
-| 14.5 | Crashes | launchd bootstrap failure on macOS 26 |
-| 15.7+ | Native | Works natively via SimRenderServer |
+### Daemon re-scan
+5s periodic re-scan, runtime allowlist (7.0–15.7), idle CPU fix (CADisplayLink paused when no devices).
 
-### Screenshot Support
+### RosettaSim.app
+`scripts/build_app.sh` — double-clickable app, auto-starts daemon, kills on exit.
 
-- `scripts/simctl io <UDID> screenshot <file>` — works for ALL devices
-  - Legacy: reads daemon's IOSurface via `fb_to_png` tool
-  - Native: delegates to `xcrun simctl io screenshot`
-- Native `xcrun simctl io screenshot` for legacy: NOT possible without modifying Apple's signed binaries
+### Install script
+`scripts/install_legacy_sim.sh` — archive.org downloads for Xcode 5.0/6.2, extraction, plist generation.
 
-### Scale Fix Attempts (ALL FAILED)
+## Key Findings
+- Finding 51: iOS 13.7 QuartzCore has PurpleFB fallback (_detectSimDisplays fails → _detectDisplays)
+- Finding 53: SimFramebufferClient ud2 trap when SIMULATOR_FRAMEBUFFER_FRAMEWORK unset
+- Finding 62: HID protocol identical on host side for all runtimes
+- Finding 66: iOS 12.4+ HID needs SimulatorHID.framework inside RuntimeRoot (DYLD_ROOT_PATH blocks host paths)
+- Rosetta 2: @try/@catch triggers SIGTRAP, SIMCTL_CHILD doesn't reach launchd_sim daemons, dyld_sim needs Apple signature
 
-| Approach | Result |
-|----------|--------|
-| DYLD_INSERT via SIMCTL_CHILD | launchd_sim strips DYLD_ vars |
-| insert_dylib + __interpose | dyld_sim ignores interpose for LC_LOAD_DYLIB |
-| insert_dylib + constructor | Infinite unmap/remap loop |
-| BaseBoard binary patch | BSMainScreenScale→2.0 doesn't reach Display::set_scale |
-| Constant patch (Session 27) | Breaks display init entirely |
-
-### simdeviceio Plugin Attempts (ALL FAILED)
-
-| Approach | Result |
-|----------|--------|
-| Custom .simdeviceio bundle | CoreSimulatorService won't load third-party plugins |
-| insert_dylib into IndigoLegacy | Plugin never loads for legacy devices |
-| DYLD_INSERT into CoreSimulatorService | Binary has library-validation flag |
-
-### Session 28 Findings
-
-| # | Agent | Finding |
-|---|-------|---------|
-| 37 | A | SimFramebuffer protocol RE (SFB API, IOSurface swapchains) |
-| 38 | A | Screenshot via Display port descriptor (SimDisplayIOSurfaceRenderable) |
-| 39 | A | SimDevice → Display port selector chain |
-| 40 | A | Screenshot IOSurface transport via XPC/ROCKit |
-| 41 | A | simdeviceio plugin bundle structure + loading mechanism |
-| 42 | C | Complete SFB C API surface (SFBConnection/SFBDisplay/SFBSwapchain) |
-| 43 | C | PurpleFBServer in all runtimes through iOS 14.5 |
-| 44 | C | iOS 13.7/14.5 crash during launchd bootstrap |
-| 45 | C | Display port class hierarchy (SimDisplayIOSurfaceRenderable) |
-| 46 | B | IndigoLegacyFramebufferServices never loads for legacy devices |
-
-### Session 29 Priorities
-
-#### P1: 2x Scale (Deeper RE)
-- Must trace BSMainScreenScale → Display::set_scale in backboardd
-- The function returns 2.0 after binary patch but value never reaches set_scale
-- Need to find the exact code path and what conditions gate the call
-- Ghidra RE task on iOS 9.3 backboardd
-
-#### P2: iOS 8/11 Runtimes
-- CDN 403 for both — needs Xcode 7.3.1 (iOS 8) or 9.4.1 (iOS 11) with Apple ID auth
-
-#### P3: Native simctl Screenshot
-- Requires deeper CoreSimulator integration (modifying SimRenderServer's display descriptor)
-- Or implementing a full SimRenderServer-compatible display service
-- Low priority — scripts/simctl wrapper works
-
-### Communication Protocol
-- Documented in `~/.claude/CLAUDE.md`
-- Use `mcp__happy-mcp__happy_send_message` (NOT built-in SendMessage)
-- Sign off: `[Role - session_id]`
+## In Progress
+- rosettasim-ctl utility (Agent C building)
+- iOS 12.4/13.7 HID touch test (SimulatorHID deployed)
+- iOS 15.7 display test (universal SFB stub deployed)
