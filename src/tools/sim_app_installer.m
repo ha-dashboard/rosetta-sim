@@ -213,11 +213,71 @@ static void process_legacy_pending(void) {
  * Constructor
  * ================================================================ */
 
+/* ================================================================
+ * File-polling fallback for cross-namespace IPC
+ *
+ * Darwin notifications don't cross the host↔sim boundary (different
+ * notifyd instances). We use a 2-second polling timer on the cmd file
+ * as the primary mechanism, with darwin notify as a bonus for same-
+ * namespace callers.
+ * ================================================================ */
+
+static void poll_cmd_file(void) {
+    NSString *cmdPath = [NSString stringWithUTF8String:g_cmd_path];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:cmdPath]) return;
+
+    NSData *data = [NSData dataWithContentsOfFile:cmdPath];
+    if (!data) return;
+
+    /* Peek at the content to determine action type */
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([parsed isKindOfClass:[NSArray class]]) {
+        /* Array = install command */
+        handle_install();
+    } else if ([parsed isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *cmd = (NSDictionary *)parsed;
+        NSString *action = cmd[@"action"];
+        if ([action isEqualToString:@"openurl"]) {
+            /* openurl: extract URL and open via LSApplicationWorkspace or UIApplication */
+            NSString *url = cmd[@"url"];
+            if (url) {
+                log_result("Opening URL: %s", url.UTF8String);
+                Class lsClass = objc_getClass("LSApplicationWorkspace");
+                if (lsClass) {
+                    id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
+                                    sel_registerName("defaultWorkspace"));
+                    if (workspace) {
+                        NSURL *nsurl = [NSURL URLWithString:url];
+                        if (nsurl) {
+                            ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace,
+                                sel_registerName("openURL:"), nsurl);
+                            log_result("  openURL dispatched");
+                        }
+                    }
+                }
+                [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+            }
+        } else if (cmd[@"bundle_id"] && !action) {
+            /* Dict with bundle_id but no action = launch command */
+            handle_launch();
+        } else {
+            /* Unknown action — remove file to avoid stuck loop */
+            log_result("Unknown cmd action: %s", action ? action.UTF8String : "(null)");
+            [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
+        }
+    }
+}
+
 __attribute__((constructor))
 static void sim_app_installer_init(void) {
+    /* Try SIMULATOR_UDID first (iOS 10+), fall back to IPHONE_SIMULATOR_DEVICE (iOS 7-9) */
     g_udid = getenv("SIMULATOR_UDID");
     if (!g_udid || !g_udid[0]) {
-        NSLog(@"[app_installer] SIMULATOR_UDID not set — disabled");
+        g_udid = getenv("IPHONE_SIMULATOR_DEVICE");
+    }
+    if (!g_udid || !g_udid[0]) {
+        /* Last resort: try to read from device.plist */
+        NSLog(@"[app_installer] No UDID env var found (checked SIMULATOR_UDID, IPHONE_SIMULATOR_DEVICE) — disabled");
         return;
     }
 
@@ -226,21 +286,37 @@ static void sim_app_installer_init(void) {
 
     NSLog(@"[app_installer] Registering for device %s", g_udid);
 
-    /* Register for install notification */
+    /* Register darwin notifications (works for same-namespace callers) */
     char install_name[256];
     snprintf(install_name, sizeof(install_name), "com.rosettasim.install.%s", g_udid);
-    int install_token;
-    notify_register_dispatch(install_name, &install_token, dispatch_get_main_queue(),
-        ^(int token) { handle_install(); });
+    int install_token = 0;
+    uint32_t install_status = notify_register_dispatch(install_name, &install_token,
+        dispatch_get_main_queue(), ^(int token) { handle_install(); });
 
-    /* Register for launch notification */
     char launch_name[256];
     snprintf(launch_name, sizeof(launch_name), "com.rosettasim.launch.%s", g_udid);
-    int launch_token;
-    notify_register_dispatch(launch_name, &launch_token, dispatch_get_main_queue(),
-        ^(int token) { handle_launch(); });
+    int launch_token = 0;
+    uint32_t launch_status = notify_register_dispatch(launch_name, &launch_token,
+        dispatch_get_main_queue(), ^(int token) { handle_launch(); });
 
-    NSLog(@"[app_installer] Listening: %s, %s", install_name, launch_name);
+    NSLog(@"[app_installer] Notify registration: install=%s (status=%u token=%d), launch=%s (status=%u token=%d)",
+          install_name, install_status, install_token,
+          launch_name, launch_status, launch_token);
+
+    /* Start polling as primary IPC mechanism.
+     * Darwin notifications don't cross the host↔sim boundary (different notifyd).
+     * Use recursive dispatch_after (safer than dispatch_source under Rosetta 2). */
+    __block void (^poll_loop)(void) = ^{
+        poll_cmd_file();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), poll_loop);
+    };
+    /* Prevent block from being deallocated */
+    poll_loop = [poll_loop copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), poll_loop);
+
+    NSLog(@"[app_installer] Listening: %s, %s + polling every 2s", install_name, launch_name);
 
     /* Process legacy pending files after delay (backward compat) */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
