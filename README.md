@@ -1,17 +1,18 @@
 # RosettaSim
 
-Display bridge for legacy iOS simulators (iOS 9.3, 10.3) on modern macOS.
+Display bridge for legacy iOS simulators (iOS 7.0–13.7) on modern macOS (Apple Silicon).
 
 Legacy simulators use the PurpleFBServer Mach protocol for framebuffer display, which modern Simulator.app no longer supports. RosettaSim bridges this gap by intercepting PurpleFBServer registrations, rendering framebuffer data to IOSurfaces, and injecting display code into Simulator.app.
 
 ## Quick Start
 
 ```bash
-# One-time setup: build tools, create re-signed Simulator, create devices
-./scripts/setup.sh
+# One-click: double-click RosettaSim.command in Finder, or:
+./RosettaSim.command
 
-# Run: starts daemon + Simulator.app with display injection
-./scripts/start_rosettasim.sh
+# Or step-by-step:
+./scripts/setup.sh              # one-time: build tools, create devices
+./scripts/start_rosettasim.sh   # start daemon + Simulator
 
 # Boot a legacy device from Simulator's menu or CLI
 xcrun simctl boot <UDID>
@@ -41,12 +42,15 @@ setup/launch_xcode833.sh   # launch
 ## Project Structure
 
 ```
+RosettaSim.command         # One-click launcher (double-click in Finder)
+
 src/                       # Source code
   daemon/                  # rosettasim_daemon — monitors devices, registers PurpleFBServer
   display/                 # sim_display_inject — DYLD_INSERT dylib for Simulator.app
   bridge/                  # purple_fb_bridge — standalone PurpleFBServer bridge
   screenshot/              # fb_to_png + screenshot plugin
   scale/                   # sim_scale_fix — 2x scale interpose for sim processes
+  shims/                   # iOS 8.2 FrontBoard fix, iOS 13.7 SimFramebufferClient stub
   viewer/                  # sim_viewer — standalone framebuffer viewer
   Makefile                 # builds everything → src/build/
 
