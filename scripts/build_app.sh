@@ -82,9 +82,15 @@ if [[ -f "$SCALE_FIX" ]]; then
 fi
 
 # Launch real Simulator with display injection
+# Don't exec — we need the wrapper to continue after Simulator exits for cleanup
 export DYLD_INSERT_LIBRARIES="$INJECT"
 export DYLD_FRAMEWORK_PATH="/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks:/Library/Developer/PrivateFrameworks"
-exec "$DIR/Simulator.real" "$@"
+"$DIR/Simulator.real" "$@"
+EXIT_CODE=$?
+
+# Cleanup after Simulator exits — kill daemon we started
+pkill -f rosettasim_daemon 2>/dev/null || true
+exit $EXIT_CODE
 WRAPPER
 
 chmod +x "$APP_DST/Contents/MacOS/Simulator"
