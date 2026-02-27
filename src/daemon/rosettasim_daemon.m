@@ -213,8 +213,8 @@ static void handle_msg_for_device(DeviceContext *ctx) {
 
 static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
 
-    if (msg->msgh_id == 4 && msg->msgh_remote_port) {
-        /* map_surface — reply with framebuffer info */
+    if ((msg->msgh_id == 4 || msg->msgh_id == 2) && msg->msgh_remote_port) {
+        /* map_surface — reply with framebuffer info (msg_id=4 for iOS 9+, msg_id=2 for iOS 8.x) */
         PFBReply r;
         memset(&r, 0, sizeof(r));
         r.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |

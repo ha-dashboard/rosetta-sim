@@ -3,19 +3,21 @@
 # Legacy iOS Simulator Runtime Installer
 # =============================================================================
 #
-# Downloads and installs iOS simulator runtimes from Apple's CDN.
-# Handles profile patching (maxHostVersion, platformIdentifier, headServices)
-# for compatibility with macOS 26 and the RosettaSim bridge.
+# Downloads and installs iOS simulator runtimes from Apple's CDN or old Xcode
+# DMGs/XIPs. Handles profile patching (maxHostVersion, platformIdentifier,
+# headServices) for compatibility with macOS 26 and the RosettaSim bridge.
 #
 # Usage:
-#   ./scripts/install_legacy_sim.sh <version>     # install specific version
-#   ./scripts/install_legacy_sim.sh --list        # show available versions
-#   ./scripts/install_legacy_sim.sh --status      # show installed runtimes
-#   ./scripts/install_legacy_sim.sh --patch-all   # patch all installed runtimes
+#   ./scripts/install_legacy_sim.sh <version>        # install specific version
+#   ./scripts/install_legacy_sim.sh --list            # show available versions
+#   ./scripts/install_legacy_sim.sh --status          # show installed runtimes
+#   ./scripts/install_legacy_sim.sh --patch-all       # patch all installed runtimes
+#   ./scripts/install_legacy_sim.sh --keep-xcode 7.0  # keep Xcode after extraction
 #
 # Examples:
-#   ./scripts/install_legacy_sim.sh 13.7
-#   ./scripts/install_legacy_sim.sh 14.5
+#   ./scripts/install_legacy_sim.sh 13.7    # CDN download
+#   ./scripts/install_legacy_sim.sh 7.0     # Xcode-based extraction via xcodes
+#   ./scripts/install_legacy_sim.sh 8.2     # Xcode-based extraction via xcodes
 #
 # =============================================================================
 
@@ -25,6 +27,8 @@ RUNTIME_BASE="$HOME/Library/Developer/CoreSimulator/Profiles/Runtimes"
 CACHE_DIR="$HOME/Library/Caches/com.apple.dt.Xcode/Downloads"
 CDN_BASE="https://devimages-cdn.apple.com/downloads/xcode/simulators"
 SDK_STUB_DIR="/Library/Developer/CoreSimulator/Profiles/Runtimes"
+XCODES="/opt/homebrew/bin/xcodes"
+KEEP_XCODE=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -56,17 +60,57 @@ cdn_url_for() {
     esac
 }
 
-ALL_VERSIONS="9.3 10.0 10.1 10.2 12.4 13.7 14.5 15.5"
+ALL_VERSIONS="7.0 8.2 9.3 10.0 10.1 10.2 11.4 12.4 13.7 14.5 15.5"
+CDN_VERSIONS="9.3 10.0 10.1 10.2 12.4 13.7 14.5 15.5"
+XCODE_VERSIONS="7.0 8.2 11.4"
 
 # Does this version use PurpleFBServer? (needs headServices in profile)
 # NOTE: iOS 13.7/14.5 QuartzCore DOES contain PurpleFBServer strings, but these
 # runtimes crash during launchd bootstrap on macOS 26 (XPC/launchd incompatibility)
-# before backboardd ever connects to PurpleFBServer. Only iOS 9.3-12.4 actually
+# before backboardd ever connects to PurpleFBServer. Only iOS 7.0-12.4 actually
 # boot successfully on modern macOS. iOS 15.7+ works natively via SimRenderServer.
 is_purplefb() {
     case "$1" in
-        9.3|10.0|10.1|10.2|10.3|12.4) return 0 ;;
+        7.0|8.2|9.3|10.0|10.1|10.2|10.3|11.4|12.4) return 0 ;;
         *) return 1 ;;
+    esac
+}
+
+# Map iOS version to Xcode version for Xcode-bundled runtimes
+xcode_version_for() {
+    case "$1" in
+        7.0)  echo "5.0" ;;
+        8.2)  echo "6.2" ;;
+        11.4) echo "9.4.1" ;;
+        *)    echo "" ;;
+    esac
+}
+
+# Archive.org mirror URLs (no auth needed, direct download)
+archive_url_for() {
+    case "$1" in
+        7.0)  echo "https://archive.org/download/xcode-5/Xcode_5.dmg" ;;
+        8.2)  echo "https://archive.org/download/xcode-6.2_202510/Xcode_6.2.dmg" ;;
+        11.4) echo "https://archive.org/download/xcode-9.4.1/Xcode_9.4.1.xip" ;;
+        *)    echo "" ;;
+    esac
+}
+
+# Map iOS version to min host macOS version
+min_host_for() {
+    case "$1" in
+        7.0)  echo "10.9" ;;
+        8.2)  echo "10.9.3" ;;
+        11.4) echo "10.12.4" ;;
+        *)    echo "10.10.2" ;;
+    esac
+}
+
+# Map iOS version to supported architectures
+supported_archs_for() {
+    case "$1" in
+        7.0|8.2) echo "i386 x86_64" ;;
+        *)       echo "x86_64" ;;
     esac
 }
 
@@ -75,23 +119,29 @@ is_purplefb() {
 # =============================================================================
 
 cmd_list() {
-    echo "Available iOS simulator runtimes from Apple CDN:"
+    echo "Available iOS simulator runtimes:"
     echo ""
-    for ver in $ALL_VERSIONS; do
+    echo "  From Apple CDN (direct download):"
+    for ver in $CDN_VERSIONS; do
         local installed=""
         local dir_name="iOS_${ver}.simruntime"
-        if [ -d "$RUNTIME_BASE/$dir_name" ]; then
-            installed=" (installed)"
-        fi
+        [ -d "$RUNTIME_BASE/$dir_name" ] && installed=" (installed)"
         local proto="SimFramebuffer"
         is_purplefb "$ver" && proto="PurpleFBServer"
-        printf "  ${CYAN}iOS %-5s${NC}  %-16s %s\n" "$ver" "$proto" "$installed"
+        printf "    ${CYAN}iOS %-5s${NC}  %-16s %s\n" "$ver" "$proto" "$installed"
     done
     echo ""
-    echo "Not available from CDN (need old Xcode DMG):"
-    echo "  iOS 7.x, 8.x, 10.3, 11.x"
+    echo "  From old Xcode (via xcodes CLI — requires Apple ID):"
+    for ver in $XCODE_VERSIONS; do
+        local installed=""
+        local dir_name="iOS_${ver}.simruntime"
+        [ -d "$RUNTIME_BASE/$dir_name" ] && installed=" (installed)"
+        local xc_ver
+        xc_ver=$(xcode_version_for "$ver")
+        printf "    ${CYAN}iOS %-5s${NC}  PurpleFBServer    Xcode %-6s %s\n" "$ver" "$xc_ver" "$installed"
+    done
     echo ""
-    echo "Usage: $0 <version>  (e.g., $0 13.7)"
+    echo "Usage: $0 <version>  (e.g., $0 13.7 or $0 7.0)"
 }
 
 cmd_status() {
@@ -171,6 +221,315 @@ cmd_patch_all() {
 }
 
 # =============================================================================
+# Generate plists for runtimes that don't ship with them (iOS 7.x, 8.x)
+# =============================================================================
+
+generate_info_plist() {
+    local VERSION="$1"
+    local RUNTIME_DIR="$2"
+    local DASH_VER="${VERSION//./-}"
+
+    cat > "$RUNTIME_DIR/Contents/Info.plist" << INFOPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>English</string>
+    <key>CFBundleExecutable</key>
+    <string>iOS ${VERSION}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.apple.CoreSimulator.SimRuntime.iOS-${DASH_VER}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>iOS ${VERSION}</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+</dict>
+</plist>
+INFOPLIST
+    log "Generated Info.plist for iOS $VERSION"
+}
+
+generate_profile_plist() {
+    local VERSION="$1"
+    local RUNTIME_DIR="$2"
+    local MIN_HOST
+    MIN_HOST=$(min_host_for "$VERSION")
+    local ARCHS
+    ARCHS=$(supported_archs_for "$VERSION")
+    local MAJOR
+    MAJOR=$(echo "$VERSION" | cut -d. -f1)
+
+    local PROFILE="$RUNTIME_DIR/Contents/Resources/profile.plist"
+    mkdir -p "$RUNTIME_DIR/Contents/Resources"
+
+    # Build arch array entries
+    local ARCH_ENTRIES=""
+    local idx=0
+    for arch in $ARCHS; do
+        ARCH_ENTRIES="${ARCH_ENTRIES}
+        <string>${arch}</string>"
+    done
+
+    cat > "$PROFILE" << PROFILEPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>defaultVersionString</key>
+    <string>${VERSION}</string>
+    <key>devicePlatformFolderName</key>
+    <string>iPhoneOS.platform</string>
+    <key>forwardHostNotifications</key>
+    <dict>
+        <key>com.apple.system.clock_set</key>
+        <string>com.apple.system.clock_set</string>
+    </dict>
+    <key>forwardHostNotificationsWithState</key>
+    <dict>
+        <key>com.apple.system.thermalpressurelevel</key>
+        <string>com.apple.system.thermalpressurelevel</string>
+    </dict>
+    <key>headServices</key>
+    <array>
+        <string>PurpleFBServer</string>
+        <string>PurpleFBTVOutServer</string>
+        <string>IndigoHIDRegistrationPort</string>
+    </array>
+    <key>maxHostVersion</key>
+    <string>99.99.99</string>
+    <key>minHostVersion</key>
+    <string>${MIN_HOST}</string>
+    <key>platformIdentifier</key>
+    <string>com.apple.platform.iphonesimulator</string>
+    <key>platformName</key>
+    <string>iPhoneSimulator</string>
+    <key>runtimeDir</key>
+    <string>iPhoneSimulator${VERSION}.sdk</string>
+    <key>simulatorPlatformFolderName</key>
+    <string>iPhoneSimulator.platform</string>
+    <key>supportedArchs</key>
+    <array>${ARCH_ENTRIES}
+    </array>
+    <key>supportedFeatures</key>
+    <dict>
+        <key>com.apple.instruments.remoteserver</key>
+        <true/>
+    </dict>
+    <key>supportedProductFamilyIDs</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+</dict>
+</plist>
+PROFILEPLIST
+    log "Generated profile.plist for iOS $VERSION (archs: $ARCHS, minHost: $MIN_HOST)"
+}
+
+# =============================================================================
+# Install from old Xcode via xcodes CLI
+# =============================================================================
+
+install_from_xcode() {
+    local VERSION="$1"
+    local XCODE_VER
+    XCODE_VER=$(xcode_version_for "$VERSION")
+
+    if [ -z "$XCODE_VER" ]; then
+        err "No Xcode mapping for iOS $VERSION"
+    fi
+
+    local RUNTIME_DIR="$RUNTIME_BASE/iOS_${VERSION}.simruntime"
+
+    # Check if already installed
+    if [ -d "$RUNTIME_DIR" ] && [ -f "$RUNTIME_DIR/Contents/Resources/profile.plist" ]; then
+        if xcrun simctl list runtimes 2>/dev/null | grep -q "iOS $VERSION"; then
+            log "iOS $VERSION already installed and recognized"
+            xcrun simctl list runtimes 2>/dev/null | grep "$VERSION"
+            return 0
+        fi
+    fi
+
+    local XCODE_APP="/Applications/Xcode-${XCODE_VER}.app"
+    # Also check for Xcode named without dash (xcodes naming varies)
+    [ -d "$XCODE_APP" ] || XCODE_APP="/Applications/Xcode_${XCODE_VER}.app"
+    [ -d "$XCODE_APP" ] || XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*${XCODE_VER}*" -type d 2>/dev/null | head -1)
+
+    # Download Xcode if not present
+    if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP" ]; then
+        log "Found existing Xcode $XCODE_VER at $XCODE_APP"
+    else
+        XCODE_APP="/Applications/Xcode-${XCODE_VER}.app"
+        local ARCHIVE_URL
+        ARCHIVE_URL=$(archive_url_for "$VERSION")
+        local DOWNLOADED=0
+
+        # Try archive.org first (no auth needed)
+        if [ -n "$ARCHIVE_URL" ]; then
+            local EXT="${ARCHIVE_URL##*.}"
+            local DL_FILE="$CACHE_DIR/Xcode_${XCODE_VER}.${EXT}"
+            mkdir -p "$CACHE_DIR"
+
+            if [ -f "$DL_FILE" ]; then
+                log "Using cached download: $DL_FILE"
+                DOWNLOADED=1
+            else
+                log "Downloading Xcode $XCODE_VER from archive.org (~2-6 GB)..."
+                if curl -L -o "$DL_FILE" "$ARCHIVE_URL" --progress-bar --fail; then
+                    log "Download complete"
+                    DOWNLOADED=1
+                else
+                    warn "Archive.org download failed, trying xcodes CLI..."
+                    rm -f "$DL_FILE"
+                fi
+            fi
+
+            if [ "$DOWNLOADED" -eq 1 ]; then
+                if [ "$EXT" = "xip" ]; then
+                    log "Extracting XIP (this takes a while)..."
+                    xip -x "$DL_FILE" -C /Applications 2>&1 || err "XIP extraction failed"
+                    # Find the extracted app
+                    XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" -newer "$DL_FILE" -type d 2>/dev/null | head -1)
+                    [ -d "$XCODE_APP" ] || XCODE_APP="/Applications/Xcode.app"
+                    # Rename to versioned name
+                    if [ -d "$XCODE_APP" ] && [ "$XCODE_APP" != "/Applications/Xcode-${XCODE_VER}.app" ]; then
+                        mv "$XCODE_APP" "/Applications/Xcode-${XCODE_VER}.app" 2>/dev/null || true
+                        XCODE_APP="/Applications/Xcode-${XCODE_VER}.app"
+                    fi
+                else
+                    # DMG
+                    local XCODE_MOUNT=$(mktemp -d /tmp/xcode_mount_XXXXXX)
+                    log "Mounting Xcode DMG..."
+                    hdiutil attach "$DL_FILE" -mountpoint "$XCODE_MOUNT" -nobrowse -quiet
+                    # Copy the .app from the mounted DMG
+                    local XCODE_IN_DMG=$(find "$XCODE_MOUNT" -maxdepth 1 -name "Xcode*.app" -type d | head -1)
+                    if [ -z "$XCODE_IN_DMG" ]; then
+                        hdiutil detach "$XCODE_MOUNT" -quiet 2>/dev/null
+                        err "No Xcode.app found in DMG"
+                    fi
+                    log "Copying Xcode from DMG (this takes a while)..."
+                    cp -R "$XCODE_IN_DMG" "/Applications/Xcode-${XCODE_VER}.app"
+                    hdiutil detach "$XCODE_MOUNT" -quiet 2>/dev/null
+                    rmdir "$XCODE_MOUNT" 2>/dev/null
+                    XCODE_APP="/Applications/Xcode-${XCODE_VER}.app"
+                fi
+            fi
+        fi
+
+        # Fallback to xcodes CLI if archive.org didn't work
+        if [ ! -d "$XCODE_APP" ]; then
+            if [ ! -x "$XCODES" ]; then
+                err "Xcode $XCODE_VER not available. Install xcodes (brew install xcodes) or download manually."
+            fi
+            log "Downloading Xcode $XCODE_VER via xcodes (requires Apple ID)..."
+            info "This downloads ~2-6 GB. You may be prompted to authenticate."
+            "$XCODES" install "$XCODE_VER" 2>&1 || err "Failed to download Xcode $XCODE_VER"
+            # Find installed app
+            XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*${XCODE_VER}*" -o -name "Xcode*$(echo "$XCODE_VER" | cut -d. -f1-2)*" 2>/dev/null | head -1)
+        fi
+
+        [ -d "$XCODE_APP" ] || err "Xcode $XCODE_VER not found in /Applications after download"
+        log "Xcode installed at: $XCODE_APP"
+    fi
+
+    # Find simulator SDK in Xcode
+    local SDK_PATH="$XCODE_APP/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs"
+    local SIM_SDK=$(find "$SDK_PATH" -maxdepth 1 -name "iPhoneSimulator*.sdk" -type d 2>/dev/null | head -1)
+    if [ -z "$SIM_SDK" ]; then
+        err "No iPhoneSimulator SDK found in $SDK_PATH"
+    fi
+    log "Found SDK: $(basename "$SIM_SDK")"
+
+    # Check if this Xcode has a pre-built simruntime
+    local XCODE_RUNTIMES="$XCODE_APP/Contents/Developer/Platforms/iPhoneSimulator.platform/Library/Developer/CoreSimulator/Profiles/Runtimes"
+    local EXISTING_RUNTIME=$(find "$XCODE_RUNTIMES" -name "*.simruntime" -maxdepth 1 2>/dev/null | head -1)
+
+    if [ -n "$EXISTING_RUNTIME" ] && [ -f "$EXISTING_RUNTIME/Contents/Info.plist" ]; then
+        # Xcode has a proper .simruntime bundle — copy it directly
+        log "Found pre-built simruntime in Xcode: $(basename "$EXISTING_RUNTIME")"
+        rm -rf "$RUNTIME_DIR"
+        cp -R "$EXISTING_RUNTIME" "$RUNTIME_DIR"
+    else
+        # Build runtime from SDK directory
+        log "Building simruntime from SDK..."
+        rm -rf "$RUNTIME_DIR"
+        mkdir -p "$RUNTIME_DIR/Contents/Resources/RuntimeRoot"
+
+        # Copy the SDK contents as RuntimeRoot
+        log "Copying RuntimeRoot (this may take a moment)..."
+        cp -R "$SIM_SDK"/ "$RUNTIME_DIR/Contents/Resources/RuntimeRoot/"
+
+        # Generate Info.plist
+        generate_info_plist "$VERSION" "$RUNTIME_DIR"
+
+        # Generate profile.plist
+        generate_profile_plist "$VERSION" "$RUNTIME_DIR"
+    fi
+
+    # Ensure profile is patched (even if we copied from Xcode)
+    local PROFILE="$RUNTIME_DIR/Contents/Resources/profile.plist"
+    if [ -f "$PROFILE" ]; then
+        /usr/libexec/PlistBuddy -c "Delete :maxHostVersion" "$PROFILE" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :maxHostVersion string 99.99.99" "$PROFILE"
+
+        /usr/libexec/PlistBuddy -c "Delete :platformIdentifier" "$PROFILE" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :platformIdentifier string com.apple.platform.iphonesimulator" "$PROFILE"
+
+        if is_purplefb "$VERSION"; then
+            local has_head=$(/usr/libexec/PlistBuddy -c "Print :headServices" "$PROFILE" 2>/dev/null | grep -c PurpleFB || echo 0)
+            if [ "$has_head" -eq 0 ]; then
+                /usr/libexec/PlistBuddy -c "Delete :headServices" "$PROFILE" 2>/dev/null || true
+                /usr/libexec/PlistBuddy \
+                    -c "Add :headServices array" \
+                    -c "Add :headServices:0 string PurpleFBServer" \
+                    -c "Add :headServices:1 string PurpleFBTVOutServer" \
+                    -c "Add :headServices:2 string IndigoHIDRegistrationPort" \
+                    "$PROFILE"
+            fi
+        fi
+        log "Profile patched for macOS 26 compatibility"
+    else
+        # No profile — generate one
+        generate_profile_plist "$VERSION" "$RUNTIME_DIR"
+    fi
+
+    # Cleanup Xcode (unless --keep-xcode)
+    if [ "$KEEP_XCODE" -eq 0 ]; then
+        local xcode_size
+        xcode_size=$(du -sh "$XCODE_APP" 2>/dev/null | cut -f1)
+        log "Removing Xcode $XCODE_VER ($xcode_size) to save disk space..."
+        rm -rf "$XCODE_APP"
+        log "Xcode removed. Use --keep-xcode to retain it."
+    else
+        info "Keeping Xcode $XCODE_VER at $XCODE_APP (--keep-xcode)"
+    fi
+
+    # Verify
+    echo ""
+    log "Installation complete!"
+    if xcrun simctl list runtimes 2>/dev/null | grep -q "iOS $VERSION"; then
+        log "iOS $VERSION recognized:"
+        xcrun simctl list runtimes 2>/dev/null | grep "$VERSION"
+    else
+        warn "iOS $VERSION installed but not yet recognized. Try restarting CoreSimulator."
+        info "Restart: kill -9 \$(pgrep -f CoreSimulatorService)"
+    fi
+}
+
+# =============================================================================
 # Install a specific version
 # =============================================================================
 
@@ -180,6 +539,13 @@ install_version() {
     DMG_NAME=$(cdn_url_for "$VERSION")
 
     if [ -z "$DMG_NAME" ]; then
+        # Check if this is a Xcode-based runtime
+        local XCODE_VER
+        XCODE_VER=$(xcode_version_for "$VERSION")
+        if [ -n "$XCODE_VER" ]; then
+            install_from_xcode "$VERSION"
+            return $?
+        fi
         err "Unknown version: $VERSION. Run '$0 --list' to see available versions."
     fi
 
@@ -313,6 +679,16 @@ install_version() {
 # Main
 # =============================================================================
 
+# Parse --keep-xcode flag
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --keep-xcode) KEEP_XCODE=1 ;;
+        *) args+=("$arg") ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
 case "${1:-}" in
     --list|-l)
         cmd_list
@@ -324,19 +700,20 @@ case "${1:-}" in
         cmd_patch_all
         ;;
     --help|-h|"")
-        echo "Usage: $0 <version|--list|--status|--patch-all>"
+        echo "Usage: $0 [--keep-xcode] <version|--list|--status|--patch-all>"
         echo ""
         echo "Commands:"
-        echo "  <version>    Install a specific iOS runtime (e.g., 13.7)"
-        echo "  --list       Show available versions from Apple CDN"
-        echo "  --status     Show installed runtimes and their patch status"
-        echo "  --patch-all  Patch all installed runtimes for macOS 26 compatibility"
+        echo "  <version>      Install a specific iOS runtime (e.g., 13.7 or 7.0)"
+        echo "  --list         Show available versions"
+        echo "  --status       Show installed runtimes and their patch status"
+        echo "  --patch-all    Patch all installed runtimes for macOS 26 compatibility"
         echo ""
-        echo "The script automatically:"
-        echo "  - Downloads from Apple's CDN"
-        echo "  - Patches maxHostVersion for macOS 26"
-        echo "  - Adds headServices for PurpleFBServer runtimes (iOS 9-12)"
-        echo "  - Sets platformIdentifier for CoreSimulator discovery"
+        echo "Options:"
+        echo "  --keep-xcode   Don't delete downloaded Xcode after extracting runtime"
+        echo ""
+        echo "CDN versions download directly (~1-2 GB). Xcode-based versions (7.0, 8.2,"
+        echo "11.4) require the xcodes CLI and an Apple ID to download the full Xcode,"
+        echo "then extract just the simulator runtime."
         ;;
     *)
         install_version "$1"
