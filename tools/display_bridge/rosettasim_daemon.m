@@ -230,25 +230,18 @@ static void handle_one_msg(DeviceContext *ctx, mach_msg_header_t *msg) {
         r.stride = ctx->bytes_per_row;
         r.width = ctx->pixel_width;
         r.height = ctx->pixel_height;
-        /* Session 28: insert_dylib injects sim_scale_fix.dylib into backboardd,
-         * which interposes BSMainScreenScale to return 2.0. With scale=2, the
-         * point dimensions must be half the pixel dimensions for correct layout.
-         * Check if the scale fix dylib exists in this runtime's usr/lib/. */
-        BOOL has_scale_fix = NO;
-        if (ctx->runtime_root[0]) {
-            NSString *fixPath = [NSString stringWithFormat:@"%s/usr/lib/sim_scale_fix.dylib",
-                                 ctx->runtime_root];
-            has_scale_fix = [[NSFileManager defaultManager] fileExistsAtPath:fixPath];
-        }
-        uint32_t scale = has_scale_fix ? 2 : 1;
-        r.pt_width = ctx->pixel_width / scale;
-        r.pt_height = ctx->pixel_height / scale;
+        /* pt_width = pixel_width (scale=1). Session 28 attempted BSMainScreenScale
+         * binary patch + pt_width/2, but the patch doesn't reach Display::set_scale —
+         * render output is identical regardless. The 2x scale needs deeper RE of the
+         * Display init path (set_scale must fire BEFORE first render, after set_size,
+         * without triggering unmap/remap). For now, scale=1 gives working display. */
+        r.pt_width = ctx->pixel_width;
+        r.pt_height = ctx->pixel_height;
 
         kern_return_t skr = mach_msg(&r.header, MACH_SEND_MSG, sizeof(r),
                       0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u pt=%ux%u scale=%u root='%s')",
-              ctx->name, skr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row,
-              r.pt_width, r.pt_height, scale, ctx->runtime_root);
+        NSLog(@"[daemon] %s: map_surface reply kr=%d (%ux%u stride=%u)",
+              ctx->name, skr, ctx->pixel_width, ctx->pixel_height, ctx->bytes_per_row);
 
     } else if (msg->msgh_id == 3) {
         /* flush_shmem — reply and dump pixels */
