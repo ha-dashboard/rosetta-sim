@@ -51,7 +51,23 @@ static BOOL is_legacy_runtime(NSString *runtimeID) {
 
 static int run_with_timeout(NSArray<NSString *> *args, int timeout_secs) {
     NSTask *task = [[NSTask alloc] init];
-    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/timeout"];
+    /* Resolve timeout binary: prefer /opt/homebrew/bin/gtimeout on macOS (coreutils) */
+    NSString *timeoutPath = nil;
+    for (NSString *candidate in @[@"/opt/homebrew/bin/gtimeout",
+                                   @"/usr/local/bin/gtimeout",
+                                   @"/usr/bin/timeout",
+                                   @"/opt/homebrew/bin/timeout",
+                                   @"/usr/local/bin/timeout"]) {
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+            timeoutPath = candidate;
+            break;
+        }
+    }
+    if (!timeoutPath) {
+        fprintf(stderr, "Error: neither gtimeout nor timeout found. Install coreutils: brew install coreutils\n");
+        return 1;
+    }
+    task.executableURL = [NSURL fileURLWithPath:timeoutPath];
     NSMutableArray *fullArgs = [NSMutableArray arrayWithObject:
         [NSString stringWithFormat:@"%d", timeout_secs]];
     [fullArgs addObjectsFromArray:args];
