@@ -48,11 +48,15 @@ DAEMON_LDFLAGS = -framework Foundation -framework IOSurface -framework CoreGraph
 # Must be built with iOS simulator target or dyld_sim will reject it
 SCALE_SRC     = sim_scale_fix.m
 SCALE_BIN     = sim_scale_fix.dylib
+# Screenshot tool: reads IOSurface or raw framebuffer, saves PNG
+SCREENSHOT_SRC = fb_to_png.m
+SCREENSHOT_BIN = fb_to_png
+
 IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
 
-.PHONY: all bridge inject viewer daemon scale_fix clean
+.PHONY: all bridge inject viewer daemon scale_fix screenshot clean
 
-all: bridge inject viewer daemon scale_fix
+all: bridge inject viewer daemon scale_fix screenshot
 
 bridge: $(BRIDGE_BIN)
 
@@ -78,6 +82,14 @@ $(DAEMON_BIN): $(DAEMON_SRC)
 	$(CC) $(DAEMON_CFLAGS) $(DAEMON_LDFLAGS) -o $@ $<
 	@echo "Built: $@"
 
+screenshot: $(SCREENSHOT_BIN)
+
+$(SCREENSHOT_BIN): $(SCREENSHOT_SRC)
+	$(CC) -fobjc-arc -framework Foundation -framework CoreGraphics \
+		-framework ImageIO -framework IOSurface -framework UniformTypeIdentifiers \
+		-o $@ $<
+	@echo "Built: $@"
+
 scale_fix: $(SCALE_BIN)
 
 $(SCALE_BIN): $(SCALE_SRC)
@@ -88,5 +100,5 @@ $(SCALE_BIN): $(SCALE_SRC)
 	@echo "Built: $@"
 
 clean:
-	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN) $(SCALE_BIN)
+	rm -f $(BRIDGE_BIN) $(INJECT_BIN) $(VIEWER_BIN) $(DAEMON_BIN) $(SCALE_BIN) $(SCREENSHOT_BIN)
 	@echo "Cleaned."

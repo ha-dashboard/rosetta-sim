@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# =============================================================================
+# simctl wrapper — transparent screenshot support for legacy iOS simulators
+# =============================================================================
+#
+# Drop-in replacement for `xcrun simctl` that adds screenshot support for
+# legacy PurpleFB devices (iOS 9.3, 10.3, 12.4) by reading the daemon's
+# IOSurface framebuffer.
+#
+# For all other commands, delegates to the real `xcrun simctl`.
+#
+# Usage:
+#   ./scripts/simctl io <UDID> screenshot <output.png>
+#   ./scripts/simctl <any other command>   # delegates to xcrun simctl
+#
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FB_TO_PNG="$PROJECT_ROOT/tools/display_bridge/fb_to_png"
+
+# Build fb_to_png if needed
+build_fb_to_png() {
+    if [[ ! -x "$FB_TO_PNG" ]]; then
+        local src="$PROJECT_ROOT/tools/display_bridge/fb_to_png.m"
+        if [[ ! -f "$src" ]]; then
+            # Create source inline
+            src="/tmp/fb_to_png_build.m"
+            cat > "$src" << 'OBJC'
+#import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
+#import <IOSurface/IOSurface.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <surface_id> <output.png>\n", argv[0]);
+        fprintf(stderr, "   or: %s --raw <raw_file> <width> <height> <bpr> <output.png>\n", argv[0]);
+        return 1;
+    }
+    @autoreleasepool {
+        CGImageRef img = NULL;
+        int width, height;
+
+        if (strcmp(argv[1], "--raw") == 0 && argc >= 7) {
+            // Raw file mode
+            NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[2]]];
+            if (!data) { fprintf(stderr, "Can't read %s\n", argv[2]); return 1; }
+            width = atoi(argv[3]); height = atoi(argv[4]); int bpr = atoi(argv[5]);
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef ctx = CGBitmapContextCreate((void *)data.bytes, width, height, 8, bpr,
+                cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+            img = CGBitmapContextCreateImage(ctx);
+            CGContextRelease(ctx); CGColorSpaceRelease(cs);
+            // Output path is argv[6]
+            NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[6]]];
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,
+                (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+            CGImageDestinationAddImage(dest, img, NULL);
+            CGImageDestinationFinalize(dest);
+            CFRelease(dest); CGImageRelease(img);
+            return 0;
+        }
+
+        // IOSurface mode
+        uint32_t surfaceID = (uint32_t)atoi(argv[1]);
+        IOSurfaceRef surface = IOSurfaceLookup(surfaceID);
+        if (!surface) { fprintf(stderr, "IOSurfaceLookup(%u) failed\n", surfaceID); return 1; }
+
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+        width = (int)IOSurfaceGetWidth(surface);
+        height = (int)IOSurfaceGetHeight(surface);
+        int bpr = (int)IOSurfaceGetBytesPerRow(surface);
+        void *base = IOSurfaceGetBaseAddress(surface);
+
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(base, width, height, 8, bpr,
+            cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        img = CGBitmapContextCreateImage(ctx);
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+        NSString *outPath = [NSString stringWithUTF8String:argv[2]];
+        NSURL *url = [NSURL fileURLWithPath:outPath];
+        CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,
+            (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+        CGImageDestinationAddImage(dest, img, NULL);
+        CGImageDestinationFinalize(dest);
+
+        CFRelease(dest); CGImageRelease(img);
+        CGContextRelease(ctx); CGColorSpaceRelease(cs);
+        CFRelease(surface);
+
+        fprintf(stderr, "Wrote %s (%dx%d) from IOSurface %u\n", argv[2], width, height, surfaceID);
+    }
+    return 0;
+}
+OBJC
+        fi
+        /usr/bin/cc -fobjc-arc -framework Foundation -framework CoreGraphics \
+            -framework ImageIO -framework IOSurface -framework UniformTypeIdentifiers \
+            -o "$FB_TO_PNG" "$src" 2>/dev/null
+    fi
+}
+
+# Check if a UDID is a legacy PurpleFB device
+is_legacy_device() {
+    local udid="$1"
+    local json="/tmp/rosettasim_active_devices.json"
+    [[ -f "$json" ]] && python3 -c "
+import json, sys
+with open('$json') as f:
+    devices = json.load(f)
+for d in devices:
+    if d.get('udid','').upper() == '${udid}'.upper():
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
+# Get IOSurface ID for a legacy device
+get_surface_id() {
+    local udid="$1"
+    local json="/tmp/rosettasim_active_devices.json"
+    python3 -c "
+import json
+with open('$json') as f:
+    devices = json.load(f)
+for d in devices:
+    if d.get('udid','').upper() == '${udid}'.upper():
+        print(d.get('surface_id', ''))
+        break
+" 2>/dev/null
+}
+
+# Get framebuffer path for a legacy device
+get_fb_info() {
+    local udid="$1"
+    local json="/tmp/rosettasim_dims_${udid}.json"
+    if [[ -f "$json" ]]; then
+        python3 -c "
+import json
+with open('$json') as f:
+    d = json.load(f)
+print(d.get('width',''), d.get('height',''), d.get('bpr',''))
+" 2>/dev/null
+    fi
+}
+
+# Handle: simctl io <UDID> screenshot <output>
+handle_screenshot() {
+    local udid="$1"
+    local output="$2"
+
+    # Try native simctl first for non-legacy devices
+    if ! is_legacy_device "$udid"; then
+        exec xcrun simctl io "$udid" screenshot "$output"
+    fi
+
+    # Legacy device — use our IOSurface
+    build_fb_to_png
+
+    local surface_id
+    surface_id=$(get_surface_id "$udid")
+    if [[ -n "$surface_id" ]] && [[ "$surface_id" != "0" ]]; then
+        "$FB_TO_PNG" "$surface_id" "$output"
+        echo "Wrote screenshot to: $output"
+        return 0
+    fi
+
+    # Fallback: raw framebuffer file
+    local fb_file="/tmp/rosettasim_fb_${udid}.raw"
+    if [[ -f "$fb_file" ]]; then
+        local dims
+        dims=$(get_fb_info "$udid")
+        if [[ -n "$dims" ]]; then
+            local w h bpr
+            read -r w h bpr <<< "$dims"
+            "$FB_TO_PNG" --raw "$fb_file" "$w" "$h" "$bpr" "$output"
+            echo "Wrote screenshot to: $output"
+            return 0
+        fi
+    fi
+
+    echo "Error: No framebuffer available for $udid. Is the daemon running?" >&2
+    return 1
+}
+
+# Parse arguments
+if [[ "${1:-}" == "io" ]] && [[ "${3:-}" == "screenshot" ]]; then
+    UDID="${2:-}"
+    OUTPUT="${4:-/tmp/screenshot.png}"
+
+    # Detect file type from extension
+    case "$OUTPUT" in
+        *.png|*.PNG) ;;
+        *.jpg|*.jpeg|*.JPEG) ;;
+        *) OUTPUT="${OUTPUT}.png" ;;
+    esac
+
+    handle_screenshot "$UDID" "$OUTPUT"
+else
+    # All other commands: delegate to real simctl
+    exec xcrun simctl "$@"
+fi
