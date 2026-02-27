@@ -488,42 +488,19 @@ static int cmd_launch(NSString *udid, NSString *bundleID) {
         return 1;
     }
 
-    NSString *execPath = [appPath stringByAppendingPathComponent:execName];
+    (void)execName; /* app path confirmed valid */
 
-    /* Try simctl spawn with the executable path */
-    printf("  Spawning %s...\n", execPath.UTF8String);
-    int rc = run_with_timeout(@[@"xcrun", @"simctl", @"spawn", udid, execPath], 15);
-    if (rc == 124) {
-        /* simctl spawn timed out — try openurl scheme instead */
-        fprintf(stderr, "  spawn timed out. Trying openurl fallback...\n");
-
-        /* Try simctl openurl if the app has a URL scheme */
-        NSArray *urlTypes = info[@"CFBundleURLTypes"];
-        if ([urlTypes isKindOfClass:[NSArray class]] && urlTypes.count > 0) {
-            NSDictionary *urlType = urlTypes[0];
-            NSArray *schemes = urlType[@"CFBundleURLSchemes"];
-            if ([schemes isKindOfClass:[NSArray class]] && schemes.count > 0) {
-                NSString *scheme = schemes[0];
-                NSString *url = [NSString stringWithFormat:@"%@://", scheme];
-                rc = run_with_timeout(@[@"xcrun", @"simctl", @"openurl", udid, url], 10);
-                if (rc == 0) {
-                    printf("Launched %s via URL scheme %s://\n", bundleID.UTF8String, scheme.UTF8String);
-                    return 0;
-                }
-            }
-        }
-
-        fprintf(stderr, "  Could not launch app automatically.\n");
-        fprintf(stderr, "  The app is installed — tap its icon on the home screen.\n");
-        return 1;
-    }
-
-    if (rc != 0) {
-        fprintf(stderr, "Launch failed (exit %d).\n", rc);
-        return rc;
-    }
-
-    printf("Launched %s\n", bundleID.UTF8String);
+    /* Legacy devices: simctl spawn and simctl launch both fail with Mach errors
+     * under Rosetta 2. The only reliable way to launch an app is via the home screen. */
+    printf("  App found at: %s\n", appPath.UTF8String);
+    printf("\n");
+    printf("  NOTE: Programmatic app launch is not supported on legacy simulators.\n");
+    printf("  The CoreSimulator spawn/launch APIs fail under Rosetta 2.\n");
+    printf("\n");
+    printf("  To launch the app, tap its icon on the home screen in Simulator.app.\n");
+    printf("  If the icon doesn't appear, reboot the device:\n");
+    printf("    rosettasim-ctl shutdown %s\n", udid.UTF8String);
+    printf("    rosettasim-ctl boot %s\n", udid.UTF8String);
     return 0;
 }
 
