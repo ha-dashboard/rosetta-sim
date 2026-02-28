@@ -189,6 +189,15 @@ static NSString *get_device_name(id device) {
     return ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("name"));
 }
 
+static NSString *get_device_data_path(id device) {
+    id udidObj = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("UDID"));
+    NSString *udidStr = udidObj ? [udidObj UUIDString] : nil;
+    if (!udidStr) return nil;
+    return [NSString stringWithFormat:
+        @"%@/Library/Developer/CoreSimulator/Devices/%@/data",
+        NSHomeDirectory(), udidStr];
+}
+
 static long get_device_state(id device) {
     return ((long(*)(id, SEL))objc_msgSend)(device, sel_registerName("state"));
 }
@@ -1551,8 +1560,9 @@ static int cmd_addmedia(NSString *udid, NSArray<NSString *> *files) {
 
 /* ── Command: touch (rosettasim extension) ── */
 
-/* Send touch via SimulatorKit's SimDeviceLegacyHIDClient + IndigoHIDMessageForMouseNSEvent.
- * This runs host-side and talks directly to the HID system — no in-sim IPC needed. */
+/* Send touch via file-based IPC to sim_touch_inject.dylib in backboardd.
+ * Writes JSONL touch events to {deviceDataPath}/tmp/rosettasim_touch.json.
+ * The dylib polls this file and dispatches IOHIDEvents directly. */
 
 static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
     id deviceSet = get_device_set();
@@ -1569,156 +1579,52 @@ static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
         return 1;
     }
 
-    /* Load SimulatorKit.framework */
-    void *skHandle = dlopen("/Applications/Xcode.app/Contents/Developer/Library/"
-                            "PrivateFrameworks/SimulatorKit.framework/SimulatorKit", RTLD_NOW);
-    if (!skHandle) {
-        fprintf(stderr, "Failed to load SimulatorKit: %s\n", dlerror());
+    /* Get device data path */
+    NSString *dataPath = get_device_data_path(device);
+    if (!dataPath) {
+        fprintf(stderr, "Could not determine device data path\n");
         return 1;
     }
 
-    /* Get IndigoHIDMessageForMouseNSEvent:
-     * IndigoHIDMessage *IndigoHIDMessageForMouseNSEvent(
-     *     CGPoint *point, CGPoint *prevPoint,
-     *     IndigoHIDTarget target, NSEventType type,
-     *     NSSize deviceSize, IndigoHIDEdge edge)
-     * IndigoHIDTarget and IndigoHIDEdge are uint32_t-sized structs.
-     * target=0 for main screen, edge=0 for no edge. */
-    typedef void *(*CreateMouseMsgFn)(CGPoint *, CGPoint *, uint32_t, NSUInteger, CGSize, uint32_t);
-    CreateMouseMsgFn createMsg = (CreateMouseMsgFn)dlsym(RTLD_DEFAULT,
-        "IndigoHIDMessageForMouseNSEvent");
-    if (!createMsg) {
-        fprintf(stderr, "IndigoHIDMessageForMouseNSEvent not found\n");
-        return 1;
-    }
-
-    /* Create SimDeviceIOClient first to establish IO connection */
-    Class IOClientClass = objc_getClass("SimDeviceIOClient");
-    id ioClient = nil;
-    if (IOClientClass) {
-        ioClient = ((id(*)(id, SEL, id, id, id))objc_msgSend)(
-            [IOClientClass alloc],
-            sel_registerName("initWithDevice:errorQueue:errorHandler:"),
-            device, dispatch_get_main_queue(), nil);
-        if (ioClient) {
-            /* Wait a moment for IO ports to connect */
-            usleep(500000); /* 500ms */
-            NSArray *ports = ((id(*)(id, SEL))objc_msgSend)(ioClient, sel_registerName("ioPorts"));
-            printf("  IO client created, %lu ports\n", (unsigned long)ports.count);
-
-            /* Find the LegacyHID port by UUID */
-            for (id port in ports) {
-                @try {
-                    id uuid = [port valueForKey:@"uuid"];
-                    NSString *uuidStr = uuid ? [uuid description] : @"(nil)";
-                    /* Check port class name for LegacyHID */
-                    NSString *cls = NSStringFromClass([port class]);
-                    printf("    port: %s uuid=%s\n", cls.UTF8String, uuidStr.UTF8String);
-
-                    /* Try to register the HID client with this port */
-                    SEL regSel = sel_registerName("registerCallbackWithUUID:legacyHIDEventPortCallback:");
-                    if ([port respondsToSelector:regSel]) {
-                        printf("    → This port supports legacyHIDEventPortCallback!\n");
-                    }
-                } @catch (id e) { }
-            }
-        }
-    }
-
-    /* Create SimDeviceLegacyHIDClient */
-    Class LegacyHIDClass = objc_getClass("SimulatorKit.SimDeviceLegacyHIDClient");
-    if (!LegacyHIDClass) {
-        LegacyHIDClass = objc_getClass("_TtC12SimulatorKit24SimDeviceLegacyHIDClient");
-    }
-    if (!LegacyHIDClass) {
-        fprintf(stderr, "SimDeviceLegacyHIDClient class not found\n");
-        return 1;
-    }
-
-    NSError *err = nil;
-    id hidClient = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
-        [LegacyHIDClass alloc],
-        sel_registerName("initWithDevice:error:"),
-        device, &err);
-    if (!hidClient) {
-        fprintf(stderr, "Failed to create HID client: %s\n",
-                err ? err.localizedDescription.UTF8String : "unknown error");
-        return 1;
-    }
+    NSString *tmpDir = [dataPath stringByAppendingPathComponent:@"tmp"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *cmdPath = [tmpDir stringByAppendingPathComponent:@"rosettasim_touch.json"];
 
     printf("Touch at (%.0f, %.0f) duration=%dms on %s\n",
            x, y, duration_ms, get_device_name(device).UTF8String);
 
-    /* Get device screen size for coordinate mapping */
-    /* IndigoHIDMessageForMouseNSEvent expects coordinates in the device's
-     * logical point space, and deviceSize as the screen dimensions. */
-    CGSize devSize = CGSizeMake(1024, 768); /* iPad default */
-    /* Try to get actual size from device properties */
-    @try {
-        id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
-        if (runtime) {
-            id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
-            if (deviceType) {
-                /* mainScreenSize property */
-                @try {
-                    NSValue *sizeVal = [deviceType valueForKey:@"mainScreenSize"];
-                    if (sizeVal) devSize = sizeVal.sizeValue;
-                } @catch (id e) { /* use default */ }
-            }
-        }
-    } @catch (id e) { /* use default */ }
+    /* Send touch down as separate file write, wait, then send touch up.
+     * UIKit needs ~150ms+ between down and up to register as a tap.
+     * Writing both in the same file results in only 16ms between them (too fast). */
 
-    /* mainScreenSize returns pixels — convert to points by dividing by scale factor */
-    @try {
-        id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
-        if (deviceType) {
-            NSNumber *scale = [deviceType valueForKey:@"mainScreenScale"];
-            if (scale && scale.floatValue > 0) {
-                devSize.width /= scale.floatValue;
-                devSize.height /= scale.floatValue;
-            }
-        }
-    } @catch (id e) { /* use as-is */ }
+    NSString *downJson = [NSString stringWithFormat:
+        @"{\"action\":\"down\",\"x\":%.1f,\"y\":%.1f,\"finger\":0}\n", x, y];
+    NSString *upJson = [NSString stringWithFormat:
+        @"{\"action\":\"up\",\"x\":%.1f,\"y\":%.1f,\"finger\":0}\n", x, y];
 
-    /* Check if the HID client has a valid event port */
-    SEL portSel = sel_registerName("legacyHIDEventPort");
-    uint32_t port = 0;
-    if ([hidClient respondsToSelector:portSel]) {
-        port = ((uint32_t(*)(id, SEL))objc_msgSend)(hidClient, portSel);
-    }
-    printf("  Device size: %.0fx%.0f (points), HID client: %s, port=%u\n",
-           devSize.width, devSize.height,
-           NSStringFromClass([hidClient class]).UTF8String, port);
+    NSError *err = nil;
 
-    /* Build touch down message */
-    CGPoint pt = CGPointMake(x, y);
-    CGPoint prevPt = pt;
-    /* IndigoHIDTarget: screen index OR'd with 0x40000000
-     * IndigoHIDTargetForScreen(0) = 0x40000000 for main screen */
-    uint32_t target = 0x40000000; /* main screen */
-    /* NSEventTypeLeftMouseDown = 1, NSEventTypeLeftMouseUp = 2 */
-    void *downMsg = createMsg(&pt, &prevPt, target, 1 /*NSEventTypeLeftMouseDown*/, devSize, 0);
-    if (!downMsg) {
-        fprintf(stderr, "Failed to create mouse down message\n");
+    /* Touch down */
+    [downJson writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) {
+        fprintf(stderr, "Failed to write touch down: %s\n", err.localizedDescription.UTF8String);
         return 1;
     }
 
-    /* Send touch down */
-    SEL sendSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
-    ((void(*)(id, SEL, void *, BOOL, id, id))objc_msgSend)(
-        hidClient, sendSel, downMsg, YES, nil, nil);
-    printf("  Touch DOWN sent\n");
+    /* Wait for dylib to pick up down (100ms poll) + duration for the hold */
+    int hold_ms = duration_ms > 0 ? duration_ms : 150;
+    usleep((100 + hold_ms) * 1000);
 
-    /* Wait for duration */
-    usleep(duration_ms * 1000);
-
-    /* Build and send touch up message */
-    void *upMsg = createMsg(&pt, &prevPt, target, 2 /*NSEventTypeLeftMouseUp*/, devSize, 0);
-    if (upMsg) {
-        ((void(*)(id, SEL, void *, BOOL, id, id))objc_msgSend)(
-            hidClient, sendSel, upMsg, YES, nil, nil);
-        printf("  Touch UP sent\n");
+    /* Touch up */
+    [upJson writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) {
+        fprintf(stderr, "Failed to write touch up: %s\n", err.localizedDescription.UTF8String);
+        return 1;
     }
+
+    /* Wait for dylib to pick up up event */
+    usleep(200000); /* 200ms */
 
     printf("Touch complete.\n");
     return 0;

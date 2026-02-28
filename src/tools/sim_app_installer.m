@@ -20,10 +20,15 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #include <notify.h>
+#include <CoreGraphics/CoreGraphics.h>
 
 static const char *g_udid = NULL;
 static char g_cmd_path[512];
 static char g_result_path[512];
+static char g_touch_path[512];
+
+/* UIASyntheticEvents touch generator (resolved after UIKit init) */
+static id g_uia_generator = nil;
 
 /* ================================================================
  * Logging
@@ -45,6 +50,84 @@ static void log_result(const char *fmt, ...) {
         fclose(f);
     }
     va_end(ap);
+}
+
+/* ================================================================
+ * Touch handler (UIASyntheticEvents — runs in SpringBoard)
+ * ================================================================ */
+
+static void handle_touch(void) {
+    @autoreleasepool {
+        if (!g_uia_generator) return;
+
+        NSString *touchPath = [NSString stringWithUTF8String:g_touch_path];
+        NSData *data = [NSData dataWithContentsOfFile:touchPath];
+        [[NSFileManager defaultManager] removeItemAtPath:touchPath error:nil];
+        if (!data || data.length == 0) return;
+
+        NSLog(@"[touch] Processing %lu bytes", (unsigned long)data.length);
+
+        NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (!content) return;
+
+        NSArray *lines = [content componentsSeparatedByCharactersInSet:
+                          [NSCharacterSet newlineCharacterSet]];
+
+        for (NSString *line in lines) {
+            NSString *trimmed = [line stringByTrimmingCharactersInSet:
+                                 [NSCharacterSet whitespaceCharacterSet]];
+            if (trimmed.length == 0) continue;
+
+            NSData *lineData = [trimmed dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:lineData
+                                                                options:0 error:nil];
+            if (!cmd || ![cmd isKindOfClass:[NSDictionary class]]) continue;
+
+            NSString *action = cmd[@"action"];
+            NSNumber *xNum = cmd[@"x"];
+            NSNumber *yNum = cmd[@"y"];
+            if (!action || !xNum || !yNum) continue;
+
+            float x = xNum.floatValue;
+            float y = yNum.floatValue;
+
+            CGPoint pt = CGPointMake(x, y);
+
+            if ([action isEqualToString:@"down"]) {
+                NSLog(@"[touch] down (%.0f,%.0f)", x, y);
+                ((void(*)(id, SEL, CGPoint, NSUInteger))objc_msgSend)(
+                    g_uia_generator, sel_registerName("touchDown:touchCount:"), pt, 1);
+                usleep(150000); /* 150ms — UIKit needs time to register tap */
+            } else if ([action isEqualToString:@"move"]) {
+                NSLog(@"[touch] move (%.0f,%.0f)", x, y);
+                SEL moveSel = sel_registerName("moveToPoint:touchCount:");
+                if ([g_uia_generator respondsToSelector:moveSel]) {
+                    ((void(*)(id, SEL, CGPoint, NSUInteger))objc_msgSend)(
+                        g_uia_generator, moveSel, pt, 1);
+                }
+            } else if ([action isEqualToString:@"up"]) {
+                NSLog(@"[touch] up (%.0f,%.0f)", x, y);
+                ((void(*)(id, SEL, CGPoint, NSUInteger))objc_msgSend)(
+                    g_uia_generator, sel_registerName("liftUp:touchCount:"), pt, 1);
+            } else if ([action isEqualToString:@"tap"]) {
+                NSLog(@"[touch] tap (%.0f,%.0f)", x, y);
+                ((void(*)(id, SEL, CGPoint, NSUInteger))objc_msgSend)(
+                    g_uia_generator, sel_registerName("touchDown:touchCount:"), pt, 1);
+                usleep(150000);
+                ((void(*)(id, SEL, CGPoint, NSUInteger))objc_msgSend)(
+                    g_uia_generator, sel_registerName("liftUp:touchCount:"), pt, 1);
+            }
+        }
+    }
+}
+
+static int g_touch_poll_count = 0;
+
+static void poll_touch_file(void) {
+    g_touch_poll_count++;
+    NSString *touchPath = [NSString stringWithUTF8String:g_touch_path];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:touchPath]) return;
+    handle_touch();
 }
 
 /* ================================================================
@@ -408,8 +491,16 @@ static void sim_app_installer_init(void) {
 
     snprintf(g_cmd_path, sizeof(g_cmd_path), "/tmp/rosettasim_cmd_%s.json", g_udid);
     snprintf(g_result_path, sizeof(g_result_path), "/tmp/rosettasim_install_result_%s.txt", g_udid);
+
+    /* Touch command file path — in sim's home/tmp */
+    NSString *home = NSHomeDirectory();
+    snprintf(g_touch_path, sizeof(g_touch_path), "%s/tmp/rosettasim_touch.json", home.UTF8String);
+    [[NSFileManager defaultManager] createDirectoryAtPath:[home stringByAppendingPathComponent:@"tmp"]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+
     NSLog(@"[app_installer] cmd_path set to: %s", g_cmd_path);
     NSLog(@"[app_installer] result_path set to: %s", g_result_path);
+    NSLog(@"[app_installer] touch_path set to: %s", g_touch_path);
 
     NSLog(@"[app_installer] Registering for device %s", g_udid);
 
@@ -452,6 +543,37 @@ static void sim_app_installer_init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         process_legacy_pending();
+    });
+
+    /* Touch injection via UIASyntheticEvents — init after 3s to let UIKit fully start */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        void *ua = dlopen("/Developer/Library/PrivateFrameworks/UIAutomation.framework/UIAutomation", RTLD_NOW);
+        if (!ua) ua = dlopen("/System/Library/PrivateFrameworks/UIAutomation.framework/UIAutomation", RTLD_NOW);
+
+        Class synthCls = objc_getClass("UIASyntheticEvents");
+        if (synthCls) {
+            g_uia_generator = ((id(*)(id, SEL))objc_msgSend)(
+                (id)synthCls, sel_registerName("sharedEventGenerator"));
+        }
+        NSLog(@"[touch] UIASyntheticEvents generator: %p", g_uia_generator);
+
+        if (!g_uia_generator) {
+            NSLog(@"[touch] Touch injection disabled — UIASyntheticEvents not available");
+            return;
+        }
+
+        /* Start fast touch poll loop (100ms on main queue) */
+        __block void (^touch_poll_loop)(void) = ^{
+            poll_touch_file();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), touch_poll_loop);
+        };
+        touch_poll_loop = [touch_poll_loop copy];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), touch_poll_loop);
+
+        NSLog(@"[touch] Touch poll started (100ms, UIA)");
     });
 
 }
