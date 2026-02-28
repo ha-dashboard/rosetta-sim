@@ -722,11 +722,36 @@ static void install_keyboard_swizzle(void) {
     NSLog(@"[inject] Installed keyboard crash swizzle on SimDevice");
 }
 
-/* --- Touch event injection via darwin notification --- */
+/* --- Touch event injection via NSEvent posting --- */
 
-/* Dispatch a touch event through Simulator.app's SimHIDSystem.
- * Simulator.app has SimulatorKit loaded which provides the full HID pipeline.
- * We use the SimDevice's IO client to send digitizer events. */
+/* Inject touch by posting NSEvents into the Simulator.app window.
+ * Simulator.app's SimDigitizerInputView translates mouse events into
+ * IndigoHID messages via SimDeviceLegacyHIDClient automatically.
+ * This runs host-side (native arm64e) so no Rosetta 2 issues. */
+
+/* Find the NSWindow for a given device UDID */
+static NSWindow *find_window_for_udid(const char *udid) {
+    NSString *udidStr = [NSString stringWithUTF8String:udid];
+
+    /* First: try UDID extraction from windowController */
+    for (NSWindow *win in [NSApp windows]) {
+        NSString *winUDID = extract_udid_from_window(win);
+        if ([winUDID isEqualToString:udidStr])
+            return win;
+    }
+
+    /* Second: match by device name in window title */
+    for (int i = 0; i < g_device_count; i++) {
+        if (strcmp(g_devices[i].udid, udid) != 0) continue;
+        NSString *name = [NSString stringWithUTF8String:g_devices[i].name];
+        for (NSWindow *win in [NSApp windows]) {
+            if (win.title && [win.title containsString:name])
+                return win;
+        }
+    }
+
+    return nil;
+}
 
 static void handle_touch_notification(const char *udid) {
     @autoreleasepool {
@@ -745,119 +770,158 @@ static void handle_touch_notification(const char *udid) {
 
         [[NSFileManager defaultManager] removeItemAtPath:cmdPath error:nil];
 
-        NSLog(@"[inject] Touch event: (%.0f, %.0f) duration=%dms udid=%s", x, y, duration_ms, udid);
+        FILE *dbg = fopen("/tmp/rosettasim_touch_debug.log", "a");
+        if (dbg) fprintf(dbg, "Touch (%.0f, %.0f) dur=%dms udid=%s\n", x, y, duration_ms, udid);
 
-        /* Find the SimDevice for this UDID via CoreSimulator */
-        Class SimServiceContext = objc_getClass("SimServiceContext");
-        if (!SimServiceContext) {
-            NSLog(@"[inject] SimServiceContext not found — cannot inject touch");
+        /* Find the Simulator window for this device */
+        NSWindow *win = find_window_for_udid(udid);
+        if (!win) {
+            if (dbg) { fprintf(dbg, "  NO WINDOW\n"); fclose(dbg); }
             return;
         }
 
-        NSError *err = nil;
-        id ctx = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
-            (id)SimServiceContext,
-            sel_registerName("sharedServiceContextForDeveloperDir:error:"),
-            @"/Applications/Xcode.app/Contents/Developer", &err);
-        if (!ctx) return;
+        /* Find SimDisplayChromeView — it has the _deviceHIDClient */
+        __block NSView *chromeView = nil;
+        __block NSView *digitizerView = nil;
+        __block void (^findView)(NSView *);
+        findView = ^(NSView *v) {
+            NSString *cls = NSStringFromClass([v class]);
+            if ([cls containsString:@"SimDisplayChromeView"] && !chromeView)
+                chromeView = v;
+            if ([cls containsString:@"SimDigitizerInputView"] && !digitizerView)
+                digitizerView = v;
+            for (NSView *sub in v.subviews) findView(sub);
+        };
+        if (win.contentView) findView(win.contentView);
 
-        id deviceSet = ((id(*)(id, SEL))objc_msgSend)(ctx, sel_registerName("defaultDeviceSetWithError:"));
-        if (!deviceSet) return;
-
-        NSDictionary *devices = ((id(*)(id, SEL))objc_msgSend)(deviceSet, sel_registerName("devicesByUDID"));
-        NSString *udidStr = [NSString stringWithUTF8String:udid];
-        NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:udidStr];
-        id device = devices[uuid];
-        if (!device) {
-            NSLog(@"[inject] Device %s not found in device set", udid);
+        if (!chromeView) {
+            if (dbg) { fprintf(dbg, "  NO SimDisplayChromeView\n"); fclose(dbg); }
             return;
         }
 
-        /* Try to get the HID system port via SimDevice's sendEventToHIDSystem:
-         * or through the IO client. Simulator.app typically has a SimHIDSystem
-         * instance we can use. */
+        /* Get the HID client — SimDeviceLegacyHIDClient is the chromeDelegate of SimDisplayChromeView.
+         * It conforms to SimDisplayChromeViewDelegate and SimDisplayChromeViewInputDelegate. */
+        __block id hidClient = nil;
+        Ivar chromeDelegateIvar = class_getInstanceVariable([chromeView class], "chromeDelegate");
+        if (chromeDelegateIvar) {
+            id delegate = object_getIvar(chromeView, chromeDelegateIvar);
+            if (delegate && [NSStringFromClass([delegate class]) containsString:@"LegacyHIDClient"]) {
+                hidClient = delegate;
+            }
+            if (dbg) fprintf(dbg, "  chromeDelegate: %p %s → hidClient: %s\n",
+                delegate, delegate ? NSStringFromClass([delegate class]).UTF8String : "nil",
+                hidClient ? "YES" : "NO");
+        }
 
-        /* Approach: Use SimDevice's HID event API if available */
-        SEL sendHIDSel = sel_registerName("sendEventToHIDSystem:");
-        if ([device respondsToSelector:sendHIDSel]) {
-            /* Build an IOHIDEvent for a digitizer touch.
-             * We use IOHIDEventCreateDigitizerFingerEvent from IOKit. */
-            typedef void* (*CreateFingerEventFn)(void *allocator, uint64_t timestamp,
-                uint32_t index, uint32_t identity, uint32_t eventMask,
-                float x, float y, float z, float tipPressure, float twist,
-                BOOL range, BOOL touch, uint32_t options);
-            CreateFingerEventFn createFinger = (CreateFingerEventFn)dlsym(RTLD_DEFAULT,
-                "IOHIDEventCreateDigitizerFingerEvent");
-
-            typedef void* (*CreateDigitizerEventFn)(void *allocator, uint64_t timestamp,
-                uint32_t transducerType, uint32_t index, uint32_t identity,
-                uint32_t eventMask, uint32_t buttonMask,
-                float x, float y, float z, float tipPressure, float barrelPressure,
-                BOOL range, BOOL touch, uint32_t options);
-            CreateDigitizerEventFn createDigitizer = (CreateDigitizerEventFn)dlsym(RTLD_DEFAULT,
-                "IOHIDEventCreateDigitizerEvent");
-
-            typedef void (*AppendEventFn)(void *parent, void *child);
-            AppendEventFn appendEvent = (AppendEventFn)dlsym(RTLD_DEFAULT,
-                "IOHIDEventAppendEvent");
-
-            if (createFinger && createDigitizer && appendEvent) {
-                uint64_t ts = mach_absolute_time();
-
-                /* Find device screen dimensions for normalizing coordinates */
-                float devW = 0, devH = 0;
-                for (int i = 0; i < g_device_count; i++) {
-                    if (strcmp(g_devices[i].udid, udid) == 0) {
-                        devW = (float)g_devices[i].width / g_devices[i].scale;
-                        devH = (float)g_devices[i].height / g_devices[i].scale;
-                        break;
+        if (!hidClient) {
+            /* Search ALL views AND their delegates for LegacyHIDClient */
+            __block void (^searchObj)(id, int);
+            searchObj = ^(id obj, int depth) {
+                if (hidClient || !obj || depth > 5) return;
+                NSString *cls = NSStringFromClass([obj class]);
+                if ([cls containsString:@"LegacyHIDClient"]) {
+                    hidClient = obj;
+                    if (dbg) fprintf(dbg, "  Found hidClient: %p %s (depth=%d)\n",
+                        obj, cls.UTF8String, depth);
+                    return;
+                }
+                /* Check all ivars of this object */
+                unsigned int count = 0;
+                Ivar *ivars = class_copyIvarList([obj class], &count);
+                for (unsigned i = 0; i < count; i++) {
+                    const char *name = ivar_getName(ivars[i]);
+                    if (!name) continue;
+                    /* Only follow HID, delegate, or client references */
+                    if (strstr(name, "HID") || strstr(name, "hid") ||
+                        strstr(name, "Client") || strstr(name, "client") ||
+                        strstr(name, "delegate") || strstr(name, "Delegate")) {
+                        @try {
+                            id val = object_getIvar(obj, ivars[i]);
+                            if (val && val != obj) {
+                                if (dbg && depth == 0) fprintf(dbg, "  Following %s.%s → %s\n",
+                                    cls.UTF8String, name, NSStringFromClass([val class]).UTF8String);
+                                searchObj(val, depth + 1);
+                            }
+                        } @catch (id e) {}
+                        if (hidClient) break;
                     }
                 }
-                if (devW <= 0 || devH <= 0) { devW = 1024; devH = 768; } /* iPad default */
+                if (ivars) free(ivars);
 
-                /* Normalize to 0.0-1.0 range */
-                float nx = x / devW;
-                float ny = y / devH;
-                if (nx < 0) nx = 0; if (nx > 1) nx = 1;
-                if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+                /* If it's a view, recurse into subviews */
+                if ([obj isKindOfClass:[NSView class]]) {
+                    for (NSView *sub in ((NSView*)obj).subviews) {
+                        searchObj(sub, depth + 1);
+                        if (hidClient) break;
+                    }
+                }
+            };
+            searchObj(win.contentView, 0);
+        }
+
+        /* Get device dimensions for coordinate conversion */
+        float devW = 1024, devH = 1366;
+        for (int i = 0; i < g_device_count; i++) {
+            if (strcmp(g_devices[i].udid, udid) == 0) {
+                devW = (float)g_devices[i].width / g_devices[i].scale;
+                devH = (float)g_devices[i].height / g_devices[i].scale;
+                break;
+            }
+        }
+
+        /* Convert iOS coords to digitizer view's window coordinates */
+        NSRect viewFrame = [digitizerView convertRect:digitizerView.bounds toView:nil];
+        float scaleX = viewFrame.size.width / devW;
+        float scaleY = viewFrame.size.height / devH;
+        CGFloat winX = viewFrame.origin.x + x * scaleX;
+        CGFloat winY = viewFrame.origin.y + viewFrame.size.height - y * scaleY;
+
+        if (dbg) fprintf(dbg, "  view frame: (%.0f,%.0f) %.0fx%.0f → winCoord (%.1f,%.1f)\n",
+            viewFrame.origin.x, viewFrame.origin.y,
+            viewFrame.size.width, viewFrame.size.height, winX, winY);
+
+        if (hidClient) {
+            /* Use IndigoHIDMessageForMouseNSEvent + SimDeviceLegacyHIDClient.send() */
+            typedef void *(*CreateMouseMsgFn)(CGPoint *, CGPoint *, uint32_t, NSUInteger, CGSize, uint32_t);
+            CreateMouseMsgFn createMsg = (CreateMouseMsgFn)dlsym(RTLD_DEFAULT,
+                "IndigoHIDMessageForMouseNSEvent");
+
+            if (createMsg) {
+                CGPoint pt = CGPointMake(x, y);
+                CGPoint prevPt = pt;
+                CGSize devSz = CGSizeMake(devW, devH);
+                uint32_t target = 0x40000000; /* IndigoHIDTargetForScreen(0) */
 
                 /* Touch down */
-                void *parent = createDigitizer(NULL, ts, 2 /*finger*/, 0, 0,
-                    (1<<0)|(1<<1)|(1<<5), /* range|touch|position */
-                    0, nx, ny, 0, 1.0, 0, YES, YES, 0);
-                void *finger = createFinger(NULL, ts, 0, 2, (1<<0)|(1<<1)|(1<<5),
-                    nx, ny, 0, 1.0, 0, YES, YES, 0);
-                if (parent && finger) {
-                    appendEvent(parent, finger);
-                    ((void(*)(id, SEL, void*))objc_msgSend)(device, sendHIDSel, parent);
-                    CFRelease(finger);
-                    NSLog(@"[inject] Touch DOWN sent at (%.2f, %.2f)", nx, ny);
+                void *downMsg = createMsg(&pt, &prevPt, target, 1/*MouseDown*/, devSz, 0);
+                if (downMsg) {
+                    SEL sendSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
+                    ((void(*)(id, SEL, void*, BOOL, id, id))objc_msgSend)(
+                        hidClient, sendSel, downMsg, YES, nil, nil);
+                    if (dbg) fprintf(dbg, "  IndigoHID DOWN sent via chromeDelegate\n");
                 }
 
-                /* Wait for duration */
-                usleep(duration_ms * 1000);
-
-                /* Touch up */
-                ts = mach_absolute_time();
-                void *upParent = createDigitizer(NULL, ts, 2, 0, 0,
-                    (1<<0)|(1<<1)|(1<<5), 0, nx, ny, 0, 0, 0, NO, NO, 0);
-                void *upFinger = createFinger(NULL, ts, 0, 2, (1<<0)|(1<<1)|(1<<5),
-                    nx, ny, 0, 0, 0, NO, NO, 0);
-                if (upParent && upFinger) {
-                    appendEvent(upParent, upFinger);
-                    ((void(*)(id, SEL, void*))objc_msgSend)(device, sendHIDSel, upParent);
-                    CFRelease(upFinger);
-                    NSLog(@"[inject] Touch UP sent");
-                }
-                if (parent) CFRelease(parent);
-                if (upParent) CFRelease(upParent);
+                /* Schedule touch up */
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, duration_ms * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    CGPoint upt = CGPointMake(x, y);
+                    CGPoint uprev = upt;
+                    void *upMsg = createMsg(&upt, &uprev, target, 2/*MouseUp*/, devSz, 0);
+                    if (upMsg) {
+                        SEL upSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
+                        ((void(*)(id, SEL, void*, BOOL, id, id))objc_msgSend)(
+                            hidClient, upSel, upMsg, YES, nil, nil);
+                    }
+                });
+                if (dbg) fprintf(dbg, "  Touch sent, UP scheduled after %dms\n", duration_ms);
             } else {
-                NSLog(@"[inject] IOHIDEvent creation functions not found");
+                if (dbg) fprintf(dbg, "  IndigoHIDMessageForMouseNSEvent not found\n");
             }
         } else {
-            NSLog(@"[inject] SimDevice does not respond to sendEventToHIDSystem:");
-            /* Fallback: try posting through the window's NSEvent system */
+            if (dbg) fprintf(dbg, "  NO HID client found — touch cannot be sent\n");
         }
+
+        if (dbg) fclose(dbg);
     }
 }
 

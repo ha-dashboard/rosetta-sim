@@ -387,11 +387,12 @@ static int cmd_install(NSString *udid, NSString *appPath) {
         @".com.apple.mobile_container_manager.metadata.plist"];
     [metadata writeToFile:metadataPath atomically:YES];
 
-    /* Write to LastLaunchServicesMap.plist for persistence across reboots.
+    /* Write installed apps plist for persistence across reboots.
      * registerApplicationDictionary: only updates lsd's in-memory state;
-     * on fresh devices the registration is lost on reboot without this. */
+     * on fresh devices the registration is lost on reboot without this.
+     * Use custom path — MobileInstallation/ is wiped by CoreSimulator on boot. */
     NSString *lsMapPath = [NSString stringWithFormat:
-        @"%@/Library/MobileInstallation/LastLaunchServicesMap.plist",
+        @"%@/Library/rosettasim_installed_apps.plist",
         deviceDataPath];
     NSString *lsMapDir = [lsMapPath stringByDeletingLastPathComponent];
     [[NSFileManager defaultManager] createDirectoryAtPath:lsMapDir
@@ -413,6 +414,51 @@ static int cmd_install(NSString *udid, NSString *appPath) {
     lsMap[@"User"] = userApps;
     [lsMap writeToFile:lsMapPath atomically:YES];
     printf("  Updated LaunchServicesMap for persistence.\n");
+
+    /* For iOS 10+ (CSStore2): also symlink app into runtime's /Applications/ directory.
+     * CSStore2 rebuilds the LS database from /Applications/ on every boot.
+     * registerApplicationDictionary: only updates in-memory state, not the database.
+     * A symlink from /Applications/<AppName>.app → container path makes CSStore2 find it. */
+    NSString *runtimeRoot = nil;
+    @try {
+        id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
+        if (runtime) {
+            NSURL *rootURL = ((id(*)(id, SEL))objc_msgSend)(runtime, sel_registerName("root"));
+            if (rootURL) runtimeRoot = [rootURL path];
+        }
+    } @catch (id e) { }
+    /* Fallback: construct from runtime ID (e.g., com.apple.CoreSimulator.SimRuntime.iOS-10-3) */
+    if (!runtimeRoot) {
+        NSString *base = [NSString stringWithFormat:@"%@/Library/Developer/CoreSimulator/Profiles/Runtimes",
+                          NSHomeDirectory()];
+        for (NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:base error:nil]) {
+            if ([entry containsString:@"iOS_10"] || [entry containsString:@"iOS_9"]) {
+                NSString *candidate = [NSString stringWithFormat:@"%@/%@/Contents/Resources/RuntimeRoot", base, entry];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+                    /* Match runtime to device by checking runtime ID */
+                    if ((rtID && [rtID containsString:@"10"] && [entry containsString:@"10"]) ||
+                        (rtID && [rtID containsString:@"9"] && [entry containsString:@"9"])) {
+                        runtimeRoot = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (runtimeRoot) {
+        NSString *appsDir = [runtimeRoot stringByAppendingPathComponent:@"Applications"];
+        NSString *linkPath = [appsDir stringByAppendingPathComponent:appName];
+        /* Remove existing app/symlink */
+        [[NSFileManager defaultManager] removeItemAtPath:linkPath error:nil];
+        /* Copy app directly (CSStore2 may not follow symlinks) */
+        NSError *copyErr = nil;
+        if ([[NSFileManager defaultManager] copyItemAtPath:destApp toPath:linkPath error:&copyErr]) {
+            printf("  Copied into /Applications/ for CSStore2 persistence.\n");
+        } else {
+            fprintf(stderr, "  Warning: copy to /Applications/ failed: %s\n",
+                    copyErr.localizedDescription.UTF8String);
+        }
+    }
 
     /* Notify sim_app_installer.dylib inside SpringBoard via darwin notification.
      * Write command file, then post device-specific notification. */
@@ -759,8 +805,16 @@ static int cmd_listapps(NSString *udid) {
         return run_with_timeout(@[@"xcrun", @"simctl", @"listapps", udid], 15);
     }
 
-    /* Legacy: read from LastLaunchServicesMap.plist */
+    /* Legacy: read from LastLaunchServicesMap.plist, fall back to rosettasim plist */
     NSDictionary *lsMap = read_ls_map(udid);
+    if (!lsMap) {
+        /* Fallback: read rosettasim_installed_apps.plist (used on iOS 10.3 where
+         * LastLaunchServicesMap doesn't persist our registrations) */
+        NSString *fallbackPath = [NSString stringWithFormat:
+            @"%@/Library/Developer/CoreSimulator/Devices/%@/data/Library/rosettasim_installed_apps.plist",
+            NSHomeDirectory(), udid];
+        lsMap = [NSDictionary dictionaryWithContentsOfFile:fallbackPath];
+    }
     if (!lsMap) {
         fprintf(stderr, "No LaunchServicesMap found. Device may not have booted yet.\n");
         return 1;
@@ -1497,6 +1551,9 @@ static int cmd_addmedia(NSString *udid, NSArray<NSString *> *files) {
 
 /* ── Command: touch (rosettasim extension) ── */
 
+/* Send touch via SimulatorKit's SimDeviceLegacyHIDClient + IndigoHIDMessageForMouseNSEvent.
+ * This runs host-side and talks directly to the HID system — no in-sim IPC needed. */
+
 static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
     id deviceSet = get_device_set();
     if (!deviceSet) return 1;
@@ -1512,25 +1569,158 @@ static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
         return 1;
     }
 
-    /* Write touch command file and notify sim_display_inject.dylib
-     * (loaded in Simulator.app, has access to SimHIDSystem) */
-    NSString *cmdPath = [NSString stringWithFormat:
-        @"/tmp/rosettasim_cmd_%@.json", udid];
-    NSDictionary *touchCmd = @{
-        @"action": @"touch",
-        @"x": @(x),
-        @"y": @(y),
-        @"duration": @(duration_ms),
-    };
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:touchCmd options:0 error:nil];
-    [jsonData writeToFile:cmdPath atomically:YES];
+    /* Load SimulatorKit.framework */
+    void *skHandle = dlopen("/Applications/Xcode.app/Contents/Developer/Library/"
+                            "PrivateFrameworks/SimulatorKit.framework/SimulatorKit", RTLD_NOW);
+    if (!skHandle) {
+        fprintf(stderr, "Failed to load SimulatorKit: %s\n", dlerror());
+        return 1;
+    }
 
-    char notifyName[256];
-    snprintf(notifyName, sizeof(notifyName), "com.rosettasim.touch.%s", udid.UTF8String);
-    notify_post(notifyName);
+    /* Get IndigoHIDMessageForMouseNSEvent:
+     * IndigoHIDMessage *IndigoHIDMessageForMouseNSEvent(
+     *     CGPoint *point, CGPoint *prevPoint,
+     *     IndigoHIDTarget target, NSEventType type,
+     *     NSSize deviceSize, IndigoHIDEdge edge)
+     * IndigoHIDTarget and IndigoHIDEdge are uint32_t-sized structs.
+     * target=0 for main screen, edge=0 for no edge. */
+    typedef void *(*CreateMouseMsgFn)(CGPoint *, CGPoint *, uint32_t, NSUInteger, CGSize, uint32_t);
+    CreateMouseMsgFn createMsg = (CreateMouseMsgFn)dlsym(RTLD_DEFAULT,
+        "IndigoHIDMessageForMouseNSEvent");
+    if (!createMsg) {
+        fprintf(stderr, "IndigoHIDMessageForMouseNSEvent not found\n");
+        return 1;
+    }
+
+    /* Create SimDeviceIOClient first to establish IO connection */
+    Class IOClientClass = objc_getClass("SimDeviceIOClient");
+    id ioClient = nil;
+    if (IOClientClass) {
+        ioClient = ((id(*)(id, SEL, id, id, id))objc_msgSend)(
+            [IOClientClass alloc],
+            sel_registerName("initWithDevice:errorQueue:errorHandler:"),
+            device, dispatch_get_main_queue(), nil);
+        if (ioClient) {
+            /* Wait a moment for IO ports to connect */
+            usleep(500000); /* 500ms */
+            NSArray *ports = ((id(*)(id, SEL))objc_msgSend)(ioClient, sel_registerName("ioPorts"));
+            printf("  IO client created, %lu ports\n", (unsigned long)ports.count);
+
+            /* Find the LegacyHID port by UUID */
+            for (id port in ports) {
+                @try {
+                    id uuid = [port valueForKey:@"uuid"];
+                    NSString *uuidStr = uuid ? [uuid description] : @"(nil)";
+                    /* Check port class name for LegacyHID */
+                    NSString *cls = NSStringFromClass([port class]);
+                    printf("    port: %s uuid=%s\n", cls.UTF8String, uuidStr.UTF8String);
+
+                    /* Try to register the HID client with this port */
+                    SEL regSel = sel_registerName("registerCallbackWithUUID:legacyHIDEventPortCallback:");
+                    if ([port respondsToSelector:regSel]) {
+                        printf("    → This port supports legacyHIDEventPortCallback!\n");
+                    }
+                } @catch (id e) { }
+            }
+        }
+    }
+
+    /* Create SimDeviceLegacyHIDClient */
+    Class LegacyHIDClass = objc_getClass("SimulatorKit.SimDeviceLegacyHIDClient");
+    if (!LegacyHIDClass) {
+        LegacyHIDClass = objc_getClass("_TtC12SimulatorKit24SimDeviceLegacyHIDClient");
+    }
+    if (!LegacyHIDClass) {
+        fprintf(stderr, "SimDeviceLegacyHIDClient class not found\n");
+        return 1;
+    }
+
+    NSError *err = nil;
+    id hidClient = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
+        [LegacyHIDClass alloc],
+        sel_registerName("initWithDevice:error:"),
+        device, &err);
+    if (!hidClient) {
+        fprintf(stderr, "Failed to create HID client: %s\n",
+                err ? err.localizedDescription.UTF8String : "unknown error");
+        return 1;
+    }
 
     printf("Touch at (%.0f, %.0f) duration=%dms on %s\n",
            x, y, duration_ms, get_device_name(device).UTF8String);
+
+    /* Get device screen size for coordinate mapping */
+    /* IndigoHIDMessageForMouseNSEvent expects coordinates in the device's
+     * logical point space, and deviceSize as the screen dimensions. */
+    CGSize devSize = CGSizeMake(1024, 768); /* iPad default */
+    /* Try to get actual size from device properties */
+    @try {
+        id runtime = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("runtime"));
+        if (runtime) {
+            id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
+            if (deviceType) {
+                /* mainScreenSize property */
+                @try {
+                    NSValue *sizeVal = [deviceType valueForKey:@"mainScreenSize"];
+                    if (sizeVal) devSize = sizeVal.sizeValue;
+                } @catch (id e) { /* use default */ }
+            }
+        }
+    } @catch (id e) { /* use default */ }
+
+    /* mainScreenSize returns pixels — convert to points by dividing by scale factor */
+    @try {
+        id deviceType = ((id(*)(id, SEL))objc_msgSend)(device, sel_registerName("deviceType"));
+        if (deviceType) {
+            NSNumber *scale = [deviceType valueForKey:@"mainScreenScale"];
+            if (scale && scale.floatValue > 0) {
+                devSize.width /= scale.floatValue;
+                devSize.height /= scale.floatValue;
+            }
+        }
+    } @catch (id e) { /* use as-is */ }
+
+    /* Check if the HID client has a valid event port */
+    SEL portSel = sel_registerName("legacyHIDEventPort");
+    uint32_t port = 0;
+    if ([hidClient respondsToSelector:portSel]) {
+        port = ((uint32_t(*)(id, SEL))objc_msgSend)(hidClient, portSel);
+    }
+    printf("  Device size: %.0fx%.0f (points), HID client: %s, port=%u\n",
+           devSize.width, devSize.height,
+           NSStringFromClass([hidClient class]).UTF8String, port);
+
+    /* Build touch down message */
+    CGPoint pt = CGPointMake(x, y);
+    CGPoint prevPt = pt;
+    /* IndigoHIDTarget: screen index OR'd with 0x40000000
+     * IndigoHIDTargetForScreen(0) = 0x40000000 for main screen */
+    uint32_t target = 0x40000000; /* main screen */
+    /* NSEventTypeLeftMouseDown = 1, NSEventTypeLeftMouseUp = 2 */
+    void *downMsg = createMsg(&pt, &prevPt, target, 1 /*NSEventTypeLeftMouseDown*/, devSize, 0);
+    if (!downMsg) {
+        fprintf(stderr, "Failed to create mouse down message\n");
+        return 1;
+    }
+
+    /* Send touch down */
+    SEL sendSel = sel_registerName("sendWithMessage:freeWhenDone:completionQueue:completion:");
+    ((void(*)(id, SEL, void *, BOOL, id, id))objc_msgSend)(
+        hidClient, sendSel, downMsg, YES, nil, nil);
+    printf("  Touch DOWN sent\n");
+
+    /* Wait for duration */
+    usleep(duration_ms * 1000);
+
+    /* Build and send touch up message */
+    void *upMsg = createMsg(&pt, &prevPt, target, 2 /*NSEventTypeLeftMouseUp*/, devSize, 0);
+    if (upMsg) {
+        ((void(*)(id, SEL, void *, BOOL, id, id))objc_msgSend)(
+            hidClient, sendSel, upMsg, YES, nil, nil);
+        printf("  Touch UP sent\n");
+    }
+
+    printf("Touch complete.\n");
     return 0;
 }
 

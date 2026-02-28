@@ -148,11 +148,22 @@ static void handle_install(void) {
         }
 
         if (success > 0) {
-            /* Do NOT post com.apple.LaunchServices.ApplicationsChanged or
-             * com.apple.mobile.application_installed — these trigger SpringBoard
-             * icon layout rebuild which crashes due to missing icon data.
-             * The lsd registration is sufficient; app appears after next reboot. */
-            log_result("SUCCESS: Registered %d app(s) with LaunchServices (reboot to see on home screen)", success);
+            /* On iOS 10+, SpringBoard can handle the ApplicationsChanged notification
+             * without crashing. On iOS 9.x, it crashes during icon layout rebuild.
+             * Check runtime version and only post on 10+. */
+            NSString *runtimeVer = [[NSProcessInfo processInfo].environment
+                objectForKey:@"SIMULATOR_RUNTIME_VERSION"];
+            BOOL isIOS10Plus = runtimeVer && ![runtimeVer hasPrefix:@"9."] &&
+                               ![runtimeVer hasPrefix:@"8."] && ![runtimeVer hasPrefix:@"7."];
+
+            if (isIOS10Plus) {
+                /* Tell SpringBoard to refresh its icon model */
+                notify_post("com.apple.LaunchServices.ApplicationsChanged");
+                log_result("SUCCESS: Registered %d app(s) — notified SpringBoard (iOS 10+)", success);
+            } else {
+                /* iOS 9.x: skip notification to avoid SpringBoard crash */
+                log_result("SUCCESS: Registered %d app(s) with LaunchServices (reboot to see on home screen)", success);
+            }
         } else {
             log_result("FAILED: No apps registered successfully");
         }
@@ -273,8 +284,55 @@ static void process_legacy_pending(void) {
 
 static int g_poll_count = 0;
 
+static BOOL g_boot_reregistered = NO;
+
+static void reregister_on_boot(void) {
+    if (g_boot_reregistered) return;
+    g_boot_reregistered = YES;
+
+    @autoreleasepool {
+        NSString *lsMapPath = [NSHomeDirectory()
+            stringByAppendingPathComponent:@"Library/rosettasim_installed_apps.plist"];
+        NSDictionary *lsMap = [NSDictionary dictionaryWithContentsOfFile:lsMapPath];
+        NSDictionary *userApps = lsMap[@"User"];
+        if (!userApps.count) return;
+
+        NSLog(@"[app_installer] Re-registering %lu apps on boot", (unsigned long)userApps.count);
+
+        Class lsClass = objc_getClass("LSApplicationWorkspace");
+        if (!lsClass) return;
+        id workspace = ((id(*)(id, SEL))objc_msgSend)((id)lsClass,
+                        sel_registerName("defaultWorkspace"));
+        if (!workspace) return;
+        SEL regSel = sel_registerName("registerApplicationDictionary:");
+
+        for (NSString *bundleId in userApps) {
+            NSDictionary *appInfo = userApps[bundleId];
+            NSString *appPath = appInfo[@"Path"];
+            if (!appPath || ![[NSFileManager defaultManager] fileExistsAtPath:appPath]) continue;
+            NSString *plistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+            NSMutableDictionary *regDict = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
+            if (!regDict) continue;
+            regDict[@"Path"] = appPath;
+            regDict[@"ApplicationType"] = @"User";
+            BOOL ok = ((BOOL(*)(id, SEL, id))objc_msgSend)(workspace, regSel, regDict);
+            NSLog(@"[app_installer] Re-registered %@: %@", bundleId, ok ? @"YES" : @"NO");
+        }
+
+        NSString *runtimeVer = [[NSProcessInfo processInfo].environment
+            objectForKey:@"SIMULATOR_RUNTIME_VERSION"];
+        if (runtimeVer && ![runtimeVer hasPrefix:@"9."] &&
+            ![runtimeVer hasPrefix:@"8."] && ![runtimeVer hasPrefix:@"7."]) {
+            notify_post("com.apple.LaunchServices.ApplicationsChanged");
+        }
+    }
+}
+
 static void poll_cmd_file(void) {
     g_poll_count++;
+    /* Re-register apps from plist on first few polls (after boot) */
+    if (g_poll_count == 5) reregister_on_boot();
+
     NSString *cmdPath = [NSString stringWithUTF8String:g_cmd_path];
     BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:cmdPath];
     if (g_poll_count <= 5 || (exists) || (g_poll_count % 30 == 0)) {
@@ -395,4 +453,5 @@ static void sim_app_installer_init(void) {
                    dispatch_get_main_queue(), ^{
         process_legacy_pending();
     });
+
 }
