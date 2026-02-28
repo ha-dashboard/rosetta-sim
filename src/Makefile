@@ -1,21 +1,20 @@
-# Makefile for legacy iOS simulator display tools
+# Makefile for legacy iOS simulator tools (rosettasim)
 #
 # Source layout:
 #   daemon/     — rosettasim_daemon.m
-#   display/    — sim_display_inject.m (injection dylib)
+#   display/    — sim_display_inject.m (injection dylib for Simulator.app)
 #   screenshot/ — fb_to_png.m, rosettasim_screenshot_plugin.m
 #   scale/      — sim_scale_fix.m (scale fix dylib)
-#   bridge/     — purple_fb_bridge.m (PurpleFB bridge)
+#   bridge/     — purple_fb_bridge.m, bridge_compat_stubs.m, bridge_wrapper.c
 #   viewer/     — sim_viewer.m (standalone viewer)
+#   touch/      — sim_touch_inject.m (backboardd touch/keyboard injection)
+#   tools/      — rosettasim_ctl.m, sim_app_installer.m
 #
 # Build outputs go to build/ (gitignored).
 #
 # Usage:
 #   make              # build all
-#   make daemon       # build daemon only
-#   make inject       # build injection dylib only
-#   make bridge       # build bridge only
-#   make viewer       # build viewer only
+#   make deploy       # build all + deploy to iOS 9.3 and 10.3 runtimes
 #   make clean        # remove build artifacts
 
 # IMPORTANT: Use /usr/bin/cc, NOT cc (shell alias hangs in this environment)
@@ -59,9 +58,36 @@ PLUGIN_BIN    = $(BUILD)/RosettaSimScreenshot.simdeviceio/Contents/MacOS/Rosetta
 
 IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
 
-.PHONY: all daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl clean
+# Sim-side dylibs (x86_64, run under Rosetta 2 inside the simulator)
+CFLAGS_SIM = -arch x86_64 -isysroot $(IPHONE_SIM_SDK) -mios-simulator-version-min=9.0 \
+	-fobjc-arc -Wl,-undefined,dynamic_lookup -Wl,-not_for_dyld_shared_cache
 
-all: daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl
+# Touch/keyboard injection dylib (loaded into backboardd)
+TOUCH_INJECT_SRC = touch/sim_touch_inject.m
+TOUCH_INJECT_BIN = $(BUILD)/sim_touch_inject.dylib
+
+# App installer dylib (loaded into SpringBoard — install, launch, UIA touch)
+APP_INSTALLER_SRC = tools/sim_app_installer.m
+APP_INSTALLER_BIN = $(BUILD)/sim_app_installer.dylib
+
+# Bridge compat stubs (loaded into CoreSimulatorBridge for legacy runtimes)
+BRIDGE_STUBS_SRC = bridge/bridge_compat_stubs.m
+BRIDGE_STUBS_BIN = $(BUILD)/bridge_compat_stubs.dylib
+
+# Bridge wrapper (universal binary, dispatches to legacy or modern bridge)
+BRIDGE_WRAPPER_SRC = tools/bridge_wrapper.c
+BRIDGE_WRAPPER_BIN = $(BUILD)/bridge_wrapper
+
+# Runtime root paths for deployment
+RUNTIME_93 = $(HOME)/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS_9.3.simruntime/Contents/Resources/RuntimeRoot
+RUNTIME_10 = $(HOME)/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS_10.3.simruntime/Contents/Resources/RuntimeRoot
+
+.PHONY: all daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl \
+	touch_inject app_installer bridge_stubs bridge_wrapper \
+	deploy deploy_93 deploy_10 clean
+
+all: daemon inject bridge viewer scale_fix screenshot screenshot_plugin ctl \
+	touch_inject app_installer bridge_stubs bridge_wrapper
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -133,6 +159,99 @@ $(CTL_BIN): $(CTL_SRC) | $(BUILD)
 		-framework ImageIO -framework UniformTypeIdentifiers \
 		-Wl,-undefined,dynamic_lookup -o $@ $<
 	@echo "Built: $@"
+
+# --- Sim-side dylibs (x86_64) ---
+
+touch_inject: $(TOUCH_INJECT_BIN)
+
+$(TOUCH_INJECT_BIN): $(TOUCH_INJECT_SRC) | $(BUILD)
+	$(CC) $(CFLAGS_SIM) -dynamiclib -framework Foundation -framework IOKit \
+		-install_name /usr/lib/sim_touch_inject.dylib -o $@ $<
+	@echo "Built: $@"
+
+app_installer: $(APP_INSTALLER_BIN)
+
+$(APP_INSTALLER_BIN): $(APP_INSTALLER_SRC) | $(BUILD)
+	$(CC) $(CFLAGS_SIM) -dynamiclib -framework Foundation \
+		-install_name /usr/lib/sim_app_installer.dylib -o $@ $<
+	@echo "Built: $@"
+
+bridge_stubs: $(BRIDGE_STUBS_BIN)
+
+$(BRIDGE_STUBS_BIN): $(BRIDGE_STUBS_SRC) | $(BUILD)
+	$(CC) $(CFLAGS_SIM) -dynamiclib -framework Foundation \
+		-install_name /usr/lib/bridge_compat_stubs.dylib -o $@ $<
+	@echo "Built: $@"
+
+bridge_wrapper: $(BRIDGE_WRAPPER_BIN)
+
+$(BRIDGE_WRAPPER_BIN): $(BRIDGE_WRAPPER_SRC) | $(BUILD)
+	$(CC) -arch x86_64 -arch arm64 -o $@ $<
+	@echo "Built: $@"
+
+# --- Deploy to runtime roots ---
+# Copies sim-side dylibs, codesigns for iOS 10.3, checks insert_dylib status.
+# Usage: make deploy
+# NOTE: insert_dylib into SpringBoard/backboardd is only done once (idempotent check).
+#       iOS 10.3 binaries MUST be codesigned after insert_dylib modifies them.
+
+deploy: deploy_93 deploy_10
+	@echo ""
+	@echo "=== Deploy complete ==="
+
+deploy_93: touch_inject app_installer bridge_stubs
+	@echo "--- Deploying to iOS 9.3 ---"
+	@if [ ! -d "$(RUNTIME_93)" ]; then echo "iOS 9.3 runtime not found"; exit 0; fi
+	cp $(TOUCH_INJECT_BIN) "$(RUNTIME_93)/usr/lib/sim_touch_inject.dylib"
+	cp $(APP_INSTALLER_BIN) "$(RUNTIME_93)/usr/lib/sim_app_installer.dylib"
+	cp $(BRIDGE_STUBS_BIN) "$(RUNTIME_93)/usr/lib/bridge_compat_stubs.dylib"
+	@# Check if insert_dylib needed for backboardd
+	@if ! otool -L "$(RUNTIME_93)/usr/libexec/backboardd" 2>/dev/null | grep -q sim_touch_inject; then \
+		echo "  Injecting sim_touch_inject into backboardd..."; \
+		echo y | insert_dylib --inplace --no-strip-codesig /usr/lib/sim_touch_inject.dylib \
+			"$(RUNTIME_93)/usr/libexec/backboardd" 2>&1; \
+	else \
+		echo "  sim_touch_inject already in backboardd"; \
+	fi
+	@# Check if insert_dylib needed for SpringBoard
+	@if ! otool -L "$(RUNTIME_93)/System/Library/CoreServices/SpringBoard.app/SpringBoard" 2>/dev/null | grep -q sim_app_installer; then \
+		echo "  Injecting sim_app_installer into SpringBoard..."; \
+		echo y | insert_dylib --inplace --no-strip-codesig /usr/lib/sim_app_installer.dylib \
+			"$(RUNTIME_93)/System/Library/CoreServices/SpringBoard.app/SpringBoard" 2>&1; \
+	else \
+		echo "  sim_app_installer already in SpringBoard"; \
+	fi
+	@echo "  iOS 9.3 deploy done"
+
+deploy_10: touch_inject app_installer bridge_stubs
+	@echo "--- Deploying to iOS 10.3 ---"
+	@if [ ! -d "$(RUNTIME_10)" ]; then echo "iOS 10.3 runtime not found"; exit 0; fi
+	cp $(TOUCH_INJECT_BIN) "$(RUNTIME_10)/usr/lib/sim_touch_inject.dylib"
+	cp $(APP_INSTALLER_BIN) "$(RUNTIME_10)/usr/lib/sim_app_installer.dylib"
+	cp $(BRIDGE_STUBS_BIN) "$(RUNTIME_10)/usr/lib/bridge_compat_stubs.dylib"
+	@# Codesign all sim dylibs (iOS 10.3 requires this)
+	codesign --force --sign - "$(RUNTIME_10)/usr/lib/sim_touch_inject.dylib"
+	codesign --force --sign - "$(RUNTIME_10)/usr/lib/sim_app_installer.dylib"
+	codesign --force --sign - "$(RUNTIME_10)/usr/lib/bridge_compat_stubs.dylib"
+	@# Check if insert_dylib needed for backboardd
+	@if ! otool -L "$(RUNTIME_10)/usr/libexec/backboardd" 2>/dev/null | grep -q sim_touch_inject; then \
+		echo "  Injecting sim_touch_inject into backboardd..."; \
+		echo y | insert_dylib --inplace --no-strip-codesig /usr/lib/sim_touch_inject.dylib \
+			"$(RUNTIME_10)/usr/libexec/backboardd" 2>&1; \
+		codesign --force --sign - "$(RUNTIME_10)/usr/libexec/backboardd"; \
+	else \
+		echo "  sim_touch_inject already in backboardd"; \
+	fi
+	@# Check if insert_dylib needed for SpringBoard
+	@if ! otool -L "$(RUNTIME_10)/System/Library/CoreServices/SpringBoard.app/SpringBoard" 2>/dev/null | grep -q sim_app_installer; then \
+		echo "  Injecting sim_app_installer into SpringBoard..."; \
+		echo y | insert_dylib --inplace --no-strip-codesig /usr/lib/sim_app_installer.dylib \
+			"$(RUNTIME_10)/System/Library/CoreServices/SpringBoard.app/SpringBoard" 2>&1; \
+		codesign --force --sign - "$(RUNTIME_10)/System/Library/CoreServices/SpringBoard.app/SpringBoard"; \
+	else \
+		echo "  sim_app_installer already in SpringBoard"; \
+	fi
+	@echo "  iOS 10.3 deploy done"
 
 clean:
 	rm -rf $(BUILD)
