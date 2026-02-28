@@ -21,6 +21,7 @@
 #import <dlfcn.h>
 #include <notify.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include "common/rosettasim_paths.h"
 
 static const char *g_udid = NULL;
 static char g_cmd_path[512];
@@ -394,7 +395,7 @@ static void reregister_on_boot(void) {
 
     @autoreleasepool {
         NSString *lsMapPath = [NSHomeDirectory()
-            stringByAppendingPathComponent:@"Library/rosettasim_installed_apps.plist"];
+            stringByAppendingPathComponent:@ROSETTASIM_DEV_INSTALLED_APPS];
         NSDictionary *lsMap = [NSDictionary dictionaryWithContentsOfFile:lsMapPath];
         NSDictionary *userApps = lsMap[@"User"];
         if (!userApps.count) return;
@@ -508,13 +509,13 @@ static void sim_app_installer_init(void) {
         return;
     }
 
-    snprintf(g_cmd_path, sizeof(g_cmd_path), "/tmp/rosettasim_cmd_%s.json", g_udid);
-    snprintf(g_result_path, sizeof(g_result_path), "/tmp/rosettasim_install_result_%s.txt", g_udid);
+    snprintf(g_cmd_path, sizeof(g_cmd_path), ROSETTASIM_HOST_CMD_FMT, g_udid);
+    snprintf(g_result_path, sizeof(g_result_path), ROSETTASIM_HOST_RESULT_FMT, g_udid);
 
     /* Touch command file path — in sim's home/tmp */
     NSString *home = NSHomeDirectory();
-    snprintf(g_touch_path, sizeof(g_touch_path), "%s/tmp/rosettasim_touch.json", home.UTF8String);
-    snprintf(g_touch_log_path, sizeof(g_touch_log_path), "%s/tmp/rosettasim_touch.log", home.UTF8String);
+    snprintf(g_touch_path, sizeof(g_touch_path), "%s/" ROSETTASIM_DEV_TOUCH_FILE, home.UTF8String);
+    snprintf(g_touch_log_path, sizeof(g_touch_log_path), "%s/" ROSETTASIM_DEV_TOUCH_LOG, home.UTF8String);
     [[NSFileManager defaultManager] createDirectoryAtPath:[home stringByAppendingPathComponent:@"tmp"]
                               withIntermediateDirectories:YES attributes:nil error:nil];
 

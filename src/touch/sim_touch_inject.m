@@ -26,6 +26,7 @@
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include "common/rosettasim_paths.h"
 
 /* ================================================================
  * IOHIDEvent types
@@ -718,9 +719,9 @@ static void sim_touch_inject_init(void) {
 
         /* Use separate file path so backboardd doesn't compete with SpringBoard's
          * UIA touch handler (which polls rosettasim_touch.json). */
-        snprintf(g_cmd_path, sizeof(g_cmd_path), "%s/tmp/rosettasim_touch_bb.json",
+        snprintf(g_cmd_path, sizeof(g_cmd_path), "%s/" ROSETTASIM_DEV_TOUCH_BB_FILE,
                  home.UTF8String);
-        snprintf(g_log_path, sizeof(g_log_path), "%s/tmp/rosettasim_touch_inject.log",
+        snprintf(g_log_path, sizeof(g_log_path), "%s/" ROSETTASIM_DEV_TOUCH_INJECT_LOG,
                  home.UTF8String);
 
         touch_log("=== sim_touch_inject loaded pid=%d ===", getpid());

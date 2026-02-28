@@ -22,7 +22,7 @@ CC = /usr/bin/cc
 
 BUILD = build
 
-CFLAGS_COMMON = -fobjc-arc -fmodules -arch arm64e -Wall -Wextra -Wno-unused-parameter
+CFLAGS_COMMON = -fobjc-arc -fmodules -arch arm64e -Wall -Wextra -Wno-unused-parameter -I.
 
 # Daemon: monitors all legacy devices, auto-registers PurpleFBServer on boot
 DAEMON_SRC    = daemon/rosettasim_daemon.m
@@ -60,7 +60,7 @@ IPHONE_SIM_SDK = $(shell xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null
 
 # Sim-side dylibs (x86_64, run under Rosetta 2 inside the simulator)
 CFLAGS_SIM = -arch x86_64 -isysroot $(IPHONE_SIM_SDK) -mios-simulator-version-min=9.0 \
-	-fobjc-arc -Wl,-undefined,dynamic_lookup -Wl,-not_for_dyld_shared_cache
+	-fobjc-arc -I. -Wl,-undefined,dynamic_lookup -Wl,-not_for_dyld_shared_cache
 
 # Touch/keyboard injection dylib (loaded into backboardd)
 TOUCH_INJECT_SRC = touch/sim_touch_inject.m
