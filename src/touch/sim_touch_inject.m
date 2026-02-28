@@ -514,10 +514,19 @@ static void *touch_poll_thread(void *arg) {
 static void register_virtual_hid_services(void) {
     touch_log("=== Registering virtual HID services ===");
 
+    /* Skip VSM registration on iOS 10.x — ISCVirtualServiceManager connect crashes backboardd */
+    NSString *runtimeVer = [[NSProcessInfo processInfo].environment
+        objectForKey:@"SIMULATOR_RUNTIME_VERSION"];
+    if (runtimeVer && [runtimeVer hasPrefix:@"10."]) {
+        touch_log("Skipping VSM registration on iOS 10.x (ISC incompatible)");
+        return;
+    }
+
     /* Get backboardd's IOHIDEventSystem from BKHIDServiceManager */
     Class svcMgrCls = objc_getClass("BKHIDServiceManager");
     if (!svcMgrCls) {
-        touch_log("BKHIDServiceManager not found");
+        touch_log("BKHIDServiceManager not found — trying BKHIDSystemInterface");
+        /* On iOS 10.x, might need different approach */
         /* Dump BK* classes for debugging */
         unsigned int classCount = 0;
         Class *allClasses = objc_copyClassList(&classCount);
@@ -583,22 +592,26 @@ static void register_virtual_hid_services(void) {
         return;
     }
 
-    /* Create SimHIDVirtualServiceManager */
+    /* Create SimHIDVirtualServiceManager (or ISCVirtualServiceManager on iOS 10.x) */
     Class vsmCls = objc_getClass("SimHIDVirtualServiceManager");
     if (!vsmCls) {
-        touch_log("SimHIDVirtualServiceManager not found — searching Sim* classes");
+        vsmCls = objc_getClass("ISCVirtualServiceManager");
+        touch_log("Trying ISCVirtualServiceManager: %p", vsmCls);
+    }
+    if (!vsmCls) {
+        touch_log("No VirtualServiceManager class found — searching:");
         unsigned int classCount = 0;
         Class *allClasses = objc_copyClassList(&classCount);
         for (unsigned int i = 0; i < classCount; i++) {
             const char *name = class_getName(allClasses[i]);
-            if (strcasestr(name, "SimHID") || strcasestr(name, "VirtualService"))
+            if (strcasestr(name, "Virtual") && strcasestr(name, "Service"))
                 touch_log("  Class: %s", name);
         }
         free(allClasses);
         return;
     }
 
-    touch_log("SimHIDVirtualServiceManager class: %p", vsmCls);
+    touch_log("VirtualServiceManager class: %p (%s)", vsmCls, class_getName(vsmCls));
 
     /* List methods for debugging */
     unsigned int mcount = 0;
@@ -624,10 +637,16 @@ static void register_virtual_hid_services(void) {
         CFRetain((__bridge CFTypeRef)vsm);
         touch_log("Virtual HID services registered successfully!");
 
-        /* Get mainScreenTouchService */
+        /* Get mainScreenTouchService (SimHID) or mainDisplayTouchService (ISC) */
         id touchSvc = ((id(*)(id, SEL))objc_msgSend)(
             vsm, sel_registerName("mainScreenTouchService"));
-        touch_log("  mainScreenTouchService: %p", (__bridge void *)touchSvc);
+        if (!touchSvc) {
+            touchSvc = ((id(*)(id, SEL))objc_msgSend)(
+                vsm, sel_registerName("mainDisplayTouchService"));
+            touch_log("  mainDisplayTouchService (ISC fallback): %p", (__bridge void *)touchSvc);
+        } else {
+            touch_log("  mainScreenTouchService: %p", (__bridge void *)touchSvc);
+        }
 
         if (touchSvc) {
             /* Dump methods */
@@ -680,112 +699,6 @@ static void register_virtual_hid_services(void) {
                   (unsigned long)(allSvcs ? [allSvcs count] : 0));
     } else {
         touch_log("SimHIDVirtualServiceManager init returned nil");
-    }
-
-    /* Swizzle BKTouchPadManager.handleEvent:fromTouchPad: to trace events */
-    Class tpmCls = objc_getClass("BKTouchPadManager");
-    if (tpmCls) {
-        touch_log("BKTouchPadManager: %p", tpmCls);
-        SEL handleSel = sel_registerName("handleEvent:fromTouchPad:");
-        Method m = class_getInstanceMethod(tpmCls, handleSel);
-        if (m) {
-            static IMP orig_handleEvent = NULL;
-            orig_handleEvent = method_getImplementation(m);
-            method_setImplementation(m, imp_implementationWithBlock(
-                ^(id self, void *event, id touchPad) {
-                    touch_log("*** BKTouchPadManager.handleEvent: %p fromTouchPad: %p", event, (__bridge void *)touchPad);
-                    ((void(*)(id, SEL, void *, id))orig_handleEvent)(self, handleSel, event, touchPad);
-                }));
-            touch_log("  Swizzled handleEvent:fromTouchPad:");
-        } else {
-            touch_log("  handleEvent:fromTouchPad: method not found");
-        }
-
-        /* Also swizzle _queue_sendEvent:fromTouchPad:toDestination: */
-        SEL sendSel = sel_registerName("_queue_sendEvent:fromTouchPad:toDestination:");
-        Method sendM = class_getInstanceMethod(tpmCls, sendSel);
-        if (sendM) {
-            static IMP orig_send = NULL;
-            orig_send = method_getImplementation(sendM);
-            method_setImplementation(sendM, imp_implementationWithBlock(
-                ^(id self, void *event, id touchPad, id destination) {
-                    touch_log("*** _queue_sendEvent: %p dest: %p (%s)",
-                              event, (__bridge void *)destination,
-                              destination ? class_getName([destination class]) : "nil");
-                    /* Check destination port and contextID */
-                    if (destination) {
-                        Ivar pIvar = class_getInstanceVariable([destination class], "_port");
-                        if (pIvar) {
-                            uint32_t port = *(uint32_t *)((uint8_t *)(__bridge void *)destination + ivar_getOffset(pIvar));
-                            touch_log("    dest._port: %u", port);
-                        }
-                        @try {
-                            id ctxID = [destination valueForKey:@"contextID"];
-                            touch_log("    dest.contextID: %@", ctxID);
-                        } @catch (id e) {
-                            touch_log("    dest.contextID: exception");
-                        }
-                        /* Dump all ivars */
-                        unsigned int dc = 0;
-                        Ivar *divars = class_copyIvarList([destination class], &dc);
-                        for (unsigned int di = 0; di < dc; di++) {
-                            touch_log("    dest ivar: %s (off %td)",
-                                      ivar_getName(divars[di]), ivar_getOffset(divars[di]));
-                        }
-                        free(divars);
-                    }
-                    ((void(*)(id, SEL, void *, id, id))orig_send)(self, sendSel, event, touchPad, destination);
-                }));
-            touch_log("  Swizzled _queue_sendEvent:fromTouchPad:toDestination:");
-        } else {
-            touch_log("  _queue_sendEvent: not found — dumping BKTouchPadManager methods:");
-            unsigned int mc = 0;
-            Method *ms = class_copyMethodList(tpmCls, &mc);
-            for (unsigned int i = 0; i < mc; i++) {
-                const char *name = sel_getName(method_getName(ms[i]));
-                touch_log("    %s", name);
-            }
-            free(ms);
-        }
-    } else {
-        touch_log("BKTouchPadManager not found");
-    }
-
-    /* Check BKHIDServiceInfoCache */
-    Class cacheCls = objc_getClass("BKHIDServiceInfoCache");
-    if (cacheCls) {
-        id cache = ((id(*)(id, SEL))objc_msgSend)((id)cacheCls, sel_registerName("sharedInstance"));
-        touch_log("BKHIDServiceInfoCache.sharedInstance: %p", (__bridge void *)cache);
-        if (cache) {
-            unsigned int cc = 0;
-            Method *cms = class_copyMethodList([cache class], &cc);
-            for (unsigned int i = 0; i < cc; i++) {
-                const char *name = sel_getName(method_getName(cms[i]));
-                if (strcasestr(name, "service") || strcasestr(name, "info") ||
-                    strcasestr(name, "simulator") || strcasestr(name, "sender"))
-                    touch_log("  %s", name);
-            }
-            free(cms);
-        }
-    } else {
-        touch_log("BKHIDServiceInfoCache not found");
-    }
-
-    /* Also swizzle injectHIDEvent: to confirm it's actually being called */
-    if (g_bk_hid_system) {
-        SEL injSel = sel_registerName("injectHIDEvent:");
-        Method injM = class_getInstanceMethod([g_bk_hid_system class], injSel);
-        if (injM) {
-            static IMP orig_inject = NULL;
-            orig_inject = method_getImplementation(injM);
-            method_setImplementation(injM, imp_implementationWithBlock(
-                ^(id self, void *event) {
-                    touch_log("*** injectHIDEvent: called with %p", event);
-                    ((void(*)(id, SEL, void *))orig_inject)(self, injSel, event);
-                    touch_log("*** injectHIDEvent: returned");
-                }));
-            touch_log("Swizzled BKHIDSystemInterface.injectHIDEvent:");
-        }
     }
 
     touch_log("=== Virtual HID registration complete ===");
