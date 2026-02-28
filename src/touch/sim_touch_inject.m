@@ -54,6 +54,12 @@ typedef void (*IOHIDEventSetSenderIDFn)(IOHIDEventRef, uint64_t);
 
 typedef void (*BKSHIDEventSendToFocusedProcessFn)(IOHIDEventRef);
 
+/* Keyboard event creation */
+typedef IOHIDEventRef (*IOHIDEventCreateKeyboardEventFn)(
+    CFAllocatorRef, uint64_t, uint32_t usagePage, uint32_t usage,
+    Boolean down, IOOptionBits);
+
+static IOHIDEventCreateKeyboardEventFn fnCreateKeyboardEvent = NULL;
 static IOHIDEventCreateDigitizerFingerEventFn fnCreateFingerEvent = NULL;
 static IOHIDEventCreateDigitizerEventFn fnCreateDigitizerEvent = NULL;
 static IOHIDEventAppendEventFn fnAppendEvent = NULL;
@@ -109,6 +115,8 @@ static void touch_log(const char *fmt, ...) {
 static BOOL resolve_symbols(void) {
     dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
 
+    fnCreateKeyboardEvent = (IOHIDEventCreateKeyboardEventFn)
+        dlsym(RTLD_DEFAULT, "IOHIDEventCreateKeyboardEvent");
     fnCreateFingerEvent = (IOHIDEventCreateDigitizerFingerEventFn)
         dlsym(RTLD_DEFAULT, "IOHIDEventCreateDigitizerFingerEvent");
     fnCreateDigitizerEvent = (IOHIDEventCreateDigitizerEventFn)
@@ -300,6 +308,109 @@ static void send_touch(float x, float y, BOOL isDown, BOOL isMove, uint32_t fing
 }
 
 /* ================================================================
+ * Keyboard event
+ * ================================================================ */
+
+static void send_key(uint32_t usagePage, uint32_t usage, BOOL down) {
+    if (!fnCreateKeyboardEvent) {
+        touch_log("send_key: IOHIDEventCreateKeyboardEvent not available");
+        return;
+    }
+    uint64_t ts = mach_absolute_time();
+    IOHIDEventRef event = fnCreateKeyboardEvent(
+        kCFAllocatorDefault, ts, usagePage, usage, down, 0);
+    if (!event) {
+        touch_log("send_key: event creation failed");
+        return;
+    }
+    dispatch_event(event);
+    CFRelease(event);
+}
+
+/* HID usage page 7 (keyboard) key codes for ASCII characters */
+static void char_to_hid(char c, uint32_t *usage, BOOL *shift) {
+    *shift = NO;
+    if (c >= 'a' && c <= 'z') {
+        *usage = 4 + (c - 'a');
+    } else if (c >= 'A' && c <= 'Z') {
+        *usage = 4 + (c - 'A');
+        *shift = YES;
+    } else if (c >= '1' && c <= '9') {
+        *usage = 30 + (c - '1');
+    } else if (c == '0') {
+        *usage = 39;
+    } else {
+        switch (c) {
+            case '\n': case '\r': *usage = 40; break;
+            case '\t':            *usage = 43; break;
+            case ' ':             *usage = 44; break;
+            case '-':             *usage = 45; break;
+            case '=':             *usage = 46; break;
+            case '[':             *usage = 47; break;
+            case ']':             *usage = 48; break;
+            case '\\':            *usage = 49; break;
+            case ';':             *usage = 51; break;
+            case '\'':            *usage = 52; break;
+            case '`':             *usage = 53; break;
+            case ',':             *usage = 54; break;
+            case '.':             *usage = 55; break;
+            case '/':             *usage = 56; break;
+            case '!':  *usage = 30; *shift = YES; break;
+            case '@':  *usage = 31; *shift = YES; break;
+            case '#':  *usage = 32; *shift = YES; break;
+            case '$':  *usage = 33; *shift = YES; break;
+            case '%':  *usage = 34; *shift = YES; break;
+            case '^':  *usage = 35; *shift = YES; break;
+            case '&':  *usage = 36; *shift = YES; break;
+            case '*':  *usage = 37; *shift = YES; break;
+            case '(':  *usage = 38; *shift = YES; break;
+            case ')':  *usage = 39; *shift = YES; break;
+            case '_':  *usage = 45; *shift = YES; break;
+            case '+':  *usage = 46; *shift = YES; break;
+            case '{':  *usage = 47; *shift = YES; break;
+            case '}':  *usage = 48; *shift = YES; break;
+            case '|':  *usage = 49; *shift = YES; break;
+            case ':':  *usage = 51; *shift = YES; break;
+            case '"':  *usage = 52; *shift = YES; break;
+            case '~':  *usage = 53; *shift = YES; break;
+            case '<':  *usage = 54; *shift = YES; break;
+            case '>':  *usage = 55; *shift = YES; break;
+            case '?':  *usage = 56; *shift = YES; break;
+            default:   *usage = 0; break;
+        }
+    }
+}
+
+#define kHIDUsagePage_KeyboardOrKeypad 7
+#define kHIDUsage_KeyboardLeftShift 0xE1
+
+static void send_text(const char *text) {
+    if (!text) return;
+    touch_log("send_text: \"%s\" (%zu chars)", text, strlen(text));
+    for (size_t i = 0; text[i]; i++) {
+        uint32_t usage = 0;
+        BOOL shift = NO;
+        char_to_hid(text[i], &usage, &shift);
+        if (usage == 0) {
+            touch_log("  skip unknown char: 0x%02x", (unsigned char)text[i]);
+            continue;
+        }
+        if (shift) {
+            send_key(kHIDUsagePage_KeyboardOrKeypad, kHIDUsage_KeyboardLeftShift, YES);
+            usleep(10000);
+        }
+        send_key(kHIDUsagePage_KeyboardOrKeypad, usage, YES);
+        usleep(30000);
+        send_key(kHIDUsagePage_KeyboardOrKeypad, usage, NO);
+        if (shift) {
+            usleep(10000);
+            send_key(kHIDUsagePage_KeyboardOrKeypad, kHIDUsage_KeyboardLeftShift, NO);
+        }
+        usleep(30000);
+    }
+}
+
+/* ================================================================
  * Command file polling
  * ================================================================ */
 
@@ -339,11 +450,31 @@ static void poll_touch_cmd(void) {
         if (!cmd || ![cmd isKindOfClass:[NSDictionary class]]) continue;
 
         NSString *action = cmd[@"action"];
+        if (!action) continue;
+
+        /* Keyboard actions */
+        if ([action isEqualToString:@"key"]) {
+            NSNumber *pageNum = cmd[@"page"];
+            NSNumber *usageNum = cmd[@"usage"];
+            if (!pageNum || !usageNum) continue;
+            touch_log("Key: page=%u usage=%u", pageNum.unsignedIntValue, usageNum.unsignedIntValue);
+            send_key(pageNum.unsignedIntValue, usageNum.unsignedIntValue, YES);
+            usleep(50000);
+            send_key(pageNum.unsignedIntValue, usageNum.unsignedIntValue, NO);
+            continue;
+        }
+        if ([action isEqualToString:@"text"]) {
+            NSString *text = cmd[@"text"];
+            if (!text) continue;
+            send_text(text.UTF8String);
+            continue;
+        }
+
+        /* Touch actions — require x/y */
         NSNumber *xNum = cmd[@"x"];
         NSNumber *yNum = cmd[@"y"];
         NSNumber *fingerNum = cmd[@"finger"];
-        if (!action || !xNum || !yNum) continue;
-
+        if (!xNum || !yNum) continue;
         float x = xNum.floatValue;
         float y = yNum.floatValue;
         uint32_t finger = fingerNum ? fingerNum.unsignedIntValue : 0;

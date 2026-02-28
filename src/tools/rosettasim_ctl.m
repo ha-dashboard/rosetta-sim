@@ -1630,6 +1630,175 @@ static int cmd_touch(NSString *udid, float x, float y, int duration_ms) {
     return 0;
 }
 
+/* ── Command: sendtext (rosettasim extension) ── */
+
+static int cmd_sendtext(NSString *udid, NSString *text) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) { fprintf(stderr, "Device not found: %s\n", udid.UTF8String); return 1; }
+    if (get_device_state(device) != 3) { fprintf(stderr, "Device not booted\n"); return 1; }
+
+    NSString *dataPath = get_device_data_path(device);
+    if (!dataPath) { fprintf(stderr, "Could not determine device data path\n"); return 1; }
+
+    /* Keyboard events go through backboardd (rosettasim_touch_bb.json) */
+    NSString *cmdPath = [dataPath stringByAppendingPathComponent:@"tmp/rosettasim_touch_bb.json"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[dataPath stringByAppendingPathComponent:@"tmp"]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *escaped = [text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    NSString *json = [NSString stringWithFormat:@"{\"action\":\"text\",\"text\":\"%@\"}\n", escaped];
+
+    NSError *err = nil;
+    [json writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) { fprintf(stderr, "Write failed: %s\n", err.localizedDescription.UTF8String); return 1; }
+
+    printf("Sending text \"%s\" to %s\n", text.UTF8String, get_device_name(device).UTF8String);
+
+    /* Wait for processing: ~80ms per character (30ms hold + 30ms gap + overhead) */
+    usleep((unsigned)(text.length * 80000 + 200000));
+    printf("Text sent.\n");
+    return 0;
+}
+
+/* ── Command: keyevent (rosettasim extension) ── */
+
+static int cmd_keyevent(NSString *udid, uint32_t page, uint32_t usage) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) { fprintf(stderr, "Device not found: %s\n", udid.UTF8String); return 1; }
+    if (get_device_state(device) != 3) { fprintf(stderr, "Device not booted\n"); return 1; }
+
+    NSString *dataPath = get_device_data_path(device);
+    if (!dataPath) { fprintf(stderr, "Could not determine device data path\n"); return 1; }
+
+    NSString *cmdPath = [dataPath stringByAppendingPathComponent:@"tmp/rosettasim_touch_bb.json"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[dataPath stringByAppendingPathComponent:@"tmp"]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *json = [NSString stringWithFormat:
+        @"{\"action\":\"key\",\"page\":%u,\"usage\":%u}\n", page, usage];
+
+    NSError *err = nil;
+    [json writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) { fprintf(stderr, "Write failed: %s\n", err.localizedDescription.UTF8String); return 1; }
+
+    printf("Key event page=%u usage=%u sent to %s\n", page, usage, get_device_name(device).UTF8String);
+    usleep(300000);
+    return 0;
+}
+
+/* ── Command: location ── */
+
+/* NOTE: cmd_sendtext and cmd_keyevent defined above (lines ~1635, ~1668) */
+
+#if 0 /* duplicate definitions removed — keep originals above */
+static int _removed_cmd_sendtext(NSString *udid, NSString *text) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    NSString *dataPath = get_device_data_path(device);
+    if (!dataPath) {
+        fprintf(stderr, "Could not determine device data path\n");
+        return 1;
+    }
+
+    NSString *tmpDir = [dataPath stringByAppendingPathComponent:@"tmp"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    /* Keyboard events go through backboardd (rosettasim_touch_bb.json) */
+    NSString *cmdPath = [tmpDir stringByAppendingPathComponent:@"rosettasim_touch_bb.json"];
+
+    printf("Sending text: \"%s\" to %s\n", text.UTF8String, get_device_name(device).UTF8String);
+
+    /* Escape the text for JSON */
+    NSData *textData = [NSJSONSerialization dataWithJSONObject:@{
+        @"action": @"text",
+        @"text": text,
+        @"x": @0,
+        @"y": @0
+    } options:0 error:nil];
+    NSString *json = [[NSString alloc] initWithData:textData encoding:NSUTF8StringEncoding];
+    NSString *jsonLine = [json stringByAppendingString:@"\n"];
+
+    NSError *err = nil;
+    [jsonLine writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) {
+        fprintf(stderr, "Failed to write command: %s\n", err.localizedDescription.UTF8String);
+        return 1;
+    }
+
+    /* Wait for processing: ~60ms per character (30ms down + 30ms up) + overhead */
+    int wait_ms = (int)(text.length * 80 + 500);
+    usleep(wait_ms * 1000);
+
+    printf("Text sent.\n");
+    return 0;
+}
+
+/* ── Command: keyevent ── */
+
+static int cmd_keyevent(NSString *udid, uint32_t usagePage, uint32_t usage) {
+    id deviceSet = get_device_set();
+    if (!deviceSet) return 1;
+    id device = find_device(deviceSet, udid);
+    if (!device) {
+        fprintf(stderr, "Device not found: %s\n", udid.UTF8String);
+        return 1;
+    }
+
+    long state = get_device_state(device);
+    if (state != 3) {
+        fprintf(stderr, "Device is not booted (state: %s)\n", state_string(state).UTF8String);
+        return 1;
+    }
+
+    NSString *dataPath = get_device_data_path(device);
+    if (!dataPath) {
+        fprintf(stderr, "Could not determine device data path\n");
+        return 1;
+    }
+
+    NSString *tmpDir = [dataPath stringByAppendingPathComponent:@"tmp"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *cmdPath = [tmpDir stringByAppendingPathComponent:@"rosettasim_touch_bb.json"];
+
+    printf("Key event: page=%u usage=%u on %s\n",
+           usagePage, usage, get_device_name(device).UTF8String);
+
+    NSString *json = [NSString stringWithFormat:
+        @"{\"action\":\"key\",\"page\":%u,\"usage\":%u,\"x\":0,\"y\":0}\n",
+        usagePage, usage];
+
+    NSError *err = nil;
+    [json writeToFile:cmdPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) {
+        fprintf(stderr, "Failed to write command: %s\n", err.localizedDescription.UTF8String);
+        return 1;
+    }
+
+    usleep(200000); /* 200ms for processing */
+
+    printf("Key event sent.\n");
+    return 0;
+}
+#endif /* duplicate removed */
+
 /* ── Command: location ── */
 
 static int cmd_location(NSString *udid, int argc, const char *argv[]) {
@@ -2080,6 +2249,8 @@ static void usage(void) {
         "\tstatus_bar           Override information shown in the status bar.\n"
         "\tterminate           Terminate an application by identifier on a device.\n"
         "\ttouch               Send a touch event to a device (rosettasim extension).\n"
+        "\tsendtext            Send text input to a device (rosettasim extension).\n"
+        "\tkeyevent            Send a HID key event to a device (rosettasim extension).\n"
         "\tui                  Get or set UI options.\n"
         "\tuninstall           Uninstall an app from a device.\n"
         "\n"
@@ -2257,6 +2428,16 @@ int main(int argc, const char *argv[]) {
                     duration = atoi(argv[i] + 11);
             }
             return cmd_touch(resolve_device_arg(argv[2]), x, y, duration);
+        }
+        else if ([cmd isEqualToString:@"sendtext"]) {
+            if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl sendtext <UDID> <text>\n"); return 1; }
+            return cmd_sendtext(resolve_device_arg(argv[2]),
+                               [NSString stringWithUTF8String:argv[3]]);
+        }
+        else if ([cmd isEqualToString:@"keyevent"]) {
+            if (argc < 5) { fprintf(stderr, "Usage: rosettasim-ctl keyevent <UDID> <usage-page> <usage>\n"); return 1; }
+            return cmd_keyevent(resolve_device_arg(argv[2]),
+                               (uint32_t)atoi(argv[3]), (uint32_t)atoi(argv[4]));
         }
         else if ([cmd isEqualToString:@"logverbose"]) {
             if (argc < 4) { fprintf(stderr, "Usage: rosettasim-ctl logverbose <UDID> <on|off>\n"); return 1; }
